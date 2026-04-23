@@ -4,6 +4,7 @@ import { arch, homedir, hostname, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { Buffer } from "node:buffer";
 import type { AgentIdentity, IngestBatchRequest, IngestEvent, IngestSession } from "../../packages/shared/types";
+import { envValue } from "../../packages/shared/env";
 
 const VERSION = "0.1.0";
 
@@ -59,7 +60,7 @@ switch (command) {
 
 async function run(once: boolean) {
   const config = loadConfig();
-  if (!config.token) throw new Error("CHATVIEW_AGENT_TOKEN or --token is required");
+  if (!config.token) throw new Error("AGENT_TOKEN or --token is required");
 
   const state = await loadState(config.statePath);
   const identity = identityFor(config, state.agentId);
@@ -82,13 +83,19 @@ async function run(once: boolean) {
 }
 
 function loadConfig(): Config {
+  const pollMs = arg("--poll-ms") ?? envValue(process.env, "POLL_MS", "CHATVIEW_POLL_MS");
+  const readChunkBytes = arg("--read-chunk-bytes") ?? envValue(process.env, "READ_CHUNK_BYTES", "CHATVIEW_READ_CHUNK_BYTES");
+
   return {
-    backendUrl: trimSlash(arg("--backend") ?? process.env.CHATVIEW_BACKEND_URL ?? "http://localhost:3737"),
-    token: arg("--token") ?? process.env.CHATVIEW_AGENT_TOKEN ?? "",
-    projectsDir: arg("--projects-dir") ?? process.env.CHATVIEW_CLAUDE_PROJECTS_DIR ?? join(homedir(), ".claude", "projects"),
-    statePath: arg("--state") ?? process.env.CHATVIEW_AGENT_STATE ?? join(homedir(), ".chatview-agent", "state.json"),
-    pollMs: Number(arg("--poll-ms") ?? process.env.CHATVIEW_POLL_MS ?? 2000),
-    readChunkBytes: Number(arg("--read-chunk-bytes") ?? process.env.CHATVIEW_READ_CHUNK_BYTES ?? 1024 * 1024),
+    backendUrl: trimSlash(arg("--backend") ?? envValue(process.env, "BACKEND_URL", "CHATVIEW_BACKEND_URL") ?? "http://localhost:3737"),
+    token: arg("--token") ?? envValue(process.env, "AGENT_TOKEN", "CHATVIEW_AGENT_TOKEN") ?? "",
+    projectsDir:
+      arg("--projects-dir") ??
+      envValue(process.env, "CLAUDE_PROJECTS_DIR", "CHATVIEW_CLAUDE_PROJECTS_DIR") ??
+      join(homedir(), ".claude", "projects"),
+    statePath: arg("--state") ?? envValue(process.env, "AGENT_STATE", "CHATVIEW_AGENT_STATE") ?? join(homedir(), ".chatview-agent", "state.json"),
+    pollMs: positiveInteger(pollMs, 2000),
+    readChunkBytes: positiveInteger(readChunkBytes, 1024 * 1024),
   };
 }
 
@@ -289,7 +296,7 @@ async function saveState(path: string, state: AgentState) {
 function identityFor(config: Config, agentId: string): AgentIdentity {
   return {
     agentId,
-    hostname: process.env.CHATVIEW_AGENT_HOSTNAME ?? hostname(),
+    hostname: envValue(process.env, "AGENT_HOSTNAME", "CHATVIEW_AGENT_HOSTNAME") ?? hostname(),
     platform: platform(),
     arch: arch(),
     version: VERSION,
@@ -299,7 +306,7 @@ function identityFor(config: Config, agentId: string): AgentIdentity {
 
 async function installLaunchAgent() {
   const config = loadConfig();
-  if (!config.token) throw new Error("CHATVIEW_AGENT_TOKEN or --token is required before installing launch agent");
+  if (!config.token) throw new Error("AGENT_TOKEN or --token is required before installing launch agent");
   const label = "com.chatview.agent";
   const plistPath = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
   await mkdir(dirname(plistPath), { recursive: true });
@@ -323,15 +330,15 @@ ${args.map((value) => `    <string>${xml(value)}</string>`).join("\n")}
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>CHATVIEW_BACKEND_URL</key>
+    <key>BACKEND_URL</key>
     <string>${xml(config.backendUrl)}</string>
-    <key>CHATVIEW_AGENT_TOKEN</key>
+    <key>AGENT_TOKEN</key>
     <string>${xml(config.token)}</string>
-    <key>CHATVIEW_CLAUDE_PROJECTS_DIR</key>
+    <key>CLAUDE_PROJECTS_DIR</key>
     <string>${xml(config.projectsDir)}</string>
-    <key>CHATVIEW_AGENT_STATE</key>
+    <key>AGENT_STATE</key>
     <string>${xml(config.statePath)}</string>
-    <key>CHATVIEW_POLL_MS</key>
+    <key>POLL_MS</key>
     <string>${xml(String(config.pollMs))}</string>
   </dict>
   <key>RunAtLoad</key>
@@ -362,7 +369,7 @@ Usage:
 
 Options:
   --backend <url>          Backend URL (default: http://localhost:3737)
-  --token <token>          Agent token, or CHATVIEW_AGENT_TOKEN
+  --token <token>          Agent token, or AGENT_TOKEN
   --projects-dir <path>    Claude projects dir (default: ~/.claude/projects)
   --state <path>           Agent state file (default: ~/.chatview-agent/state.json)
   --poll-ms <ms>           Poll interval (default: 2000)
@@ -376,6 +383,13 @@ function arg(name: string) {
 
 function trimSlash(value: string) {
   return value.replace(/\/+$/, "");
+}
+
+function positiveInteger(value: string | undefined, fallback: number) {
+  if (!value) return fallback;
+
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function xml(value: string) {

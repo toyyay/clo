@@ -1,6 +1,7 @@
 import index from "../../index.html";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import * as Y from "yjs";
+import type { ServerWebSocket } from "bun";
 import type {
   HostInfo,
   IngestBatchRequest,
@@ -14,46 +15,92 @@ import type {
   YjsSyncRequest,
   YjsSyncResponse,
 } from "../../packages/shared/types";
-import { ensureSchema, sql, toId, toNumber } from "./db";
+import { envFlag, envValue } from "../../packages/shared/env";
+import { prepareDatabase, sql, toId, toNumber } from "./db";
 
-const port = Number(process.env.PORT ?? process.env.CHATVIEW_PORT ?? 3737);
-const agentToken = process.env.CHATVIEW_AGENT_TOKEN ?? "dev-token";
+const isProduction = process.env.NODE_ENV === "production";
+const port = Number(envValue(process.env, "PORT", "CHATVIEW_PORT") ?? 3737);
+const agentToken = envValue(process.env, "AGENT_TOKEN", "CHATVIEW_AGENT_TOKEN") ?? (isProduction ? "" : "dev-token");
+const webToken = envValue(process.env, "WEB_TOKEN", "CHATVIEW_WEB_TOKEN") ?? "";
+const importStoreBody = envFlag(process.env, ["IMPORT_STORE_BODY", "CHATVIEW_IMPORT_STORE_BODY"]);
+const webAuthCookie = "chatview_token";
+const webAuthCookieMaxAge = 60 * 60 * 24 * 30;
 const gitSha = process.env.GIT_SHA ?? "unknown";
 const encoder = new TextEncoder();
 const streamClients = new Set<ReadableStreamDefaultController<Uint8Array>>();
-const yjsSocketsByDoc = new Map<string, Set<ServerWebSocket>>();
-const docIdsBySocket = new WeakMap<ServerWebSocket, Set<string>>();
+const redactedHeaderNames = new Set(["authorization", "proxy-authorization", "cookie", "set-cookie"]);
+const redactedQueryNames = new Set(["token"]);
+type YjsWebSocket = ServerWebSocket<{ docIds: Set<string> }>;
+const yjsSocketsByDoc = new Map<string, Set<YjsWebSocket>>();
+const docIdsBySocket = new WeakMap<YjsWebSocket, Set<string>>();
 
-if (!process.env.CHATVIEW_AGENT_TOKEN) {
-  console.warn("CHATVIEW_AGENT_TOKEN is not set; backend accepts the development token 'dev-token'");
+if (!agentToken) {
+  throw new Error("AGENT_TOKEN is required in production");
 }
 
-await ensureSchema();
+if (!envValue(process.env, "AGENT_TOKEN", "CHATVIEW_AGENT_TOKEN")) {
+  console.warn("AGENT_TOKEN is not set; backend accepts the development token 'dev-token'");
+}
+
+if (isProduction && !webToken) {
+  throw new Error("WEB_TOKEN is required in production");
+}
+
+if (!webToken) {
+  console.warn("WEB_TOKEN is not set; web UI login is disabled and protected browser APIs return 401");
+}
+
+await prepareDatabase();
 
 Bun.serve<{ docIds: Set<string> }>({
   port,
   routes: {
     "/": index,
     "/api/health": () => json({ ok: true, commit_sha: gitSha }),
+    "/api/auth/status": (req: Request) => json({ configured: Boolean(webToken), authenticated: isWebAuthorized(req) }),
+    "/api/auth/login": async (req: Request) => {
+      if (req.method !== "POST") return text("method not allowed", 405);
+      if (!webToken) return text("auth token is not configured", 503);
+
+      const body = (await req.json().catch(() => ({}))) as { token?: unknown };
+      if (!tokenMatches(typeof body.token === "string" ? body.token : "", webToken)) {
+        return text("unauthorized", 401);
+      }
+
+      return json({ ok: true }, 200, { "set-cookie": makeWebAuthCookie(req, webToken) });
+    },
+    "/api/auth/logout": (req: Request) => json({ ok: true }, 200, { "set-cookie": clearWebAuthCookie(req) }),
     "/status-9c8e0f3a2b71": () => json({ ok: true, commit_sha: gitSha, uptime: Math.round(process.uptime()) }),
-    "/api/hosts": async () => json(await listHosts()),
-    "/api/sessions": async (req) => {
+    "/api/hosts": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      return json(await listHosts());
+    },
+    "/api/sessions": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
       const url = new URL(req.url);
       return json(await listSessions(url.searchParams.get("agentId") ?? undefined));
     },
-    "/api/session": async (req) => {
+    "/api/session": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
       const url = new URL(req.url);
       const id = url.searchParams.get("id");
       if (!id) return text("missing id", 400);
       const payload = await getSession(id);
       return payload ? json(payload) : text("session not found", 404);
     },
-    "/api/sync": async (req) => {
+    "/api/sync": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
       if (req.method !== "POST") return text("method not allowed", 405);
       const body = (await req.json().catch(() => ({}))) as SyncRequest;
       return json(await sync(body));
     },
-    "/api/yjs/sync": async (req) => {
+    "/api/yjs/sync": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
       if (req.method !== "POST") return text("method not allowed", 405);
       try {
         const body = (await req.json()) as YjsSyncRequest;
@@ -62,12 +109,18 @@ Bun.serve<{ docIds: Set<string> }>({
         return text(error instanceof Error ? error.message : "bad request", 400);
       }
     },
-    "/api/yjs/ws": (req, server) => {
+    "/api/yjs/ws": (req: Request, server: { upgrade(req: Request, options: { data: { docIds: Set<string> } }): boolean }) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
       if (server.upgrade(req, { data: { docIds: new Set<string>() } })) return;
       return text("websocket upgrade failed", 400);
     },
-    "/api/stream": (req) => stream(req),
-    "/api/ingest/batch": async (req) => {
+    "/api/stream": (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      return stream(req);
+    },
+    "/api/ingest/batch": async (req: Request) => {
       if (req.method !== "POST") return text("method not allowed", 405);
       if (!isAuthorized(req)) return text("unauthorized", 401);
       try {
@@ -78,7 +131,8 @@ Bun.serve<{ docIds: Set<string> }>({
         return text(error instanceof Error ? error.message : "bad request", 400);
       }
     },
-    "/api/shortcuts/audio": async (req) => handleShortcutAudio(req),
+    "/api/imports/media": async (req: Request) => handleImportMedia(req),
+    "/api/shortcuts/audio": async (req: Request) => handleImportMedia(req),
   },
   websocket: {
     open(ws) {
@@ -107,13 +161,13 @@ Bun.serve<{ docIds: Set<string> }>({
       unsubscribeYjsSocket(ws);
     },
   },
-  development: process.env.NODE_ENV !== "production",
+  development: !isProduction,
 });
 
 console.log(`chatview backend running at http://localhost:${port}`);
 
-function json(value: unknown, status = 200) {
-  return Response.json(value, { status });
+function json(value: unknown, status = 200, headers?: HeadersInit) {
+  return Response.json(value, { status, headers });
 }
 
 function text(value: string, status = 200) {
@@ -125,7 +179,77 @@ function isAuthorized(req: Request) {
   return auth === `Bearer ${agentToken}`;
 }
 
-type ShortcutAudioCandidate = {
+function requireWebAuth(req: Request) {
+  return isWebAuthorized(req) ? null : text("unauthorized", 401);
+}
+
+function isWebAuthorized(req: Request) {
+  return tokenMatches(readCookie(req, webAuthCookie), webToken);
+}
+
+function readCookie(req: Request, name: string) {
+  const cookie = req.headers.get("cookie");
+  if (!cookie) return "";
+
+  for (const part of cookie.split(";")) {
+    const [rawKey, ...rawValue] = part.trim().split("=");
+    if (rawKey !== name) continue;
+    try {
+      return decodeURIComponent(rawValue.join("="));
+    } catch {
+      return "";
+    }
+  }
+
+  return "";
+}
+
+function makeWebAuthCookie(req: Request, token: string) {
+  const parts = [
+    `${webAuthCookie}=${encodeURIComponent(token)}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    `Max-Age=${webAuthCookieMaxAge}`,
+  ];
+  if (isHttps(req)) parts.push("Secure");
+  return parts.join("; ");
+}
+
+function clearWebAuthCookie(req: Request) {
+  const parts = [`${webAuthCookie}=`, "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0"];
+  if (isHttps(req)) parts.push("Secure");
+  return parts.join("; ");
+}
+
+function isHttps(req: Request) {
+  const forwardedProto = req.headers.get("x-forwarded-proto");
+  return process.env.NODE_ENV === "production" || forwardedProto === "https" || new URL(req.url).protocol === "https:";
+}
+
+function tokenMatches(candidate: string | undefined, expected: string) {
+  if (!candidate || !expected) return false;
+  const candidateHash = createHash("sha256").update(candidate).digest();
+  const expectedHash = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(candidateHash, expectedHash);
+}
+
+function readImportToken(req: Request, url: URL) {
+  const authorization = req.headers.get("authorization") ?? "";
+  const bearer = authorization.match(/^Bearer\s+(.+)$/i);
+  if (bearer?.[1]) return bearer[1].trim();
+  return url.searchParams.get("token") ?? "";
+}
+
+function redactSensitiveUrl(url: URL) {
+  const sanitized = new URL(url);
+  for (const key of redactedQueryNames) {
+    if (sanitized.searchParams.has(key)) sanitized.searchParams.set(key, "<redacted>");
+  }
+  return sanitized.toString();
+}
+
+type ImportMediaCandidate = {
   sourceKind: string;
   partIndex: number;
   partName?: string;
@@ -135,59 +259,61 @@ type ShortcutAudioCandidate = {
   metadata: Record<string, unknown>;
 };
 
-type AudioDetection = {
+type MediaDetection = {
+  kind: "audio";
   format: string;
   metadata: Record<string, unknown>;
 };
 
-async function handleShortcutAudio(req: Request) {
+async function handleImportMedia(req: Request) {
   const url = new URL(req.url);
-  const tokenValue = url.searchParams.get("token") ?? "";
+  const tokenValue = readImportToken(req, url);
   const rawBody = Buffer.from(await req.clone().arrayBuffer());
   const tokenRows = tokenValue
     ? await sql`
         select id, token
-        from shortcut_ingest_tokens
+        from import_tokens
         where token = ${tokenValue}
       `
     : [];
 
-  const requestId = await createShortcutRequestLog(req, url, rawBody, tokenRows[0]?.id ?? null, tokenValue || null);
+  const requestId = await createImportRequestLog(req, url, rawBody, tokenRows[0]?.id ?? null, tokenValue || null);
 
   try {
     if (req.method !== "POST") {
-      return finishShortcutResponse(requestId, { ok: false, requestId, error: "method not allowed" }, 405);
+      return finishImportResponse(requestId, { ok: false, requestId, error: "method not allowed" }, 405);
     }
 
     if (!tokenRows.length) {
-      return finishShortcutResponse(requestId, { ok: false, requestId, error: "unauthorized" }, 401);
+      return finishImportResponse(requestId, { ok: false, requestId, error: "unauthorized" }, 401);
     }
 
     await sql`
-      update shortcut_ingest_tokens
+      update import_tokens
       set last_used_at = now()
       where id = ${tokenRows[0].id}
     `;
 
-    const result = await ingestShortcutAudio(req, rawBody, requestId);
-    return finishShortcutResponse(requestId, { ok: true, requestId, ...result }, 200);
+    const result = await ingestImportMedia(req, rawBody, requestId);
+    return finishImportResponse(requestId, { ok: true, requestId, ...result }, 200);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "shortcut ingest failed";
-    return finishShortcutResponse(requestId, { ok: false, requestId, error: message }, 500);
+    const message = error instanceof Error ? error.message : "import ingest failed";
+    return finishImportResponse(requestId, { ok: false, requestId, error: message }, 500);
   }
 }
 
-async function createShortcutRequestLog(
+async function createImportRequestLog(
   req: Request,
   url: URL,
   rawBody: Buffer,
   tokenId: unknown,
   tokenValue: string | null,
 ) {
+  const storedRequestBody = importStoreBody ? rawBody : Buffer.alloc(0);
   const rows = await sql`
-    insert into shortcut_ingest_requests (
+    insert into import_requests (
       token_id,
-      token,
+      token_sha256,
       method,
       url,
       path,
@@ -200,14 +326,14 @@ async function createShortcutRequestLog(
     )
     values (
       ${tokenId},
-      ${tokenValue},
+      ${tokenValue ? sha256Hex(Buffer.from(tokenValue, "utf8")) : null},
       ${req.method},
-      ${req.url},
+      ${redactSensitiveUrl(url)},
       ${url.pathname},
-      ${queryToJson(url)}::jsonb,
+      ${queryToJson(url, redactedQueryNames)}::jsonb,
       ${headersToJson(req.headers)}::jsonb,
       ${req.headers.get("content-type")},
-      ${rawBody},
+      ${storedRequestBody},
       ${sha256Hex(rawBody)},
       ${rawBody.length}
     )
@@ -216,17 +342,18 @@ async function createShortcutRequestLog(
   return rows[0].id;
 }
 
-async function finishShortcutResponse(requestId: unknown, payload: Record<string, unknown>, status: number) {
+async function finishImportResponse(requestId: unknown, payload: Record<string, unknown>, status: number) {
   const body = Buffer.from(`${JSON.stringify(payload)}\n`, "utf8");
+  const storedBody = importStoreBody ? body : Buffer.alloc(0);
   const headers = { "content-type": "application/json; charset=utf-8" };
   const error = payload.ok === false ? String(payload.error ?? "request failed") : null;
 
   await sql`
-    update shortcut_ingest_requests
+    update import_requests
     set
       response_status = ${status},
       response_headers = ${headers}::jsonb,
-      response_body = ${body},
+      response_body = ${storedBody},
       response_body_sha256 = ${sha256Hex(body)},
       response_body_bytes = ${body.length},
       error = ${error},
@@ -237,20 +364,21 @@ async function finishShortcutResponse(requestId: unknown, payload: Record<string
   return new Response(body, { status, headers });
 }
 
-async function ingestShortcutAudio(req: Request, rawBody: Buffer, requestId: unknown) {
-  const candidates = await extractShortcutAudioCandidates(req, rawBody);
-  const savedAudio = [];
+async function ingestImportMedia(req: Request, rawBody: Buffer, requestId: unknown) {
+  const candidates = await extractImportMediaCandidates(req, rawBody);
+  const savedMedia = [];
 
   for (const candidate of candidates) {
-    const detection = detectAudio(candidate.bytes, candidate.contentType, candidate.filename);
+    const detection = detectMedia(candidate.bytes, candidate.contentType, candidate.filename);
     if (!detection) continue;
 
     const metadata = {
       ...candidate.metadata,
       ...detection.metadata,
     };
-    const audioRows = await sql`
-      insert into shortcut_audio_blobs (
+    const mediaRows = await sql`
+      insert into import_media_blobs (
+        media_kind,
         sha256,
         bytes,
         size_bytes,
@@ -262,6 +390,7 @@ async function ingestShortcutAudio(req: Request, rawBody: Buffer, requestId: unk
         last_seen_at
       )
       values (
+        ${detection.kind},
         ${sha256Hex(candidate.bytes)},
         ${candidate.bytes},
         ${candidate.bytes.length},
@@ -274,19 +403,19 @@ async function ingestShortcutAudio(req: Request, rawBody: Buffer, requestId: unk
       )
       on conflict (sha256) do update set
         last_seen_at = now(),
-        content_type = coalesce(shortcut_audio_blobs.content_type, excluded.content_type),
-        filename = coalesce(shortcut_audio_blobs.filename, excluded.filename),
-        extension = coalesce(shortcut_audio_blobs.extension, excluded.extension),
-        detected_format = coalesce(shortcut_audio_blobs.detected_format, excluded.detected_format),
-        metadata = shortcut_audio_blobs.metadata || excluded.metadata
-      returning id, sha256, size_bytes, content_type, filename, detected_format, metadata
+        content_type = coalesce(import_media_blobs.content_type, excluded.content_type),
+        filename = coalesce(import_media_blobs.filename, excluded.filename),
+        extension = coalesce(import_media_blobs.extension, excluded.extension),
+        detected_format = coalesce(import_media_blobs.detected_format, excluded.detected_format),
+        metadata = import_media_blobs.metadata || excluded.metadata
+      returning id, media_kind, sha256, size_bytes, content_type, filename, detected_format, metadata
     `;
-    const audio = audioRows[0];
+    const media = mediaRows[0];
 
     await sql`
-      insert into shortcut_ingest_request_audio (
+      insert into import_request_media (
         request_id,
-        audio_id,
+        media_id,
         part_index,
         part_name,
         source_kind,
@@ -297,7 +426,7 @@ async function ingestShortcutAudio(req: Request, rawBody: Buffer, requestId: unk
       )
       values (
         ${requestId},
-        ${audio.id},
+        ${media.id},
         ${candidate.partIndex},
         ${candidate.partName ?? null},
         ${candidate.sourceKind},
@@ -309,13 +438,14 @@ async function ingestShortcutAudio(req: Request, rawBody: Buffer, requestId: unk
       on conflict (request_id, part_index) do nothing
     `;
 
-    savedAudio.push({
-      id: toId(audio.id),
-      sha256: audio.sha256,
-      sizeBytes: toNumber(audio.size_bytes),
-      contentType: audio.content_type,
-      filename: audio.filename,
-      detectedFormat: audio.detected_format,
+    savedMedia.push({
+      id: toId(media.id),
+      mediaKind: media.media_kind,
+      sha256: media.sha256,
+      sizeBytes: toNumber(media.size_bytes),
+      contentType: media.content_type,
+      filename: media.filename,
+      detectedFormat: media.detected_format,
       createdAt: typeof metadata.createdAt === "string" ? metadata.createdAt : null,
     });
   }
@@ -323,21 +453,23 @@ async function ingestShortcutAudio(req: Request, rawBody: Buffer, requestId: unk
   return {
     rawRequestBytes: rawBody.length,
     candidates: candidates.length,
-    audioFiles: savedAudio.length,
-    audio: savedAudio,
+    mediaFiles: savedMedia.length,
+    media: savedMedia,
+    audioFiles: savedMedia.length,
+    audio: savedMedia,
   };
 }
 
-async function extractShortcutAudioCandidates(req: Request, rawBody: Buffer): Promise<ShortcutAudioCandidate[]> {
+async function extractImportMediaCandidates(req: Request, rawBody: Buffer): Promise<ImportMediaCandidate[]> {
   const contentType = req.headers.get("content-type") ?? "";
-  const candidates: ShortcutAudioCandidate[] = [];
+  const candidates: ImportMediaCandidate[] = [];
 
   if (contentType.toLowerCase().includes("multipart/form-data")) {
     const form = await req.formData();
     let index = 0;
 
     for (const [name, value] of form.entries()) {
-      if (value instanceof File) {
+      if (isUploadedFile(value)) {
         candidates.push({
           sourceKind: "multipart-file",
           partIndex: index,
@@ -352,7 +484,7 @@ async function extractShortcutAudioCandidates(req: Request, rawBody: Buffer): Pr
           },
         });
       } else {
-        pushBase64AudioCandidates(candidates, value, {
+        pushBase64MediaCandidates(candidates, value, {
           sourceKind: "multipart-field-base64",
           partIndex: index,
           partName: name,
@@ -368,10 +500,10 @@ async function extractShortcutAudioCandidates(req: Request, rawBody: Buffer): Pr
   if (contentType.toLowerCase().includes("json")) {
     try {
       const parsed = JSON.parse(rawBody.toString("utf8"));
-      pushJsonAudioCandidates(candidates, parsed);
+      pushJsonMediaCandidates(candidates, parsed);
       if (candidates.length) return candidates;
     } catch {
-      // Keep the full raw body logged and fall back to raw audio detection below.
+      // Keep the body hash for audit purposes and fall back to raw media detection below.
     }
   }
 
@@ -386,11 +518,20 @@ async function extractShortcutAudioCandidates(req: Request, rawBody: Buffer): Pr
   return candidates;
 }
 
-function pushJsonAudioCandidates(candidates: ShortcutAudioCandidate[], value: unknown, path: string[] = [], depth = 0) {
+function isUploadedFile(value: FormDataEntryValue): value is File {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as File).arrayBuffer === "function" &&
+    typeof (value as File).name === "string"
+  );
+}
+
+function pushJsonMediaCandidates(candidates: ImportMediaCandidate[], value: unknown, path: string[] = [], depth = 0) {
   if (depth > 12 || candidates.length >= 50) return;
 
   if (typeof value === "string") {
-    pushBase64AudioCandidates(candidates, value, {
+    pushBase64MediaCandidates(candidates, value, {
       sourceKind: "json-base64",
       partIndex: candidates.length,
       partName: path.join(".") || "$",
@@ -400,21 +541,21 @@ function pushJsonAudioCandidates(candidates: ShortcutAudioCandidate[], value: un
   }
 
   if (Array.isArray(value)) {
-    value.forEach((item, index) => pushJsonAudioCandidates(candidates, item, [...path, String(index)], depth + 1));
+    value.forEach((item, index) => pushJsonMediaCandidates(candidates, item, [...path, String(index)], depth + 1));
     return;
   }
 
   if (value && typeof value === "object") {
     for (const [key, item] of Object.entries(value)) {
-      pushJsonAudioCandidates(candidates, item, [...path, key], depth + 1);
+      pushJsonMediaCandidates(candidates, item, [...path, key], depth + 1);
     }
   }
 }
 
-function pushBase64AudioCandidates(
-  candidates: ShortcutAudioCandidate[],
+function pushBase64MediaCandidates(
+  candidates: ImportMediaCandidate[],
   value: string,
-  defaults: Omit<ShortcutAudioCandidate, "bytes">,
+  defaults: Omit<ImportMediaCandidate, "bytes">,
 ) {
   const trimmed = value.trim();
   const dataUrl = trimmed.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$/is);
@@ -426,7 +567,7 @@ function pushBase64AudioCandidates(
 
   try {
     const bytes = Buffer.from(compact, "base64");
-    if (!detectAudio(bytes, contentType, defaults.filename)) return;
+    if (!detectMedia(bytes, contentType, defaults.filename)) return;
     candidates.push({
       ...defaults,
       contentType,
@@ -441,22 +582,22 @@ function pushBase64AudioCandidates(
   }
 }
 
-function detectAudio(bytes: Uint8Array, contentType?: string, filename?: string): AudioDetection | null {
+function detectMedia(bytes: Uint8Array, contentType?: string, filename?: string): MediaDetection | null {
   const lowerType = contentType?.toLowerCase() ?? "";
   const extension = fileExtension(filename);
 
   if (isMp4Like(bytes)) {
     const metadata = parseMp4Metadata(Buffer.from(bytes));
-    return { format: metadata.majorBrand === "qt  " ? "quicktime" : "m4a/mp4", metadata };
+    return { kind: "audio", format: metadata.majorBrand === "qt  " ? "quicktime" : "m4a/mp4", metadata };
   }
-  if (startsWithAscii(bytes, 0, "caff")) return { format: "caf", metadata: {} };
-  if (startsWithAscii(bytes, 0, "RIFF") && startsWithAscii(bytes, 8, "WAVE")) return { format: "wav", metadata: {} };
+  if (startsWithAscii(bytes, 0, "caff")) return { kind: "audio", format: "caf", metadata: {} };
+  if (startsWithAscii(bytes, 0, "RIFF") && startsWithAscii(bytes, 8, "WAVE")) return { kind: "audio", format: "wav", metadata: {} };
   if (startsWithAscii(bytes, 0, "ID3") || (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0)) {
-    return { format: "mp3", metadata: {} };
+    return { kind: "audio", format: "mp3", metadata: {} };
   }
 
   if (lowerType.startsWith("audio/") || ["m4a", "mp4", "mov", "qta", "caf", "wav", "aac", "mp3"].includes(extension ?? "")) {
-    return { format: lowerType || extension || "audio", metadata: {} };
+    return { kind: "audio", format: lowerType || extension || "audio", metadata: {} };
   }
 
   return null;
@@ -601,16 +742,21 @@ function isMp4Like(bytes: Uint8Array) {
 }
 
 function headersToJson(headers: Headers) {
-  return Object.fromEntries([...headers.entries()]);
+  const out: Record<string, string> = {};
+  for (const [key, value] of headers.entries()) {
+    out[key] = redactedHeaderNames.has(key.toLowerCase()) ? "<redacted>" : value;
+  }
+  return out;
 }
 
-function queryToJson(url: URL) {
+function queryToJson(url: URL, redactedKeys = new Set<string>()) {
   const out: Record<string, string | string[]> = {};
   for (const [key, value] of url.searchParams.entries()) {
+    const sanitizedValue = redactedKeys.has(key) ? "<redacted>" : value;
     const current = out[key];
-    if (Array.isArray(current)) current.push(value);
-    else if (current !== undefined) out[key] = [current, value];
-    else out[key] = value;
+    if (Array.isArray(current)) current.push(sanitizedValue);
+    else if (current !== undefined) out[key] = [current, sanitizedValue];
+    else out[key] = sanitizedValue;
   }
   return out;
 }
@@ -1051,7 +1197,7 @@ function publish(message: StreamMessage) {
   }
 }
 
-function subscribeYjsSocket(ws: ServerWebSocket, docIds: string[]) {
+function subscribeYjsSocket(ws: YjsWebSocket, docIds: string[]) {
   const current = docIdsBySocket.get(ws) ?? new Set<string>();
   for (const docId of docIds.slice(0, 100)) {
     if (!docId) continue;
@@ -1066,7 +1212,7 @@ function subscribeYjsSocket(ws: ServerWebSocket, docIds: string[]) {
   docIdsBySocket.set(ws, current);
 }
 
-function unsubscribeYjsSocket(ws: ServerWebSocket) {
+function unsubscribeYjsSocket(ws: YjsWebSocket) {
   const docIds = docIdsBySocket.get(ws);
   if (!docIds) return;
   for (const docId of docIds) {
@@ -1077,7 +1223,7 @@ function unsubscribeYjsSocket(ws: ServerWebSocket) {
   docIds.clear();
 }
 
-function broadcastYjsUpdate(docId: string, update: string, except?: ServerWebSocket) {
+function broadcastYjsUpdate(docId: string, update: string, except?: YjsWebSocket) {
   const sockets = yjsSocketsByDoc.get(docId);
   if (!sockets?.size) return;
   const payload = JSON.stringify({ type: "update", docId, update } satisfies YjsSocketMessage);

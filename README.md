@@ -1,5 +1,7 @@
 # Chatview
 
+Status: this is still a work-in-progress deployment target. No production data is expected to live in this repo yet, and it is fine to rebuild or wipe pre-prod database state while the schema and deploy flow are still settling.
+
 Chatview is a local-first viewer for Claude Code JSONL history collected from multiple macOS machines.
 
 It has three parts:
@@ -53,7 +55,7 @@ Backend:
 
 ```sh
 export DATABASE_URL=postgres://user:password@localhost:5432/chatview
-export CHATVIEW_AGENT_TOKEN=dev-token
+export AGENT_TOKEN=dev-token
 bun run dev:backend
 ```
 
@@ -61,7 +63,7 @@ For the bundled local compose database:
 
 ```sh
 export DATABASE_URL=postgres://chatview:chatview@localhost:5432/chatview
-export CHATVIEW_AGENT_TOKEN=dev-token
+export AGENT_TOKEN=dev-token
 bun run dev:backend
 ```
 
@@ -74,8 +76,8 @@ bun run dev:local:backend
 Agent:
 
 ```sh
-export CHATVIEW_BACKEND_URL=http://localhost:3737
-export CHATVIEW_AGENT_TOKEN=dev-token
+export BACKEND_URL=http://localhost:3737
+export AGENT_TOKEN=dev-token
 bun run dev:agent
 ```
 

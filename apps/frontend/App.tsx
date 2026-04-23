@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
 import * as Y from "yjs";
 import type { HostInfo, SessionEvent, SessionInfo } from "../../packages/shared/types";
 import { getMeta, loadHosts, loadSessionEvents, loadSessions, setMeta } from "./db";
@@ -25,6 +25,7 @@ type FlatPart = TextPart | ThinkPart | ToolUseP | ToolResP;
 type ToolGroup = { kind: "tool_group"; uses: ToolUseP[]; results: ToolResP[] };
 type RenderItem = TextPart | ThinkPart | ToolGroup;
 type SyncState = "loading" | "syncing" | "idle" | "offline" | "error";
+type AuthState = "checking" | "authenticated" | "anonymous";
 type VirtualRange = { start: number; end: number; top: number; bottom: number };
 
 const ROW_OVERSCAN = 8;
@@ -118,7 +119,7 @@ function stringifyToolResult(content: any): string {
 }
 
 function linkify(text: string) {
-  const parts: (string | JSX.Element)[] = [];
+  const parts: (string | ReactElement)[] = [];
   const re = /(https?:\/\/[^\s)]+)/g;
   let last = 0;
   let m: RegExpExecArray | null;
@@ -137,7 +138,7 @@ function linkify(text: string) {
 }
 
 function inlineMarkdown(text: string) {
-  const out: (string | JSX.Element)[] = [];
+  const out: (string | ReactElement)[] = [];
   const re = /`([^`]+)`/g;
   let last = 0;
   let m: RegExpExecArray | null;
@@ -157,7 +158,7 @@ function ToolDetail({ use, result }: { use?: ToolUseP; result?: ToolResP }) {
   }
 
   const { name, input } = use;
-  let body: JSX.Element;
+  let body: ReactElement;
   switch (name) {
     case "Bash":
       body = (
@@ -456,6 +457,11 @@ function renderChatItem(it: RenderItem, i: number) {
 }
 
 export function App() {
+  const [authState, setAuthState] = useState<AuthState>("checking");
+  const [authConfigured, setAuthConfigured] = useState(true);
+  const [authToken, setAuthToken] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
   const [hosts, setHosts] = useState<HostInfo[]>([]);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeHost, setActiveHost] = useState("all");
@@ -473,6 +479,67 @@ export function App() {
   const yDocs = useRef(new Map<string, Y.Doc>());
   const ySocket = useRef<WebSocket | null>(null);
   const yPushTimers = useRef(new Map<string, number>());
+  const isAuthenticated = authState === "authenticated";
+
+  const checkAuth = useCallback(async () => {
+    try {
+      const response = await fetch("/api/auth/status");
+      const payload = (await response.json()) as { configured?: boolean; authenticated?: boolean };
+      setAuthConfigured(Boolean(payload.configured));
+      setAuthState(payload.authenticated ? "authenticated" : "anonymous");
+      setAuthError(payload.configured ? "" : "WEB_TOKEN is not configured on the server.");
+    } catch (error) {
+      setAuthState("anonymous");
+      setAuthError("Could not reach the auth endpoint.");
+      console.error(error);
+    }
+  }, []);
+
+  const login = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (!authToken.trim() || authBusy) return;
+
+      setAuthBusy(true);
+      setAuthError("");
+      try {
+        const response = await fetch("/api/auth/login", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token: authToken }),
+        });
+
+        if (!response.ok) {
+          setAuthError(response.status === 503 ? "WEB_TOKEN is not configured on the server." : "Token is not valid.");
+          setAuthState("anonymous");
+          return;
+        }
+
+        setAuthToken("");
+        setAuthState("authenticated");
+        setAuthConfigured(true);
+      } catch (error) {
+        setAuthError("Login failed.");
+        console.error(error);
+      } finally {
+        setAuthBusy(false);
+      }
+    },
+    [authBusy, authToken],
+  );
+
+  const logout = useCallback(async () => {
+    await fetch("/api/auth/logout", { method: "POST" }).catch((error) => console.error(error));
+    ySocket.current?.close();
+    ySocket.current = null;
+    activeYDocId.current = null;
+    setHosts([]);
+    setSessions([]);
+    setActive(null);
+    setEvents([]);
+    setDraft("");
+    setAuthState("anonymous");
+  }, []);
 
   const refreshCache = useCallback(async () => {
     const [nextHosts, nextSessions] = await Promise.all([loadHosts(), loadSessions()]);
@@ -483,6 +550,7 @@ export function App() {
   }, []);
 
   const syncNow = useCallback(async () => {
+    if (!isAuthenticated) return;
     if (syncing.current) return;
     syncing.current = true;
     setSyncState("syncing");
@@ -495,19 +563,41 @@ export function App() {
       setSyncState("idle");
       setStatusText(result.events ? `Synced ${result.events} events` : "Up to date");
     } catch (error) {
+      if (error instanceof Error && error.message.includes("401")) {
+        setAuthState("anonymous");
+        setAuthError("Session expired. Enter the token again.");
+      }
       setSyncState(navigator.onLine ? "error" : "offline");
       setStatusText(navigator.onLine ? "Sync failed" : "Offline cache");
       console.error(error);
     } finally {
       syncing.current = false;
     }
-  }, [refreshCache]);
+  }, [isAuthenticated, refreshCache]);
+
+  useEffect(() => {
+    checkAuth();
+  }, [checkAuth]);
+
+  useEffect(() => {
+    getMeta<"light" | "dark">("theme").then((stored) => {
+      const next = stored ?? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      setTheme(next);
+      document.documentElement.dataset.theme = next;
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    refreshCache().then(() => syncNow());
+  }, [isAuthenticated, refreshCache, syncNow]);
 
   useEffect(() => {
     activeRef.current = active;
   }, [active]);
 
   useEffect(() => {
+    if (!isAuthenticated) return;
     const socket = openYjsSocket(async (docId, update) => {
       const doc = yDocs.current.get(docId);
       if (doc) {
@@ -523,7 +613,7 @@ export function App() {
       socket.close();
       ySocket.current = null;
     };
-  }, []);
+  }, [isAuthenticated]);
 
   const scheduleYjsPush = useCallback((docId: string, sessionDbId: string, doc: Y.Doc, update: Uint8Array) => {
     sendYjsSocketUpdate(ySocket.current, docId, sessionDbId, update);
@@ -544,20 +634,12 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    getMeta<"light" | "dark">("theme").then((stored) => {
-      const next = stored ?? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-      setTheme(next);
-      document.documentElement.dataset.theme = next;
-    });
-    refreshCache().then(() => syncNow());
-  }, [refreshCache, syncNow]);
-
-  useEffect(() => {
     document.documentElement.dataset.theme = theme;
     setMeta("theme", theme);
   }, [theme]);
 
   useEffect(() => {
+    if (!isAuthenticated) return;
     if (!active) {
       setEvents([]);
       activeYDocId.current = null;
@@ -565,9 +647,10 @@ export function App() {
       return;
     }
     loadSessionEvents(active.id).then(setEvents);
-  }, [active]);
+  }, [active, isAuthenticated]);
 
   useEffect(() => {
+    if (!isAuthenticated) return;
     if (!active) return;
     const docId = docIdForSession(active.id);
     let disposed = false;
@@ -600,9 +683,10 @@ export function App() {
       disposed = true;
       cleanup?.();
     };
-  }, [active, scheduleYjsPush]);
+  }, [active, isAuthenticated, scheduleYjsPush]);
 
   useEffect(() => {
+    if (!isAuthenticated) return;
     const id = window.setInterval(() => {
       if (!document.hidden) syncNow();
     }, 5000);
@@ -616,7 +700,7 @@ export function App() {
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("online", syncNow);
     };
-  }, [syncNow]);
+  }, [isAuthenticated, syncNow]);
 
   const filteredSessions = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -648,14 +732,44 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!isAuthenticated) return;
     const topSessions = sessions.slice(0, 20);
     if (!topSessions.length) return;
     syncCachedDraftDocs(topSessions).catch((error) => console.error(error));
-  }, [sessions]);
+  }, [isAuthenticated, sessions]);
 
   useEffect(() => {
+    if (!isAuthenticated) return;
     subscribeYjsSocket(ySocket.current, yDocIdsToKeepWarm);
-  }, [yDocIdsToKeepWarm]);
+  }, [isAuthenticated, yDocIdsToKeepWarm]);
+
+  if (!isAuthenticated) {
+    return (
+      <div className="auth-page">
+        <form className="auth-panel" onSubmit={login}>
+          <div className="auth-brand">Chatview</div>
+          <label className="auth-label" htmlFor="chatview-token">
+            Token
+          </label>
+          <input
+            id="chatview-token"
+            className="auth-input"
+            type="password"
+            value={authToken}
+            onChange={(event) => setAuthToken(event.target.value)}
+            placeholder={authState === "checking" ? "Checking session" : "Enter token"}
+            autoFocus
+            autoComplete="current-password"
+            disabled={authState === "checking" || authBusy || !authConfigured}
+          />
+          {authError && <div className="auth-error">{authError}</div>}
+          <button className="auth-button" disabled={authState === "checking" || authBusy || !authConfigured || !authToken.trim()}>
+            {authBusy ? "Signing in" : "Sign in"}
+          </button>
+        </form>
+      </div>
+    );
+  }
 
   return (
     <div className={`app-shell ${sidebarOpen ? "" : "sidebar-closed"}`}>
@@ -682,6 +796,9 @@ export function App() {
             title="Toggle theme"
           >
             {theme === "dark" ? "Light" : "Dark"}
+          </button>
+          <button className="icon-button" onClick={logout} title="Sign out">
+            Logout
           </button>
         </div>
       </header>

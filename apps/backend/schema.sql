@@ -70,7 +70,7 @@ create table if not exists yjs_documents (
 create index if not exists idx_yjs_documents_session
   on yjs_documents (session_db_id);
 
-create table if not exists shortcut_ingest_tokens (
+create table if not exists import_tokens (
   id bigserial primary key,
   token text not null unique,
   label text not null,
@@ -78,14 +78,10 @@ create table if not exists shortcut_ingest_tokens (
   last_used_at timestamptz
 );
 
-insert into shortcut_ingest_tokens (token, label)
-values ('iphone-shortcut-dev-token', 'iPhone Shortcut development token')
-on conflict (token) do nothing;
-
-create table if not exists shortcut_ingest_requests (
+create table if not exists import_requests (
   id bigserial primary key,
-  token_id bigint references shortcut_ingest_tokens(id) on delete set null,
-  token text,
+  token_id bigint references import_tokens(id) on delete set null,
+  token_sha256 text,
   method text not null,
   url text not null,
   path text not null,
@@ -105,14 +101,15 @@ create table if not exists shortcut_ingest_requests (
   responded_at timestamptz
 );
 
-create index if not exists idx_shortcut_ingest_requests_received
-  on shortcut_ingest_requests (received_at desc);
+create index if not exists idx_import_requests_received
+  on import_requests (received_at desc);
 
-create index if not exists idx_shortcut_ingest_requests_token
-  on shortcut_ingest_requests (token_id, received_at desc);
+create index if not exists idx_import_requests_token
+  on import_requests (token_id, received_at desc);
 
-create table if not exists shortcut_audio_blobs (
+create table if not exists import_media_blobs (
   id bigserial primary key,
+  media_kind text not null default 'audio',
   sha256 text not null unique,
   bytes bytea not null,
   size_bytes bigint not null,
@@ -125,13 +122,13 @@ create table if not exists shortcut_audio_blobs (
   last_seen_at timestamptz not null default now()
 );
 
-create index if not exists idx_shortcut_audio_blobs_seen
-  on shortcut_audio_blobs (last_seen_at desc);
+create index if not exists idx_import_media_blobs_seen
+  on import_media_blobs (last_seen_at desc);
 
-create table if not exists shortcut_ingest_request_audio (
+create table if not exists import_request_media (
   id bigserial primary key,
-  request_id bigint not null references shortcut_ingest_requests(id) on delete cascade,
-  audio_id bigint not null references shortcut_audio_blobs(id) on delete cascade,
+  request_id bigint not null references import_requests(id) on delete cascade,
+  media_id bigint not null references import_media_blobs(id) on delete cascade,
   part_index integer not null,
   part_name text,
   source_kind text not null,
@@ -143,5 +140,5 @@ create table if not exists shortcut_ingest_request_audio (
   unique (request_id, part_index)
 );
 
-create index if not exists idx_shortcut_ingest_request_audio_request
-  on shortcut_ingest_request_audio (request_id, part_index);
+create index if not exists idx_import_request_media_request
+  on import_request_media (request_id, part_index);

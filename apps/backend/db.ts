@@ -1,22 +1,32 @@
-const databaseUrl = process.env.DATABASE_URL ?? process.env.POSTGRES_URL;
+import { envPositiveInteger, envValue } from "../../packages/shared/env";
+
+const databaseUrl = envValue(process.env, "DATABASE_URL", "POSTGRES_URL");
+const dbPoolMax = envPositiveInteger(process.env, ["DB_POOL_MAX", "CHATVIEW_DB_POOL_MAX"], 5);
 
 if (!databaseUrl) {
   throw new Error("DATABASE_URL or POSTGRES_URL is required for the chatview backend");
 }
 
 const SQL = (Bun as any).SQL;
-export const sql = new SQL(databaseUrl);
+export const sql = new SQL(databaseUrl, {
+  max: dbPoolMax,
+});
 
-export async function ensureSchema() {
-  const schema = await Bun.file(new URL("./schema.sql", import.meta.url)).text();
-  const statements = schema
-    .split(/;\s*(?:\n|$)/)
-    .map((statement) => statement.trim())
-    .filter(Boolean);
+if (import.meta.hot) {
+  import.meta.hot.dispose(async () => {
+    await sql.close?.(0);
+  });
+}
 
-  for (const statement of statements) {
-    await sql.unsafe(statement);
+export async function prepareDatabase() {
+  const { assertDatabaseReady, migrationsEnabled, runMigrations } = await import("./migrations");
+
+  if (migrationsEnabled()) {
+    await runMigrations(sql);
+    return;
   }
+
+  await assertDatabaseReady(sql);
 }
 
 export function toId(value: unknown) {

@@ -1,11 +1,12 @@
 services:
   postgres:
-    image: postgres:18
+    image: postgres:18.3
     container_name: chatview-postgres
     environment:
       POSTGRES_DB: chatview
       POSTGRES_USER: chatview
       POSTGRES_PASSWORD: chatview
+      PGDATA: /var/lib/postgresql/18/docker
     ports:
       - "5432:5432"
     volumes:
