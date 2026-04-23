@@ -28,6 +28,18 @@ create table if not exists chat_sessions (
   title text,
   size_bytes bigint not null default 0,
   mtime_ms double precision not null default 0,
+  content_sha256 text,
+  mime_type text,
+  encoding text,
+  line_count integer,
+  mode integer,
+  symlink_target text,
+  git_repo_root text,
+  git_branch text,
+  git_commit text,
+  git_dirty boolean,
+  git_remote_url text,
+  deleted_at timestamptz,
   first_seen_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now(),
   unique (agent_id, session_id)
@@ -43,6 +55,7 @@ create table if not exists session_events (
   role text,
   occurred_at timestamptz,
   raw jsonb not null,
+  line_sha256 text,
   ingested_at timestamptz not null default now(),
   unique (session_db_id, source_line_no)
 );
@@ -58,6 +71,15 @@ create index if not exists idx_events_session_line
 
 create index if not exists idx_events_type
   on session_events (event_type);
+
+create index if not exists idx_sessions_deleted_at
+  on chat_sessions (deleted_at) where deleted_at is not null;
+
+create index if not exists idx_sessions_git_commit
+  on chat_sessions (git_commit) where git_commit is not null;
+
+create index if not exists idx_events_line_sha256
+  on session_events (line_sha256) where line_sha256 is not null;
 
 create table if not exists yjs_documents (
   doc_id text primary key,

@@ -15,6 +15,24 @@ export type IngestEvent = {
   role?: string;
   createdAt?: string;
   title?: string;
+  lineSha256?: string;
+};
+
+export type FileMetadata = {
+  contentSha256?: string;
+  mimeType?: string;
+  encoding?: string;
+  lineCount?: number;
+  mode?: number;
+  symlinkTarget?: string;
+};
+
+export type GitMetadata = {
+  repoRoot?: string;
+  branch?: string;
+  commit?: string;
+  dirty?: boolean;
+  remoteUrl?: string;
 };
 
 export type IngestSession = {
@@ -25,6 +43,9 @@ export type IngestSession = {
   sizeBytes: number;
   mtimeMs: number;
   events: IngestEvent[];
+  file?: FileMetadata;
+  git?: GitMetadata;
+  deleted?: boolean;
 };
 
 export type IngestBatchRequest = {
@@ -65,6 +86,18 @@ export type SessionInfo = {
   firstSeenAt: string;
   lastSeenAt: string;
   eventCount: number;
+  contentSha256?: string | null;
+  mimeType?: string | null;
+  encoding?: string | null;
+  lineCount?: number | null;
+  mode?: number | null;
+  symlinkTarget?: string | null;
+  gitRepoRoot?: string | null;
+  gitBranch?: string | null;
+  gitCommit?: string | null;
+  gitDirty?: boolean | null;
+  gitRemoteUrl?: string | null;
+  deletedAt?: string | null;
 };
 
 export type SessionEvent = {

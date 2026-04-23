@@ -7,6 +7,15 @@ export type PullResult = {
   cursor: string;
 };
 
+export class SyncAuthError extends Error {
+  status: number;
+  constructor(status: number, body: string) {
+    super(`sync failed: ${status} ${body}`);
+    this.name = "SyncAuthError";
+    this.status = status;
+  }
+}
+
 const DEFAULT_LIMIT_BYTES = 2 * 1024 * 1024;
 
 export async function pullUpdates(limitBytes = DEFAULT_LIMIT_BYTES): Promise<PullResult> {
@@ -20,7 +29,11 @@ export async function pullUpdates(limitBytes = DEFAULT_LIMIT_BYTES): Promise<Pul
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ cursor, limitBytes }),
     });
-    if (!response.ok) throw new Error(`sync failed: ${response.status} ${await response.text()}`);
+    if (!response.ok) {
+      const body = await response.text();
+      if (response.status === 401 || response.status === 403) throw new SyncAuthError(response.status, body);
+      throw new Error(`sync failed: ${response.status} ${body}`);
+    }
 
     const payload = (await response.json()) as SyncResponse;
     await applySync(payload);

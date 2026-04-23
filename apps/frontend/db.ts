@@ -81,7 +81,21 @@ export async function applySync(payload: SyncResponse) {
   const meta = tx.objectStore("meta");
 
   for (const host of payload.hosts) hosts.put(host);
-  for (const session of payload.sessions) sessions.put(session);
+  for (const session of payload.sessions) {
+    if (session.deletedAt) {
+      sessions.delete(session.id);
+      const eventIndex = events.index("sessionDbId");
+      const cursorReq = eventIndex.openKeyCursor(IDBKeyRange.only(session.id));
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result;
+        if (!cursor) return;
+        events.delete(cursor.primaryKey);
+        cursor.continue();
+      };
+    } else {
+      sessions.put(session);
+    }
+  }
   for (const event of payload.events) events.put(event);
   meta.put({ key: "syncCursor", value: payload.cursor });
   meta.put({ key: "lastSyncAt", value: new Date().toISOString() });

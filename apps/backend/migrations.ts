@@ -210,6 +210,37 @@ alter index if exists idx_shortcut_ingest_request_audio_request
   rename to idx_import_request_media_request;
 `.trim(),
   },
+  {
+    id: "0003",
+    name: "session_file_and_git_metadata",
+    sql: `
+alter table chat_sessions
+  add column if not exists content_sha256 text,
+  add column if not exists mime_type text,
+  add column if not exists encoding text,
+  add column if not exists line_count integer,
+  add column if not exists mode integer,
+  add column if not exists symlink_target text,
+  add column if not exists git_repo_root text,
+  add column if not exists git_branch text,
+  add column if not exists git_commit text,
+  add column if not exists git_dirty boolean,
+  add column if not exists git_remote_url text,
+  add column if not exists deleted_at timestamptz;
+
+alter table session_events
+  add column if not exists line_sha256 text;
+
+create index if not exists idx_sessions_deleted_at
+  on chat_sessions (deleted_at) where deleted_at is not null;
+
+create index if not exists idx_sessions_git_commit
+  on chat_sessions (git_commit) where git_commit is not null;
+
+create index if not exists idx_events_line_sha256
+  on session_events (line_sha256) where line_sha256 is not null;
+`.trim(),
+  },
 ];
 
 export function migrationsEnabled(env = process.env) {

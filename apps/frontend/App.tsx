@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type
 import * as Y from "yjs";
 import type { HostInfo, SessionEvent, SessionInfo } from "../../packages/shared/types";
 import { getMeta, loadHosts, loadSessionEvents, loadSessions, setMeta } from "./db";
-import { pullUpdates } from "./sync";
+import { pullUpdates, SyncAuthError } from "./sync";
 import {
   docIdForSession,
   getDraft,
@@ -557,13 +557,32 @@ export function App() {
     setStatusText("Syncing");
     try {
       const result = await pullUpdates();
-      await refreshCache();
+      const { sessions: refreshedSessions } = await refreshCache();
       const current = activeRef.current;
-      if (current && result.events > 0) setEvents(await loadSessionEvents(current.id));
+      let activeRemoved = false;
+      if (current) {
+        const fresh = refreshedSessions.find((session) => session.id === current.id);
+        if (!fresh || fresh.deletedAt) {
+          const docId = activeYDocId.current;
+          if (docId) {
+            yDocs.current.delete(docId);
+            activeYDocId.current = null;
+          }
+          setActive(null);
+          setEvents([]);
+          setDraft("");
+          activeRemoved = true;
+          console.warn("active session no longer available", current.id);
+        } else if (result.events > 0) {
+          setEvents(await loadSessionEvents(current.id));
+        }
+      }
       setSyncState("idle");
-      setStatusText(result.events ? `Synced ${result.events} events` : "Up to date");
+      setStatusText(
+        activeRemoved ? "Active chat was removed" : result.events ? `Synced ${result.events} events` : "Up to date",
+      );
     } catch (error) {
-      if (error instanceof Error && error.message.includes("401")) {
+      if (error instanceof SyncAuthError) {
         setAuthState("anonymous");
         setAuthError("Session expired. Enter the token again.");
       }

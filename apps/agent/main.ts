@@ -1,9 +1,16 @@
-import { randomUUID } from "node:crypto";
-import { chmod, copyFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { chmod, copyFile, lstat, mkdir, readdir, readFile, readlink, stat, writeFile } from "node:fs/promises";
 import { arch, homedir, hostname, platform } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, parse as parsePath } from "node:path";
 import { Buffer } from "node:buffer";
-import type { AgentIdentity, IngestBatchRequest, IngestEvent, IngestSession } from "../../packages/shared/types";
+import type {
+  AgentIdentity,
+  FileMetadata,
+  GitMetadata,
+  IngestBatchRequest,
+  IngestEvent,
+  IngestSession,
+} from "../../packages/shared/types";
 import { envValue } from "../../packages/shared/env";
 
 declare const CHATVIEW_EMBEDDED_BACKEND_URL: string | undefined;
@@ -33,6 +40,9 @@ type FileState = {
   lineNo: number;
   sizeBytes: number;
   mtimeMs: number;
+  projectKey?: string;
+  projectName?: string;
+  sessionId?: string;
 };
 
 type AgentState = {
@@ -116,39 +126,103 @@ function loadConfig(): Config {
 
 async function scanAndFlush(config: Config, identity: AgentIdentity, state: AgentState) {
   const files = await listJsonlFiles(config.projectsDir);
+  const currentPaths = new Set(files.map((f) => f.sourcePath));
+  const gitCache = new Map<string, GitMetadata | undefined>();
   let sentEvents = 0;
 
   for (const file of files) {
     const current = state.files[file.sourcePath] ?? { offset: 0, lineNo: 0, sizeBytes: 0, mtimeMs: 0 };
+    const identityFields = { projectKey: file.projectKey, projectName: file.projectName, sessionId: file.sessionId };
     const update = await readAppend(file, current, config.readChunkBytes);
     if (!update || !update.session.events.length) {
-      state.files[file.sourcePath] = update?.nextState ?? current;
+      state.files[file.sourcePath] = { ...(update?.nextState ?? current), ...identityFields };
       continue;
     }
 
-    const body: IngestBatchRequest = {
-      agent: identity,
-      sessions: [update.session],
+    const fileMeta = await collectFileMetadata(file.sourcePath, update.contentSha256);
+    const gitMeta = await collectGitMetadata(file.sourcePath, gitCache);
+
+    const session: IngestSession = {
+      ...update.session,
+      file: fileMeta,
+      git: gitMeta,
     };
 
-    const response = await fetch(`${config.backendUrl}/api/ingest/batch`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${config.token}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
+    const body: IngestBatchRequest = {
+      agent: identity,
+      sessions: [session],
+    };
 
-    if (!response.ok) {
-      throw new Error(`ingest failed for ${file.sourcePath}: ${response.status} ${await response.text()}`);
-    }
+    await postIngest(config, body, file.sourcePath);
 
-    state.files[file.sourcePath] = update.nextState;
+    state.files[file.sourcePath] = { ...update.nextState, ...identityFields };
     sentEvents += update.session.events.length;
   }
 
+  for (const path of Object.keys(state.files)) {
+    if (currentPaths.has(path)) continue;
+    const prior = state.files[path];
+    if (!prior?.projectKey || !prior?.sessionId) {
+      delete state.files[path];
+      continue;
+    }
+    const deletedSession: IngestSession = {
+      projectKey: prior.projectKey,
+      projectName: prior.projectName,
+      sessionId: prior.sessionId,
+      sourcePath: path,
+      sizeBytes: prior.sizeBytes ?? 0,
+      mtimeMs: prior.mtimeMs ?? 0,
+      events: [],
+      deleted: true,
+    };
+    try {
+      await postIngest(config, { agent: identity, sessions: [deletedSession] }, path);
+      delete state.files[path];
+    } catch (error) {
+      console.error(`[agent] failed to mark deleted ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   if (sentEvents) console.log(`[agent] sent ${sentEvents} event(s)`);
+}
+
+async function postIngest(config: Config, body: IngestBatchRequest, sourcePath: string) {
+  const response = await fetchWithRetry(`${config.backendUrl}/api/ingest/batch`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${config.token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(`ingest failed for ${sourcePath}: ${response.status} ${await response.text()}`);
+  }
+}
+
+async function fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
+  const maxAttempts = 8;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const response = await fetch(url, init);
+      if (response.ok) return response;
+      if (response.status === 429 || response.status >= 500) {
+        lastError = new Error(`HTTP ${response.status}`);
+        await response.body?.cancel().catch(() => {});
+      } else {
+        return response;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt === maxAttempts - 1) break;
+    const base = Math.min(8000, 500 * 2 ** attempt);
+    const delay = base / 2 + Math.random() * (base / 2);
+    await sleep(delay);
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 async function listJsonlFiles(projectsDir: string): Promise<JsonlFile[]> {
@@ -211,24 +285,30 @@ async function readAppend(file: JsonlFile, current: FileState, readChunkBytes: n
     return {
       session: emptySession(file),
       nextState: { offset, lineNo, sizeBytes: file.sizeBytes, mtimeMs: file.mtimeMs },
+      contentSha256: undefined as string | undefined,
     };
   }
 
   const end = Math.min(file.sizeBytes, offset + readChunkBytes);
-  const chunk = await Bun.file(file.sourcePath).slice(offset, end).text();
-  if (!chunk) return null;
+  const buf = Buffer.from(await Bun.file(file.sourcePath).slice(offset, end).arrayBuffer());
+  if (buf.length === 0) return null;
 
-  const newline = chunk.lastIndexOf("\n");
-  if (newline < 0) return null;
+  const lastNewline = buf.lastIndexOf(0x0a);
+  if (lastNewline < 0) return null;
 
-  const complete = chunk.slice(0, newline + 1);
+  const completeBytes = buf.subarray(0, lastNewline + 1);
+  const decoder = new TextDecoder("utf-8");
   const events: IngestEvent[] = [];
-  let cursorOffset = offset;
+  let cursor = 0;
 
-  for (const rawLine of complete.split("\n").slice(0, -1)) {
-    const lineOffset = cursorOffset;
-    cursorOffset += Buffer.byteLength(`${rawLine}\n`, "utf8");
+  while (cursor <= lastNewline) {
+    const nlIdx = completeBytes.indexOf(0x0a, cursor);
+    if (nlIdx < 0) break;
+    const lineBytes = completeBytes.subarray(cursor, nlIdx);
+    const lineOffset = offset + cursor;
+    cursor = nlIdx + 1;
     lineNo += 1;
+    const rawLine = decoder.decode(lineBytes);
     if (!rawLine.trim()) continue;
 
     const raw = sanitizeJson(parseLine(rawLine));
@@ -241,8 +321,12 @@ async function readAppend(file: JsonlFile, current: FileState, readChunkBytes: n
       role: meta.role,
       createdAt: meta.createdAt,
       title: meta.title,
+      lineSha256: sha256Hex(lineBytes),
     });
   }
+
+  const nextOffset = offset + completeBytes.length;
+  const contentSha256 = await hashFileRange(file.sourcePath, nextOffset);
 
   return {
     session: {
@@ -250,12 +334,92 @@ async function readAppend(file: JsonlFile, current: FileState, readChunkBytes: n
       events,
     },
     nextState: {
-      offset: offset + Buffer.byteLength(complete, "utf8"),
+      offset: nextOffset,
       lineNo,
       sizeBytes: file.sizeBytes,
       mtimeMs: file.mtimeMs,
     },
+    contentSha256,
   };
+}
+
+function sha256Hex(data: Buffer | string): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+async function hashFileRange(path: string, endByte: number): Promise<string | undefined> {
+  try {
+    const buf = Buffer.from(await Bun.file(path).slice(0, endByte).arrayBuffer());
+    return sha256Hex(buf);
+  } catch {
+    return undefined;
+  }
+}
+
+async function collectFileMetadata(path: string, contentSha256: string | undefined): Promise<FileMetadata> {
+  const meta: FileMetadata = { mimeType: "application/x-ndjson" };
+  if (contentSha256) meta.contentSha256 = contentSha256;
+  try {
+    const ls = await lstat(path);
+    meta.mode = ls.mode;
+    if (ls.isSymbolicLink()) {
+      try {
+        meta.symlinkTarget = await readlink(path);
+      } catch {}
+    }
+  } catch {}
+  return meta;
+}
+
+async function collectGitMetadata(
+  sourcePath: string,
+  cache: Map<string, GitMetadata | undefined>,
+): Promise<GitMetadata | undefined> {
+  try {
+    const repoRoot = await findGitRepoRoot(sourcePath);
+    if (!repoRoot) return undefined;
+    if (cache.has(repoRoot)) return cache.get(repoRoot);
+    const meta: GitMetadata = { repoRoot };
+    meta.commit = runGit(repoRoot, ["rev-parse", "HEAD"]);
+    meta.branch = runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    const porcelain = runGitRaw(repoRoot, ["status", "--porcelain"]);
+    if (porcelain !== undefined) meta.dirty = porcelain.length > 0;
+    meta.remoteUrl = runGit(repoRoot, ["config", "--get", "remote.origin.url"]);
+    cache.set(repoRoot, meta);
+    return meta;
+  } catch {
+    return undefined;
+  }
+}
+
+async function findGitRepoRoot(startPath: string): Promise<string | undefined> {
+  let dir = dirname(startPath);
+  const root = parsePath(dir).root;
+  while (true) {
+    try {
+      const s = await stat(join(dir, ".git"));
+      if (s.isDirectory() || s.isFile()) return dir;
+    } catch {}
+    if (dir === root) return undefined;
+    const parent = dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
+function runGit(repoRoot: string, args: string[]): string | undefined {
+  const out = runGitRaw(repoRoot, args);
+  return out && out.length ? out : undefined;
+}
+
+function runGitRaw(repoRoot: string, args: string[]): string | undefined {
+  try {
+    const proc = Bun.spawnSync(["git", "-C", repoRoot, ...args], { stdout: "pipe", stderr: "ignore" });
+    if (proc.exitCode !== 0) return undefined;
+    return new TextDecoder().decode(proc.stdout).trim();
+  } catch {
+    return undefined;
+  }
 }
 
 function emptySession(file: JsonlFile): IngestSession {

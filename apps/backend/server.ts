@@ -834,12 +834,25 @@ async function listSessions(agentId?: string): Promise<SessionInfo[]> {
           s.mtime_ms,
           s.first_seen_at,
           s.last_seen_at,
+          s.content_sha256,
+          s.mime_type,
+          s.encoding,
+          s.line_count,
+          s.mode,
+          s.symlink_target,
+          s.git_repo_root,
+          s.git_branch,
+          s.git_commit,
+          s.git_dirty,
+          s.git_remote_url,
+          s.deleted_at,
           count(e.id) as event_count
         from chat_sessions s
         join agents a on a.id = s.agent_id
         join projects p on p.id = s.project_id
         left join session_events e on e.session_db_id = s.id
         where s.agent_id = ${agentId}
+          and s.deleted_at is null
         group by s.id, a.hostname, p.project_key, p.display_name
         order by s.last_seen_at desc
       `
@@ -857,11 +870,24 @@ async function listSessions(agentId?: string): Promise<SessionInfo[]> {
           s.mtime_ms,
           s.first_seen_at,
           s.last_seen_at,
+          s.content_sha256,
+          s.mime_type,
+          s.encoding,
+          s.line_count,
+          s.mode,
+          s.symlink_target,
+          s.git_repo_root,
+          s.git_branch,
+          s.git_commit,
+          s.git_dirty,
+          s.git_remote_url,
+          s.deleted_at,
           count(e.id) as event_count
         from chat_sessions s
         join agents a on a.id = s.agent_id
         join projects p on p.id = s.project_id
         left join session_events e on e.session_db_id = s.id
+        where s.deleted_at is null
         group by s.id, a.hostname, p.project_key, p.display_name
         order by s.last_seen_at desc
       `;
@@ -884,6 +910,18 @@ async function getSession(id: string): Promise<SessionPayload | null> {
       s.mtime_ms,
       s.first_seen_at,
       s.last_seen_at,
+      s.content_sha256,
+      s.mime_type,
+      s.encoding,
+      s.line_count,
+      s.mode,
+      s.symlink_target,
+      s.git_repo_root,
+      s.git_branch,
+      s.git_commit,
+      s.git_dirty,
+      s.git_remote_url,
+      s.deleted_at,
       count(e.id) as event_count
     from chat_sessions s
     join agents a on a.id = s.agent_id
@@ -992,107 +1030,181 @@ function mapSession(row: any): SessionInfo {
     firstSeenAt: row.first_seen_at,
     lastSeenAt: row.last_seen_at,
     eventCount: toNumber(row.event_count),
+    contentSha256: row.content_sha256 ?? null,
+    mimeType: row.mime_type ?? null,
+    encoding: row.encoding ?? null,
+    lineCount: row.line_count == null ? null : toNumber(row.line_count),
+    mode: row.mode == null ? null : toNumber(row.mode),
+    symlinkTarget: row.symlink_target ?? null,
+    gitRepoRoot: row.git_repo_root ?? null,
+    gitBranch: row.git_branch ?? null,
+    gitCommit: row.git_commit ?? null,
+    gitDirty: row.git_dirty ?? null,
+    gitRemoteUrl: row.git_remote_url ?? null,
+    deletedAt: row.deleted_at ?? null,
   };
 }
 
 async function ingestBatch(body: IngestBatchRequest): Promise<IngestBatchResponse> {
   validateBatch(body);
 
-  await sql`
-    insert into agents (id, hostname, platform, arch, version, source_root, last_seen_at)
-    values (
-      ${body.agent.agentId},
-      ${body.agent.hostname},
-      ${body.agent.platform},
-      ${body.agent.arch},
-      ${body.agent.version},
-      ${body.agent.sourceRoot},
-      now()
-    )
-    on conflict (id) do update set
-      hostname = excluded.hostname,
-      platform = excluded.platform,
-      arch = excluded.arch,
-      version = excluded.version,
-      source_root = excluded.source_root,
-      last_seen_at = now()
-  `;
-
   let acceptedEvents = 0;
   const changedSessionIds = new Set<string>();
 
   for (const session of body.sessions) {
-    const projectRows = await sql`
-      insert into projects (agent_id, project_key, display_name, last_seen_at)
-      values (${body.agent.agentId}, ${session.projectKey}, ${session.projectName ?? shortProject(session.projectKey)}, now())
-      on conflict (agent_id, project_key) do update set
-        display_name = excluded.display_name,
-        last_seen_at = now()
-      returning id
-    `;
-    const projectId = projectRows[0].id;
-    const title = session.events.find((event) => event.title)?.title ?? null;
-
-    const sessionRows = await sql`
-      insert into chat_sessions (
-        agent_id,
-        project_id,
-        session_id,
-        source_path,
-        title,
-        size_bytes,
-        mtime_ms,
-        last_seen_at
-      )
-      values (
-        ${body.agent.agentId},
-        ${projectId},
-        ${session.sessionId},
-        ${session.sourcePath},
-        ${title},
-        ${session.sizeBytes},
-        ${session.mtimeMs},
-        now()
-      )
-      on conflict (agent_id, session_id) do update set
-        project_id = excluded.project_id,
-        source_path = excluded.source_path,
-        title = coalesce(excluded.title, chat_sessions.title),
-        size_bytes = excluded.size_bytes,
-        mtime_ms = excluded.mtime_ms,
-        last_seen_at = now()
-      returning id
-    `;
-    const sessionDbId = sessionRows[0].id;
-    changedSessionIds.add(toId(sessionDbId));
-
-    for (const event of session.events) {
-      const inserted = await sql`
-        insert into session_events (
-          session_db_id,
-          agent_id,
-          source_line_no,
-          source_offset,
-          event_type,
-          role,
-          occurred_at,
-          raw
-        )
+    const accepted = await sql.transaction(async (tx: any) => {
+      await tx`
+        insert into agents (id, hostname, platform, arch, version, source_root, last_seen_at)
         values (
-          ${sessionDbId},
           ${body.agent.agentId},
-          ${event.lineNo},
-          ${event.offset},
-          ${event.eventType ?? null},
-          ${event.role ?? null},
-          ${event.createdAt ?? null},
-          ${event.raw}::jsonb
+          ${body.agent.hostname},
+          ${body.agent.platform},
+          ${body.agent.arch},
+          ${body.agent.version},
+          ${body.agent.sourceRoot},
+          now()
         )
-        on conflict (session_db_id, source_line_no) do nothing
+        on conflict (id) do update set
+          hostname = excluded.hostname,
+          platform = excluded.platform,
+          arch = excluded.arch,
+          version = excluded.version,
+          source_root = excluded.source_root,
+          last_seen_at = now()
+      `;
+
+      const projectRows = await tx`
+        insert into projects (agent_id, project_key, display_name, last_seen_at)
+        values (${body.agent.agentId}, ${session.projectKey}, ${session.projectName ?? shortProject(session.projectKey)}, now())
+        on conflict (agent_id, project_key) do update set
+          display_name = excluded.display_name,
+          last_seen_at = now()
         returning id
       `;
-      acceptedEvents += inserted.length;
-    }
+      const projectId = projectRows[0].id;
+      const title = session.events.find((event) => event.title)?.title ?? null;
+      const file = session.file ?? {};
+      const git = session.git ?? {};
+
+      const sessionRows = await tx`
+        insert into chat_sessions (
+          agent_id,
+          project_id,
+          session_id,
+          source_path,
+          title,
+          size_bytes,
+          mtime_ms,
+          last_seen_at,
+          content_sha256,
+          mime_type,
+          encoding,
+          line_count,
+          mode,
+          symlink_target,
+          git_repo_root,
+          git_branch,
+          git_commit,
+          git_dirty,
+          git_remote_url,
+          deleted_at
+        )
+        values (
+          ${body.agent.agentId},
+          ${projectId},
+          ${session.sessionId},
+          ${session.sourcePath},
+          ${title},
+          ${session.sizeBytes},
+          ${session.mtimeMs},
+          now(),
+          ${file.contentSha256 ?? null},
+          ${file.mimeType ?? null},
+          ${file.encoding ?? null},
+          ${file.lineCount ?? null},
+          ${file.mode ?? null},
+          ${file.symlinkTarget ?? null},
+          ${git.repoRoot ?? null},
+          ${git.branch ?? null},
+          ${git.commit ?? null},
+          ${git.dirty ?? null},
+          ${git.remoteUrl ?? null},
+          case when ${session.deleted ?? false}::boolean then now() else null end
+        )
+        on conflict (agent_id, session_id) do update set
+          project_id = excluded.project_id,
+          source_path = excluded.source_path,
+          title = coalesce(excluded.title, chat_sessions.title),
+          size_bytes = excluded.size_bytes,
+          mtime_ms = excluded.mtime_ms,
+          last_seen_at = now(),
+          content_sha256 = coalesce(excluded.content_sha256, chat_sessions.content_sha256),
+          mime_type = coalesce(excluded.mime_type, chat_sessions.mime_type),
+          encoding = coalesce(excluded.encoding, chat_sessions.encoding),
+          line_count = coalesce(excluded.line_count, chat_sessions.line_count),
+          mode = coalesce(excluded.mode, chat_sessions.mode),
+          symlink_target = coalesce(excluded.symlink_target, chat_sessions.symlink_target),
+          git_repo_root = coalesce(excluded.git_repo_root, chat_sessions.git_repo_root),
+          git_branch = coalesce(excluded.git_branch, chat_sessions.git_branch),
+          git_commit = coalesce(excluded.git_commit, chat_sessions.git_commit),
+          git_dirty = coalesce(excluded.git_dirty, chat_sessions.git_dirty),
+          git_remote_url = coalesce(excluded.git_remote_url, chat_sessions.git_remote_url),
+          deleted_at = case
+            when excluded.deleted_at is not null then excluded.deleted_at
+            else chat_sessions.deleted_at
+          end
+        returning id
+      `;
+      const sessionDbId = sessionRows[0].id;
+      changedSessionIds.add(toId(sessionDbId));
+
+      if (session.deleted) return 0;
+
+      let inserts = 0;
+      for (const event of session.events) {
+        await tx.unsafe("savepoint sp_event");
+        try {
+          const inserted = await tx`
+            insert into session_events (
+              session_db_id,
+              agent_id,
+              source_line_no,
+              source_offset,
+              event_type,
+              role,
+              occurred_at,
+              raw,
+              line_sha256
+            )
+            values (
+              ${sessionDbId},
+              ${body.agent.agentId},
+              ${event.lineNo},
+              ${event.offset},
+              ${event.eventType ?? null},
+              ${event.role ?? null},
+              ${event.createdAt ?? null},
+              ${event.raw}::jsonb,
+              ${event.lineSha256 ?? null}
+            )
+            on conflict (session_db_id, source_line_no) do nothing
+            returning id
+          `;
+          await tx.unsafe("release savepoint sp_event");
+          inserts += inserted.length;
+        } catch (error) {
+          await tx.unsafe("rollback to savepoint sp_event");
+          await tx.unsafe("release savepoint sp_event").catch(() => {});
+          console.error("ingest event insert failed", {
+            sessionDbId: toId(sessionDbId),
+            lineNo: event.lineNo,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      return inserts;
+    });
+    acceptedEvents += accepted;
   }
 
   if (changedSessionIds.size) {
