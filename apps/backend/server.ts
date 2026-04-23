@@ -1,4 +1,5 @@
 import index from "../../index.html";
+import { createHash } from "node:crypto";
 import * as Y from "yjs";
 import type {
   HostInfo,
@@ -17,6 +18,7 @@ import { ensureSchema, sql, toId, toNumber } from "./db";
 
 const port = Number(process.env.PORT ?? process.env.CHATVIEW_PORT ?? 3737);
 const agentToken = process.env.CHATVIEW_AGENT_TOKEN ?? "dev-token";
+const gitSha = process.env.GIT_SHA ?? "unknown";
 const encoder = new TextEncoder();
 const streamClients = new Set<ReadableStreamDefaultController<Uint8Array>>();
 const yjsSocketsByDoc = new Map<string, Set<ServerWebSocket>>();
@@ -32,7 +34,8 @@ Bun.serve<{ docIds: Set<string> }>({
   port,
   routes: {
     "/": index,
-    "/api/health": () => json({ ok: true }),
+    "/api/health": () => json({ ok: true, commit_sha: gitSha }),
+    "/status-9c8e0f3a2b71": () => json({ ok: true, commit_sha: gitSha, uptime: Math.round(process.uptime()) }),
     "/api/hosts": async () => json(await listHosts()),
     "/api/sessions": async (req) => {
       const url = new URL(req.url);
@@ -75,6 +78,7 @@ Bun.serve<{ docIds: Set<string> }>({
         return text(error instanceof Error ? error.message : "bad request", 400);
       }
     },
+    "/api/shortcuts/audio": async (req) => handleShortcutAudio(req),
   },
   websocket: {
     open(ws) {
@@ -119,6 +123,513 @@ function text(value: string, status = 200) {
 function isAuthorized(req: Request) {
   const auth = req.headers.get("authorization") ?? "";
   return auth === `Bearer ${agentToken}`;
+}
+
+type ShortcutAudioCandidate = {
+  sourceKind: string;
+  partIndex: number;
+  partName?: string;
+  filename?: string;
+  contentType?: string;
+  bytes: Buffer;
+  metadata: Record<string, unknown>;
+};
+
+type AudioDetection = {
+  format: string;
+  metadata: Record<string, unknown>;
+};
+
+async function handleShortcutAudio(req: Request) {
+  const url = new URL(req.url);
+  const tokenValue = url.searchParams.get("token") ?? "";
+  const rawBody = Buffer.from(await req.clone().arrayBuffer());
+  const tokenRows = tokenValue
+    ? await sql`
+        select id, token
+        from shortcut_ingest_tokens
+        where token = ${tokenValue}
+      `
+    : [];
+
+  const requestId = await createShortcutRequestLog(req, url, rawBody, tokenRows[0]?.id ?? null, tokenValue || null);
+
+  try {
+    if (req.method !== "POST") {
+      return finishShortcutResponse(requestId, { ok: false, requestId, error: "method not allowed" }, 405);
+    }
+
+    if (!tokenRows.length) {
+      return finishShortcutResponse(requestId, { ok: false, requestId, error: "unauthorized" }, 401);
+    }
+
+    await sql`
+      update shortcut_ingest_tokens
+      set last_used_at = now()
+      where id = ${tokenRows[0].id}
+    `;
+
+    const result = await ingestShortcutAudio(req, rawBody, requestId);
+    return finishShortcutResponse(requestId, { ok: true, requestId, ...result }, 200);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "shortcut ingest failed";
+    return finishShortcutResponse(requestId, { ok: false, requestId, error: message }, 500);
+  }
+}
+
+async function createShortcutRequestLog(
+  req: Request,
+  url: URL,
+  rawBody: Buffer,
+  tokenId: unknown,
+  tokenValue: string | null,
+) {
+  const rows = await sql`
+    insert into shortcut_ingest_requests (
+      token_id,
+      token,
+      method,
+      url,
+      path,
+      query,
+      request_headers,
+      request_content_type,
+      request_body,
+      request_body_sha256,
+      request_body_bytes
+    )
+    values (
+      ${tokenId},
+      ${tokenValue},
+      ${req.method},
+      ${req.url},
+      ${url.pathname},
+      ${queryToJson(url)}::jsonb,
+      ${headersToJson(req.headers)}::jsonb,
+      ${req.headers.get("content-type")},
+      ${rawBody},
+      ${sha256Hex(rawBody)},
+      ${rawBody.length}
+    )
+    returning id
+  `;
+  return rows[0].id;
+}
+
+async function finishShortcutResponse(requestId: unknown, payload: Record<string, unknown>, status: number) {
+  const body = Buffer.from(`${JSON.stringify(payload)}\n`, "utf8");
+  const headers = { "content-type": "application/json; charset=utf-8" };
+  const error = payload.ok === false ? String(payload.error ?? "request failed") : null;
+
+  await sql`
+    update shortcut_ingest_requests
+    set
+      response_status = ${status},
+      response_headers = ${headers}::jsonb,
+      response_body = ${body},
+      response_body_sha256 = ${sha256Hex(body)},
+      response_body_bytes = ${body.length},
+      error = ${error},
+      responded_at = now()
+    where id = ${requestId}
+  `;
+
+  return new Response(body, { status, headers });
+}
+
+async function ingestShortcutAudio(req: Request, rawBody: Buffer, requestId: unknown) {
+  const candidates = await extractShortcutAudioCandidates(req, rawBody);
+  const savedAudio = [];
+
+  for (const candidate of candidates) {
+    const detection = detectAudio(candidate.bytes, candidate.contentType, candidate.filename);
+    if (!detection) continue;
+
+    const metadata = {
+      ...candidate.metadata,
+      ...detection.metadata,
+    };
+    const audioRows = await sql`
+      insert into shortcut_audio_blobs (
+        sha256,
+        bytes,
+        size_bytes,
+        content_type,
+        filename,
+        extension,
+        detected_format,
+        metadata,
+        last_seen_at
+      )
+      values (
+        ${sha256Hex(candidate.bytes)},
+        ${candidate.bytes},
+        ${candidate.bytes.length},
+        ${candidate.contentType ?? null},
+        ${candidate.filename ?? null},
+        ${fileExtension(candidate.filename) ?? null},
+        ${detection.format},
+        ${metadata}::jsonb,
+        now()
+      )
+      on conflict (sha256) do update set
+        last_seen_at = now(),
+        content_type = coalesce(shortcut_audio_blobs.content_type, excluded.content_type),
+        filename = coalesce(shortcut_audio_blobs.filename, excluded.filename),
+        extension = coalesce(shortcut_audio_blobs.extension, excluded.extension),
+        detected_format = coalesce(shortcut_audio_blobs.detected_format, excluded.detected_format),
+        metadata = shortcut_audio_blobs.metadata || excluded.metadata
+      returning id, sha256, size_bytes, content_type, filename, detected_format, metadata
+    `;
+    const audio = audioRows[0];
+
+    await sql`
+      insert into shortcut_ingest_request_audio (
+        request_id,
+        audio_id,
+        part_index,
+        part_name,
+        source_kind,
+        filename,
+        content_type,
+        size_bytes,
+        metadata
+      )
+      values (
+        ${requestId},
+        ${audio.id},
+        ${candidate.partIndex},
+        ${candidate.partName ?? null},
+        ${candidate.sourceKind},
+        ${candidate.filename ?? null},
+        ${candidate.contentType ?? null},
+        ${candidate.bytes.length},
+        ${metadata}::jsonb
+      )
+      on conflict (request_id, part_index) do nothing
+    `;
+
+    savedAudio.push({
+      id: toId(audio.id),
+      sha256: audio.sha256,
+      sizeBytes: toNumber(audio.size_bytes),
+      contentType: audio.content_type,
+      filename: audio.filename,
+      detectedFormat: audio.detected_format,
+      createdAt: typeof metadata.createdAt === "string" ? metadata.createdAt : null,
+    });
+  }
+
+  return {
+    rawRequestBytes: rawBody.length,
+    candidates: candidates.length,
+    audioFiles: savedAudio.length,
+    audio: savedAudio,
+  };
+}
+
+async function extractShortcutAudioCandidates(req: Request, rawBody: Buffer): Promise<ShortcutAudioCandidate[]> {
+  const contentType = req.headers.get("content-type") ?? "";
+  const candidates: ShortcutAudioCandidate[] = [];
+
+  if (contentType.toLowerCase().includes("multipart/form-data")) {
+    const form = await req.formData();
+    let index = 0;
+
+    for (const [name, value] of form.entries()) {
+      if (value instanceof File) {
+        candidates.push({
+          sourceKind: "multipart-file",
+          partIndex: index,
+          partName: name,
+          filename: value.name || undefined,
+          contentType: value.type || undefined,
+          bytes: Buffer.from(await value.arrayBuffer()),
+          metadata: {
+            formField: name,
+            fileLastModifiedMs: value.lastModified || null,
+            fileLastModifiedAt: value.lastModified ? new Date(value.lastModified).toISOString() : null,
+          },
+        });
+      } else {
+        pushBase64AudioCandidates(candidates, value, {
+          sourceKind: "multipart-field-base64",
+          partIndex: index,
+          partName: name,
+          metadata: { formField: name },
+        });
+      }
+      index += 1;
+    }
+
+    return candidates;
+  }
+
+  if (contentType.toLowerCase().includes("json")) {
+    try {
+      const parsed = JSON.parse(rawBody.toString("utf8"));
+      pushJsonAudioCandidates(candidates, parsed);
+      if (candidates.length) return candidates;
+    } catch {
+      // Keep the full raw body logged and fall back to raw audio detection below.
+    }
+  }
+
+  candidates.push({
+    sourceKind: "raw-body",
+    partIndex: 0,
+    filename: filenameFromContentDisposition(req.headers.get("content-disposition")),
+    contentType: contentType || undefined,
+    bytes: rawBody,
+    metadata: {},
+  });
+  return candidates;
+}
+
+function pushJsonAudioCandidates(candidates: ShortcutAudioCandidate[], value: unknown, path: string[] = [], depth = 0) {
+  if (depth > 12 || candidates.length >= 50) return;
+
+  if (typeof value === "string") {
+    pushBase64AudioCandidates(candidates, value, {
+      sourceKind: "json-base64",
+      partIndex: candidates.length,
+      partName: path.join(".") || "$",
+      metadata: { jsonPath: path.join(".") || "$" },
+    });
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => pushJsonAudioCandidates(candidates, item, [...path, String(index)], depth + 1));
+    return;
+  }
+
+  if (value && typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) {
+      pushJsonAudioCandidates(candidates, item, [...path, key], depth + 1);
+    }
+  }
+}
+
+function pushBase64AudioCandidates(
+  candidates: ShortcutAudioCandidate[],
+  value: string,
+  defaults: Omit<ShortcutAudioCandidate, "bytes">,
+) {
+  const trimmed = value.trim();
+  const dataUrl = trimmed.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$/is);
+  const contentType = dataUrl?.[1] || defaults.contentType;
+  const base64 = dataUrl?.[2] ?? trimmed;
+  const compact = base64.replace(/\s+/g, "");
+
+  if (compact.length < 24 || compact.length % 4 !== 0 || !/^[a-z0-9+/]+={0,2}$/i.test(compact)) return;
+
+  try {
+    const bytes = Buffer.from(compact, "base64");
+    if (!detectAudio(bytes, contentType, defaults.filename)) return;
+    candidates.push({
+      ...defaults,
+      contentType,
+      bytes,
+      metadata: {
+        ...defaults.metadata,
+        dataUrl: Boolean(dataUrl),
+      },
+    });
+  } catch {
+    return;
+  }
+}
+
+function detectAudio(bytes: Uint8Array, contentType?: string, filename?: string): AudioDetection | null {
+  const lowerType = contentType?.toLowerCase() ?? "";
+  const extension = fileExtension(filename);
+
+  if (isMp4Like(bytes)) {
+    const metadata = parseMp4Metadata(Buffer.from(bytes));
+    return { format: metadata.majorBrand === "qt  " ? "quicktime" : "m4a/mp4", metadata };
+  }
+  if (startsWithAscii(bytes, 0, "caff")) return { format: "caf", metadata: {} };
+  if (startsWithAscii(bytes, 0, "RIFF") && startsWithAscii(bytes, 8, "WAVE")) return { format: "wav", metadata: {} };
+  if (startsWithAscii(bytes, 0, "ID3") || (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0)) {
+    return { format: "mp3", metadata: {} };
+  }
+
+  if (lowerType.startsWith("audio/") || ["m4a", "mp4", "mov", "qta", "caf", "wav", "aac", "mp3"].includes(extension ?? "")) {
+    return { format: lowerType || extension || "audio", metadata: {} };
+  }
+
+  return null;
+}
+
+function parseMp4Metadata(bytes: Buffer): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {};
+  const tags: Record<string, string> = {};
+  const brands: string[] = [];
+  const creationTimes: string[] = [];
+  const durations: number[] = [];
+
+  scanMp4Boxes(bytes, 0, bytes.length, [], 0, (box) => {
+    if (box.type === "ftyp" && box.end - box.contentStart >= 8) {
+      metadata.majorBrand = bytes.toString("latin1", box.contentStart, box.contentStart + 4);
+      for (let offset = box.contentStart + 8; offset + 4 <= box.end; offset += 4) {
+        brands.push(bytes.toString("latin1", offset, offset + 4));
+      }
+    }
+
+    if ((box.type === "mvhd" || box.type === "mdhd") && box.end - box.contentStart >= 24) {
+      const parsed = parseMp4TimeBox(bytes, box.contentStart, box.end);
+      if (parsed.createdAt) creationTimes.push(parsed.createdAt);
+      if (parsed.durationSeconds !== undefined) durations.push(parsed.durationSeconds);
+      metadata[`${box.type}CreatedAt`] = parsed.createdAt ?? null;
+      metadata[`${box.type}DurationSeconds`] = parsed.durationSeconds ?? null;
+    }
+
+    if (box.type === "data" && box.path.length >= 2 && box.end - box.contentStart > 8) {
+      const key = box.path[box.path.length - 2];
+      const raw = bytes.subarray(box.contentStart + 8, box.end);
+      const value = raw.toString("utf8").replace(/\0+$/, "").trim();
+      if (value) tags[key] = value;
+    }
+  });
+
+  if (brands.length) metadata.compatibleBrands = brands;
+  if (Object.keys(tags).length) metadata.tags = tags;
+  const tagDate = tags["©day"] ?? tags.date ?? tags.creationdate ?? tags["com.apple.quicktime.creationdate"];
+  metadata.createdAt = validDate(tagDate) ?? creationTimes.find(Boolean) ?? null;
+  if (durations.length) metadata.durationSeconds = durations.find((value) => Number.isFinite(value) && value > 0) ?? null;
+  return metadata;
+}
+
+type Mp4Box = {
+  type: string;
+  contentStart: number;
+  end: number;
+  path: string[];
+};
+
+function scanMp4Boxes(
+  bytes: Buffer,
+  start: number,
+  end: number,
+  path: string[],
+  depth: number,
+  visit: (box: Mp4Box) => void,
+) {
+  if (depth > 8) return;
+  let offset = start;
+
+  while (offset + 8 <= end) {
+    const size32 = bytes.readUInt32BE(offset);
+    const type = bytes.toString("latin1", offset + 4, offset + 8);
+    let headerSize = 8;
+    let size = size32;
+
+    if (size32 === 1) {
+      if (offset + 16 > end) break;
+      size = Number(bytes.readBigUInt64BE(offset + 8));
+      headerSize = 16;
+    } else if (size32 === 0) {
+      size = end - offset;
+    }
+
+    if (size < headerSize || offset + size > end) break;
+
+    let contentStart = offset + headerSize;
+    const boxEnd = offset + size;
+    const boxPath = [...path, type];
+    const box = { type, contentStart, end: boxEnd, path: boxPath };
+    visit(box);
+
+    if (type === "meta" && boxEnd - contentStart >= 4) contentStart += 4;
+    if (["moov", "trak", "mdia", "minf", "stbl", "udta", "meta", "ilst"].includes(type)) {
+      scanMp4Boxes(bytes, contentStart, boxEnd, boxPath, depth + 1, visit);
+    } else if (path.includes("ilst")) {
+      scanMp4Boxes(bytes, contentStart, boxEnd, boxPath, depth + 1, visit);
+    }
+
+    offset = boxEnd;
+  }
+}
+
+function parseMp4TimeBox(bytes: Buffer, start: number, end: number) {
+  const version = bytes[start];
+  const epochOffsetSeconds = Date.UTC(1904, 0, 1) / 1000;
+
+  if (version === 1 && start + 32 <= end) {
+    const createdSeconds = Number(bytes.readBigUInt64BE(start + 4));
+    const timescale = bytes.readUInt32BE(start + 20);
+    const duration = Number(bytes.readBigUInt64BE(start + 24));
+    return {
+      createdAt: quickTimeDate(createdSeconds, epochOffsetSeconds),
+      durationSeconds: timescale ? duration / timescale : undefined,
+    };
+  }
+
+  if (start + 20 <= end) {
+    const createdSeconds = bytes.readUInt32BE(start + 4);
+    const timescale = bytes.readUInt32BE(start + 12);
+    const duration = bytes.readUInt32BE(start + 16);
+    return {
+      createdAt: quickTimeDate(createdSeconds, epochOffsetSeconds),
+      durationSeconds: timescale ? duration / timescale : undefined,
+    };
+  }
+
+  return {};
+}
+
+function quickTimeDate(seconds: number, epochOffsetSeconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
+  const date = new Date((seconds + epochOffsetSeconds) * 1000);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function validDate(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  return Number.isNaN(Date.parse(value)) ? undefined : value;
+}
+
+function isMp4Like(bytes: Uint8Array) {
+  for (let offset = 0; offset + 12 <= Math.min(bytes.length, 4096); ) {
+    const size = readUInt32BE(bytes, offset);
+    if (size < 8) return false;
+    if (startsWithAscii(bytes, offset + 4, "ftyp")) return true;
+    offset += size;
+  }
+  return false;
+}
+
+function headersToJson(headers: Headers) {
+  return Object.fromEntries([...headers.entries()]);
+}
+
+function queryToJson(url: URL) {
+  const out: Record<string, string | string[]> = {};
+  for (const [key, value] of url.searchParams.entries()) {
+    const current = out[key];
+    if (Array.isArray(current)) current.push(value);
+    else if (current !== undefined) out[key] = [current, value];
+    else out[key] = value;
+  }
+  return out;
+}
+
+function filenameFromContentDisposition(value: string | null) {
+  if (!value) return undefined;
+  const utf8 = value.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8) return decodeURIComponent(utf8[1].trim().replace(/^"|"$/g, ""));
+  const ascii = value.match(/filename="?([^";]+)"?/i);
+  return ascii?.[1];
+}
+
+function fileExtension(filename?: string) {
+  const match = filename?.toLowerCase().match(/\.([a-z0-9]+)$/);
+  return match?.[1];
+}
+
+function sha256Hex(bytes: Uint8Array) {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 async function listHosts(): Promise<HostInfo[]> {
@@ -586,6 +1097,18 @@ function clamp(value: number, min: number, max: number) {
 
 function byteSize(value: string) {
   return new TextEncoder().encode(value).byteLength;
+}
+
+function readUInt32BE(bytes: Uint8Array, offset: number) {
+  return ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
+}
+
+function startsWithAscii(bytes: Uint8Array, offset: number, value: string) {
+  if (offset + value.length > bytes.length) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    if (bytes[offset + index] !== value.charCodeAt(index)) return false;
+  }
+  return true;
 }
 
 function normalizeRaw(raw: unknown) {

@@ -1,0 +1,11 @@
+.git
+.github
+.chatview-agent-dev
+node_modules
+dist
+deploy/.env
+deploy/pgdata
+*.dump
+*.tar
+*.tar.gz
+.DS_Store

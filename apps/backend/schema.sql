@@ -69,3 +69,79 @@ create table if not exists yjs_documents (
 
 create index if not exists idx_yjs_documents_session
   on yjs_documents (session_db_id);
+
+create table if not exists shortcut_ingest_tokens (
+  id bigserial primary key,
+  token text not null unique,
+  label text not null,
+  created_at timestamptz not null default now(),
+  last_used_at timestamptz
+);
+
+insert into shortcut_ingest_tokens (token, label)
+values ('iphone-shortcut-dev-token', 'iPhone Shortcut development token')
+on conflict (token) do nothing;
+
+create table if not exists shortcut_ingest_requests (
+  id bigserial primary key,
+  token_id bigint references shortcut_ingest_tokens(id) on delete set null,
+  token text,
+  method text not null,
+  url text not null,
+  path text not null,
+  query jsonb not null,
+  request_headers jsonb not null,
+  request_content_type text,
+  request_body bytea not null,
+  request_body_sha256 text not null,
+  request_body_bytes bigint not null,
+  response_status integer,
+  response_headers jsonb,
+  response_body bytea,
+  response_body_sha256 text,
+  response_body_bytes bigint,
+  error text,
+  received_at timestamptz not null default now(),
+  responded_at timestamptz
+);
+
+create index if not exists idx_shortcut_ingest_requests_received
+  on shortcut_ingest_requests (received_at desc);
+
+create index if not exists idx_shortcut_ingest_requests_token
+  on shortcut_ingest_requests (token_id, received_at desc);
+
+create table if not exists shortcut_audio_blobs (
+  id bigserial primary key,
+  sha256 text not null unique,
+  bytes bytea not null,
+  size_bytes bigint not null,
+  content_type text,
+  filename text,
+  extension text,
+  detected_format text,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now()
+);
+
+create index if not exists idx_shortcut_audio_blobs_seen
+  on shortcut_audio_blobs (last_seen_at desc);
+
+create table if not exists shortcut_ingest_request_audio (
+  id bigserial primary key,
+  request_id bigint not null references shortcut_ingest_requests(id) on delete cascade,
+  audio_id bigint not null references shortcut_audio_blobs(id) on delete cascade,
+  part_index integer not null,
+  part_name text,
+  source_kind text not null,
+  filename text,
+  content_type text,
+  size_bytes bigint not null,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  unique (request_id, part_index)
+);
+
+create index if not exists idx_shortcut_ingest_request_audio_request
+  on shortcut_ingest_request_audio (request_id, part_index);

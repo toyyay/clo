@@ -1,0 +1,75 @@
+name: build-and-push
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: [self-hosted, cd, finland]
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,format=short,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          cache-to: type=inline
+          provenance: false
+          sbom: false
+
+  deploy-clo:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via deploy-agent
+        env:
+          DEPLOY_URL: ${{ secrets.DEPLOY_URL }}
+          COMPOSE_PATH: /root/clo/docker-compose.yml
+          SERVICE: app
+        run: |
+          set -euo pipefail
+          base="${DEPLOY_URL%%\?*}"
+          token="${DEPLOY_URL#*\?token=}"
+          short=$(echo "$GITHUB_SHA" | cut -c1-7)
+          compose_enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$COMPOSE_PATH")
+          resp=$(curl -sfk -X POST "$base/deploy?token=$token&service=$SERVICE&tag=$short&compose=$compose_enc")
+          id=$(echo "$resp" | jq -r .id)
+          echo "deploy id: $id (tag=$short)"
+          output=$(curl -Nsk "$base/logs/$id?token=$token")
+          echo "$output"
+          echo "$output" | tail -1 | grep -q "DONE:ok" || { echo "::error::deploy failed"; exit 1; }
+          sleep 2
+          got=$(curl -fsS "https://clo.vf.lc/status-9c8e0f3a2b71" | jq -r .commit_sha)
+          echo "live commit_sha: $got"
+          [ "$got" = "$GITHUB_SHA" ] || { echo "::error::live sha $got != $GITHUB_SHA"; exit 1; }
