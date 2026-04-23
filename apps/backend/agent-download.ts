@@ -1,232 +1,284 @@
 import { createHash } from "node:crypto";
-import { gzipSync } from "node:zlib";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { envValue } from "../../packages/shared/env";
 
 const DEFAULT_PUBLIC_URL = "https://clo.vf.lc";
-const ARCHIVE_NAME = "chatview-agent-macos.tar.gz";
-const INSTALLER_NAME = "chatview-agent.command";
-const README_NAME = "README.txt";
+const EXECUTABLE_NAME = "chatview-agent.command";
+const AGENT_ENTRYPOINT = new URL("../agent/main.ts", import.meta.url).pathname;
+const ZIP_FLAGS_UTF8 = 0x0800;
+const ZIP_VERSION = 20;
 
-let agentBundlePromise: Promise<string> | null = null;
+type CompileTarget = "bun-darwin-arm64" | "bun-darwin-x64";
 
-export async function downloadAgentArchiveResponse(agentToken: string, env = process.env) {
+type DownloadArtifact = {
+  archive: Uint8Array;
+  filename: string;
+};
+
+const artifactPromises = new Map<string, Promise<DownloadArtifact>>();
+const crc32Table = buildCrc32Table();
+
+export async function downloadAgentArchiveResponse(req: Request, agentToken: string, env = process.env) {
   const publicUrl = trimSlash(envValue(env, "PUBLIC_URL", "CHATVIEW_PUBLIC_URL", "BACKEND_URL", "CHATVIEW_BACKEND_URL") ?? DEFAULT_PUBLIC_URL);
-  const agentBundle = await loadAgentBundle();
-  const installer = renderInstallerScript({
-    agentBundle,
-    publicUrl,
-    agentToken,
-  });
-  const readme = renderReadme(publicUrl);
-  const archive = gzipSync(
-    createTarArchive([
-      { name: INSTALLER_NAME, mode: 0o755, content: installer },
-      { name: README_NAME, mode: 0o644, content: readme },
-    ]),
-  );
+  const target = resolveCompileTarget(req);
+  const artifact = await loadArtifact({ target, publicUrl, agentToken, gitSha: process.env.GIT_SHA ?? "unknown" });
 
-  return new Response(archive, {
+  return new Response(toArrayBuffer(artifact.archive), {
     status: 200,
     headers: {
-      "content-type": "application/gzip",
-      "content-disposition": `attachment; filename="${ARCHIVE_NAME}"`,
-      "cache-control": "no-store",
+      "content-type": "application/zip",
+      "content-disposition": `attachment; filename="${artifact.filename}"`,
+      "cache-control": "private, no-store, max-age=0",
     },
   });
 }
 
 if (import.meta.hot) {
   import.meta.hot.dispose(() => {
-    agentBundlePromise = null;
+    artifactPromises.clear();
   });
 }
 
-async function loadAgentBundle() {
-  if (!agentBundlePromise) {
-    agentBundlePromise = buildAgentBundle().catch((error) => {
-      agentBundlePromise = null;
+async function loadArtifact({
+  target,
+  publicUrl,
+  agentToken,
+  gitSha,
+}: {
+  target: CompileTarget;
+  publicUrl: string;
+  agentToken: string;
+  gitSha: string;
+}) {
+  const cacheKey = [gitSha, target, publicUrl, tokenHash(agentToken)].join(":");
+  let promise = artifactPromises.get(cacheKey);
+
+  if (!promise) {
+    promise = buildArtifact({ target, publicUrl, agentToken }).catch((error) => {
+      artifactPromises.delete(cacheKey);
       throw error;
     });
+    artifactPromises.set(cacheKey, promise);
   }
 
-  return agentBundlePromise;
+  return promise;
 }
 
-async function buildAgentBundle() {
-  const result = await Bun.build({
-    entrypoints: [new URL("../agent/main.ts", import.meta.url).pathname],
-    target: "bun",
-    format: "esm",
-    minify: false,
-    sourcemap: "none",
-  });
-
-  if (!result.success) {
-    const logs = result.logs.map((log) => log.message).join("\n");
-    throw new Error(`failed to build downloadable agent bundle${logs ? `:\n${logs}` : ""}`);
-  }
-
-  const output = result.outputs.find((item) => item.kind === "entry-point");
-  if (!output) {
-    throw new Error("downloadable agent bundle did not produce an entry point");
-  }
-
-  return output.text();
-}
-
-function renderInstallerScript({
-  agentBundle,
+async function buildArtifact({
+  target,
   publicUrl,
   agentToken,
 }: {
-  agentBundle: string;
+  target: CompileTarget;
   publicUrl: string;
   agentToken: string;
 }) {
-  const delimiter = `__CHATVIEW_AGENT_JS_${createHash("sha256").update(agentBundle).digest("hex").slice(0, 16)}__`;
+  const tempDir = await mkdtemp(join(tmpdir(), "chatview-agent-"));
+  const outfile = join(tempDir, EXECUTABLE_NAME);
 
-  return `#!/bin/bash
-set -euo pipefail
-
-APP_DIR="$HOME/Library/Application Support/ChatviewAgent"
-SCRIPT_PATH="$APP_DIR/chatview-agent.js"
-BUN_INSTALL_DIR="\${BUN_INSTALL:-$HOME/.bun}"
-BUN_BIN="$BUN_INSTALL_DIR/bin/bun"
-BACKEND_URL="\${BACKEND_URL:-${escapeDoubleQuotedShell(publicUrl)}}"
-AGENT_TOKEN="\${AGENT_TOKEN:-${escapeDoubleQuotedShell(agentToken)}}"
-AGENT_STATE="\${AGENT_STATE:-$HOME/.chatview-agent/state.json}"
-
-mkdir -p "$APP_DIR"
-
-cat > "$SCRIPT_PATH" <<'${delimiter}'
-${agentBundle}
-${delimiter}
-
-if [ ! -x "$BUN_BIN" ]; then
-  echo "Installing Bun..."
-  curl -fsSL https://bun.com/install | bash
-fi
-
-BUN_INSTALL_DIR="\${BUN_INSTALL:-$HOME/.bun}"
-BUN_BIN="$BUN_INSTALL_DIR/bin/bun"
-
-if [ ! -x "$BUN_BIN" ]; then
-  echo "Bun is not available at $BUN_BIN" >&2
-  exit 1
-fi
-
-export BACKEND_URL
-export AGENT_TOKEN
-export AGENT_STATE
-
-echo "Installing Chatview launch agent..."
-"$BUN_BIN" "$SCRIPT_PATH" install-launch-agent --backend "$BACKEND_URL" --token "$AGENT_TOKEN"
-
-PLIST_PATH="$HOME/Library/LaunchAgents/com.chatview.agent.plist"
-launchctl bootout "gui/$(id -u)" com.chatview.agent >/dev/null 2>&1 || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
-launchctl kickstart -k "gui/$(id -u)/com.chatview.agent" >/dev/null 2>&1 || true
-
-echo "Running first sync..."
-"$BUN_BIN" "$SCRIPT_PATH" scan-once || true
-
-cat <<EOF
-
-Chatview Agent is installed.
-Backend: $BACKEND_URL
-State:   $AGENT_STATE
-Logs:
-  ~/Library/Logs/chatview-agent.log
-  ~/Library/Logs/chatview-agent.err.log
-EOF
-`;
-}
-
-function renderReadme(publicUrl: string) {
-  return `Chatview Agent for macOS
-
-1. Extract this archive.
-2. Double-click ${INSTALLER_NAME}.
-3. If macOS blocks the script on first run, right-click it and choose Open.
-
-The installer already includes:
-- Backend URL: ${publicUrl}
-- An embedded ingest token
-
-You can override them temporarily before running:
-- BACKEND_URL
-- AGENT_TOKEN
-- AGENT_STATE
-`;
-}
-
-function escapeDoubleQuotedShell(value: string) {
-  return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("$", "\\$").replaceAll("`", "\\`");
-}
-
-function trimSlash(value: string) {
-  return value.replace(/\/+$/, "");
-}
-
-function createTarArchive(files: { name: string; mode: number; content: string }[]) {
-  const chunks: Buffer[] = [];
-
-  for (const file of files) {
-    const content = Buffer.from(file.content, "utf8");
-    const header = createTarHeader({
-      name: file.name,
-      mode: file.mode,
-      size: content.length,
-      mtime: Math.floor(Date.now() / 1000),
+  try {
+    const result = await Bun.build({
+      entrypoints: [AGENT_ENTRYPOINT],
+      compile: {
+        target,
+        outfile,
+      },
+      minify: false,
+      sourcemap: "none",
+      define: {
+        CHATVIEW_EMBEDDED_BACKEND_URL: JSON.stringify(publicUrl),
+        CHATVIEW_EMBEDDED_AGENT_TOKEN: JSON.stringify(agentToken),
+        CHATVIEW_DEFAULT_COMMAND: JSON.stringify("install-self"),
+      },
     });
-    chunks.push(header, content);
 
-    const remainder = content.length % 512;
-    if (remainder) chunks.push(Buffer.alloc(512 - remainder));
+    if (!result.success) {
+      const logs = result.logs.map((log) => log.message).join("\n");
+      throw new Error(`failed to build downloadable agent${logs ? `:\n${logs}` : ""}`);
+    }
+
+    const binary = await readFile(outfile);
+
+    return {
+      archive: createZipArchive({
+        name: EXECUTABLE_NAME,
+        mode: 0o755,
+        data: binary,
+        mtime: new Date(),
+      }),
+      filename: `chatview-agent-macos-${target.endsWith("x64") ? "intel" : "arm64"}.zip`,
+    };
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
   }
-
-  chunks.push(Buffer.alloc(1024));
-  return Buffer.concat(chunks);
 }
 
-function createTarHeader({
+function resolveCompileTarget(req: Request): CompileTarget {
+  const url = new URL(req.url);
+  const requestedArch = normalizeArch(url.searchParams.get("arch"));
+  if (requestedArch === "x64") return "bun-darwin-x64";
+  if (requestedArch === "arm64") return "bun-darwin-arm64";
+
+  const userAgent = req.headers.get("user-agent") ?? "";
+  if (/Macintosh/i.test(userAgent) && /Intel Mac OS X/i.test(userAgent)) return "bun-darwin-x64";
+  return "bun-darwin-arm64";
+}
+
+function normalizeArch(value: string | null) {
+  switch ((value ?? "").toLowerCase()) {
+    case "amd64":
+    case "intel":
+    case "x64":
+      return "x64";
+    case "aarch64":
+    case "apple":
+    case "arm":
+    case "arm64":
+      return "arm64";
+    default:
+      return null;
+  }
+}
+
+function createZipArchive({
   name,
   mode,
-  size,
+  data,
   mtime,
 }: {
   name: string;
   mode: number;
-  size: number;
-  mtime: number;
+  data: Uint8Array;
+  mtime: Date;
 }) {
-  const header = Buffer.alloc(512, 0);
+  const fileName = Buffer.from(name, "utf8");
+  const content = Buffer.from(data);
+  const crc = crc32(content);
+  const dos = toDosDateTime(mtime);
+  const localHeader = Buffer.alloc(30 + fileName.length);
+  let offset = 0;
 
-  writeString(header, 0, 100, name);
-  writeOctal(header, 100, 8, mode);
-  writeOctal(header, 108, 8, 0);
-  writeOctal(header, 116, 8, 0);
-  writeOctal(header, 124, 12, size);
-  writeOctal(header, 136, 12, mtime);
-  header.fill(0x20, 148, 156);
-  header[156] = "0".charCodeAt(0);
-  writeString(header, 257, 6, "ustar");
-  writeString(header, 263, 2, "00");
-  writeString(header, 265, 32, "root");
-  writeString(header, 297, 32, "wheel");
+  localHeader.writeUInt32LE(0x04034b50, offset);
+  offset += 4;
+  localHeader.writeUInt16LE(ZIP_VERSION, offset);
+  offset += 2;
+  localHeader.writeUInt16LE(ZIP_FLAGS_UTF8, offset);
+  offset += 2;
+  localHeader.writeUInt16LE(0, offset);
+  offset += 2;
+  localHeader.writeUInt16LE(dos.time, offset);
+  offset += 2;
+  localHeader.writeUInt16LE(dos.date, offset);
+  offset += 2;
+  localHeader.writeUInt32LE(crc, offset);
+  offset += 4;
+  localHeader.writeUInt32LE(content.length, offset);
+  offset += 4;
+  localHeader.writeUInt32LE(content.length, offset);
+  offset += 4;
+  localHeader.writeUInt16LE(fileName.length, offset);
+  offset += 2;
+  localHeader.writeUInt16LE(0, offset);
+  offset += 2;
+  fileName.copy(localHeader, offset);
 
-  const checksum = [...header].reduce((sum, byte) => sum + byte, 0);
-  const value = checksum.toString(8).padStart(6, "0");
-  writeString(header, 148, 8, `${value}\0 `);
+  const centralHeader = Buffer.alloc(46 + fileName.length);
+  offset = 0;
+  centralHeader.writeUInt32LE(0x02014b50, offset);
+  offset += 4;
+  centralHeader.writeUInt16LE((3 << 8) | ZIP_VERSION, offset);
+  offset += 2;
+  centralHeader.writeUInt16LE(ZIP_VERSION, offset);
+  offset += 2;
+  centralHeader.writeUInt16LE(ZIP_FLAGS_UTF8, offset);
+  offset += 2;
+  centralHeader.writeUInt16LE(0, offset);
+  offset += 2;
+  centralHeader.writeUInt16LE(dos.time, offset);
+  offset += 2;
+  centralHeader.writeUInt16LE(dos.date, offset);
+  offset += 2;
+  centralHeader.writeUInt32LE(crc, offset);
+  offset += 4;
+  centralHeader.writeUInt32LE(content.length, offset);
+  offset += 4;
+  centralHeader.writeUInt32LE(content.length, offset);
+  offset += 4;
+  centralHeader.writeUInt16LE(fileName.length, offset);
+  offset += 2;
+  centralHeader.writeUInt16LE(0, offset);
+  offset += 2;
+  centralHeader.writeUInt16LE(0, offset);
+  offset += 2;
+  centralHeader.writeUInt16LE(0, offset);
+  offset += 2;
+  centralHeader.writeUInt16LE(0, offset);
+  offset += 2;
+  centralHeader.writeUInt32LE(((0o100000 | (mode & 0o7777)) * 0x10000) >>> 0, offset);
+  offset += 4;
+  centralHeader.writeUInt32LE(0, offset);
+  offset += 4;
+  fileName.copy(centralHeader, offset);
 
-  return header;
+  const end = Buffer.alloc(22);
+  offset = 0;
+  end.writeUInt32LE(0x06054b50, offset);
+  offset += 4;
+  end.writeUInt16LE(0, offset);
+  offset += 2;
+  end.writeUInt16LE(0, offset);
+  offset += 2;
+  end.writeUInt16LE(1, offset);
+  offset += 2;
+  end.writeUInt16LE(1, offset);
+  offset += 2;
+  end.writeUInt32LE(centralHeader.length, offset);
+  offset += 4;
+  end.writeUInt32LE(localHeader.length + content.length, offset);
+  offset += 4;
+  end.writeUInt16LE(0, offset);
+
+  return Buffer.concat([localHeader, content, centralHeader, end]);
 }
 
-function writeString(buffer: Buffer, offset: number, length: number, value: string) {
-  buffer.write(value.slice(0, length), offset, length, "utf8");
+function toDosDateTime(date: Date) {
+  const safeYear = Math.max(date.getFullYear(), 1980);
+  return {
+    date: ((safeYear - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate(),
+    time: (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2),
+  };
 }
 
-function writeOctal(buffer: Buffer, offset: number, length: number, value: number) {
-  const octal = value.toString(8).padStart(length - 1, "0");
-  writeString(buffer, offset, length, `${octal}\0`);
+function crc32(buffer: Uint8Array) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc = crc32Table[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function buildCrc32Table() {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < table.length; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+}
+
+function tokenHash(value: string) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function toArrayBuffer(value: Uint8Array): ArrayBuffer {
+  return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer;
+}
+
+function trimSlash(value: string) {
+  return value.replace(/\/+$/, "");
 }

@@ -788,7 +788,7 @@ export function App() {
         </div>
         <div className="top-actions">
           <a className="icon-button download-button" href="/api/agent/download">
-            Download Agent
+            Download Mac Agent
           </a>
           <button className="icon-button" onClick={syncNow} disabled={syncState === "syncing"} title="Sync now">
             Sync

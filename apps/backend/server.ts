@@ -124,7 +124,7 @@ Bun.serve<{ docIds: Set<string> }>({
     "/api/agent/download": async (req: Request) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;
-      return downloadAgentArchiveResponse(agentToken);
+      return downloadAgentArchiveResponse(req, agentToken);
     },
     "/api/ingest/batch": async (req: Request) => {
       if (req.method !== "POST") return text("method not allowed", 405);

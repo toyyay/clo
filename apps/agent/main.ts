@@ -1,13 +1,23 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { arch, homedir, hostname, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { Buffer } from "node:buffer";
 import type { AgentIdentity, IngestBatchRequest, IngestEvent, IngestSession } from "../../packages/shared/types";
 import { envValue } from "../../packages/shared/env";
 
+declare const CHATVIEW_EMBEDDED_BACKEND_URL: string | undefined;
+declare const CHATVIEW_EMBEDDED_AGENT_TOKEN: string | undefined;
+declare const CHATVIEW_DEFAULT_COMMAND: string | undefined;
+
 const VERSION = "0.1.0";
-const DEFAULT_BACKEND_URL = "https://clo.vf.lc";
+const LABEL = "com.chatview.agent";
+const APP_DIR = join(homedir(), "Library", "Application Support", "ChatviewAgent");
+const INSTALLED_EXECUTABLE_PATH = join(APP_DIR, "chatview-agent");
+const DEFAULT_BACKEND_URL =
+  typeof CHATVIEW_EMBEDDED_BACKEND_URL !== "undefined" ? CHATVIEW_EMBEDDED_BACKEND_URL : "https://clo.vf.lc";
+const DEFAULT_AGENT_TOKEN = typeof CHATVIEW_EMBEDDED_AGENT_TOKEN !== "undefined" ? CHATVIEW_EMBEDDED_AGENT_TOKEN : "";
+const DEFAULT_COMMAND = typeof CHATVIEW_DEFAULT_COMMAND !== "undefined" ? CHATVIEW_DEFAULT_COMMAND : "run";
 
 type Config = {
   backendUrl: string;
@@ -39,7 +49,7 @@ type JsonlFile = {
   mtimeMs: number;
 };
 
-const command = Bun.argv[2] ?? "run";
+const command = Bun.argv[2] ?? DEFAULT_COMMAND;
 
 switch (command) {
   case "run":
@@ -47,6 +57,10 @@ switch (command) {
     break;
   case "scan-once":
     await run(true);
+    break;
+  case "install":
+  case "install-self":
+    await installSelf();
     break;
   case "install-launch-agent":
     await installLaunchAgent();
@@ -89,7 +103,7 @@ function loadConfig(): Config {
 
   return {
     backendUrl: trimSlash(arg("--backend") ?? envValue(process.env, "BACKEND_URL", "CHATVIEW_BACKEND_URL") ?? DEFAULT_BACKEND_URL),
-    token: arg("--token") ?? envValue(process.env, "AGENT_TOKEN", "CHATVIEW_AGENT_TOKEN") ?? "",
+    token: arg("--token") ?? envValue(process.env, "AGENT_TOKEN", "CHATVIEW_AGENT_TOKEN") ?? DEFAULT_AGENT_TOKEN,
     projectsDir:
       arg("--projects-dir") ??
       envValue(process.env, "CLAUDE_PROJECTS_DIR", "CHATVIEW_CLAUDE_PROJECTS_DIR") ??
@@ -308,23 +322,50 @@ function identityFor(config: Config, agentId: string): AgentIdentity {
 async function installLaunchAgent() {
   const config = loadConfig();
   if (!config.token) throw new Error("AGENT_TOKEN or --token is required before installing launch agent");
-  const label = "com.chatview.agent";
-  const plistPath = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
-  await mkdir(dirname(plistPath), { recursive: true });
-  await writeFile(plistPath, launchAgentPlist(config));
+  const plistPath = await writeLaunchAgentPlist(config);
   console.log(`wrote ${plistPath}`);
   console.log(`load with: launchctl bootstrap gui/$(id -u) ${plistPath}`);
   console.log(`stop with: launchctl bootout gui/$(id -u) ${plistPath}`);
 }
 
-function launchAgentPlist(config: Config) {
-  const args = launchProgramArguments();
+async function installSelf() {
+  if (platform() !== "darwin") {
+    throw new Error("install-self is only supported on macOS");
+  }
+
+  const config = loadConfig();
+  if (!config.token) throw new Error("AGENT_TOKEN or --token is required before installing the standalone agent");
+
+  await mkdir(dirname(INSTALLED_EXECUTABLE_PATH), { recursive: true });
+
+  if (process.execPath !== INSTALLED_EXECUTABLE_PATH) {
+    await copyFile(process.execPath, INSTALLED_EXECUTABLE_PATH);
+    await chmod(INSTALLED_EXECUTABLE_PATH, 0o755);
+  }
+
+  const plistPath = await writeLaunchAgentPlist(config, [INSTALLED_EXECUTABLE_PATH, "run"]);
+  bootstrapLaunchAgent(plistPath);
+
+  console.log(`installed ${INSTALLED_EXECUTABLE_PATH}`);
+  console.log("running first sync...");
+  await run(true);
+  console.log(`launch agent active: ${LABEL}`);
+}
+
+async function writeLaunchAgentPlist(config: Config, args = launchProgramArguments()) {
+  const plistPath = join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
+  await mkdir(dirname(plistPath), { recursive: true });
+  await writeFile(plistPath, launchAgentPlist(config, args));
+  return plistPath;
+}
+
+function launchAgentPlist(config: Config, args = launchProgramArguments()) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.chatview.agent</string>
+  <string>${LABEL}</string>
   <key>ProgramArguments</key>
   <array>
 ${args.map((value) => `    <string>${xml(value)}</string>`).join("\n")}
@@ -355,6 +396,29 @@ ${args.map((value) => `    <string>${xml(value)}</string>`).join("\n")}
 `;
 }
 
+function bootstrapLaunchAgent(plistPath: string) {
+  const uid = process.getuid?.();
+  if (typeof uid !== "number") {
+    throw new Error("cannot determine the current macOS user id for launchctl");
+  }
+
+  const domain = `gui/${uid}`;
+  Bun.spawnSync(["launchctl", "bootout", domain, LABEL], { stderr: "ignore", stdout: "ignore" });
+
+  const bootstrap = Bun.spawnSync(["launchctl", "bootstrap", domain, plistPath], {
+    stderr: "inherit",
+    stdout: "inherit",
+  });
+  if (bootstrap.exitCode !== 0) {
+    throw new Error(`launchctl bootstrap failed with exit code ${bootstrap.exitCode}`);
+  }
+
+  Bun.spawnSync(["launchctl", "kickstart", "-k", `${domain}/${LABEL}`], {
+    stderr: "ignore",
+    stdout: "ignore",
+  });
+}
+
 function launchProgramArguments() {
   if (Bun.argv[1] && /\.(?:[cm]?js|tsx?|jsx)$/.test(Bun.argv[1])) return [process.execPath, Bun.argv[1], "run"];
   return [process.execPath, "run"];
@@ -366,6 +430,7 @@ function printHelp() {
 Usage:
   chatview-agent run
   chatview-agent scan-once
+  chatview-agent install-self
   chatview-agent install-launch-agent
 
 Options:
@@ -374,6 +439,9 @@ Options:
   --projects-dir <path>    Claude projects dir (default: ~/.claude/projects)
   --state <path>           Agent state file (default: ~/.chatview-agent/state.json)
   --poll-ms <ms>           Poll interval (default: 2000)
+
+When a standalone downloadable executable is launched without arguments, it installs itself into:
+  ${INSTALLED_EXECUTABLE_PATH}
 `);
 }
 
