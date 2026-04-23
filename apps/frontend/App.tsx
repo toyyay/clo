@@ -747,7 +747,9 @@ export function App() {
       list.push(session);
       grouped.set(key, list);
     }
-    return [...grouped.entries()].sort(([a], [b]) => a.localeCompare(b));
+    const lastSeen = (list: SessionInfo[]) =>
+      list.reduce((acc, s) => (s.lastSeenAt > acc ? s.lastSeenAt : acc), "");
+    return [...grouped.entries()].sort(([, a], [, b]) => lastSeen(b).localeCompare(lastSeen(a)));
   }, [filteredSessions]);
 
   const selectSession = useCallback((session: SessionInfo) => {

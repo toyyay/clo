@@ -4,8 +4,15 @@
     {
       "name": "chatview",
       "runtimeExecutable": "bun",
-      "runtimeArgs": ["dev"],
-      "port": 3737
+      "runtimeArgs": ["run", "--hot", "apps/backend/server.ts"],
+      "port": 3737,
+      "env": {
+        "DATABASE_URL": "postgres://chatview:chatview@localhost:5432/chatview",
+        "AUTO_MIGRATION": "true",
+        "DB_POOL_MAX": "5",
+        "AGENT_TOKEN": "dev-token",
+        "WEB_TOKEN": "dev-web-token"
+      }
     }
   ]
 }
