@@ -1,0 +1,28 @@
+{
+  "name": "chatview",
+  "module": "server.ts",
+  "type": "module",
+  "scripts": {
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "dev": "bun run --hot apps/backend/server.ts",
+    "dev:backend": "bun run --hot apps/backend/server.ts",
+    "dev:agent": "bun run apps/agent/main.ts run",
+    "dev:local:backend": "DATABASE_URL=postgres://chatview:chatview@localhost:5432/chatview CHATVIEW_AGENT_TOKEN=dev-token bun run --hot apps/backend/server.ts",
+    "dev:local:agent": "CHATVIEW_BACKEND_URL=http://localhost:3737 CHATVIEW_AGENT_TOKEN=dev-token CHATVIEW_AGENT_STATE=.chatview-agent-dev/state.json bun run apps/agent/main.ts run",
+    "dev:local:agent:scan": "CHATVIEW_BACKEND_URL=http://localhost:3737 CHATVIEW_AGENT_TOKEN=dev-token CHATVIEW_AGENT_STATE=.chatview-agent-dev/state.json bun run apps/agent/main.ts scan-once",
+    "agent:scan": "bun run apps/agent/main.ts scan-once",
+    "build:agent": "mkdir -p dist && bun build apps/agent/main.ts --compile --outfile dist/chatview-agent",
+    "build:frontend": "bun build index.html --outdir dist/frontend"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "yjs": "^13.6.30"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/bun": "latest"
+  }
+}
