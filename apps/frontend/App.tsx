@@ -787,8 +787,8 @@ export function App() {
           <div className={`sync-line ${syncState}`}>{statusText}</div>
         </div>
         <div className="top-actions">
-          <a className="icon-button download-button" href="/api/agent/download">
-            Download Mac Agent
+          <a className="icon-button download-button" href="/api/agent/download?arch=arm64">
+            Download Mac Agent (M1)
           </a>
           <button className="icon-button" onClick={syncNow} disabled={syncState === "syncing"} title="Sync now">
             Sync
