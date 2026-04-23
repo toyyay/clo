@@ -895,6 +895,50 @@ async function listSessions(agentId?: string): Promise<SessionInfo[]> {
   return rows.map(mapSession);
 }
 
+async function getSessionMeta(id: string): Promise<SessionInfo | null> {
+  const rows = await sql`
+    select
+      s.id,
+      s.agent_id,
+      a.hostname,
+      p.project_key,
+      p.display_name as project_name,
+      s.session_id,
+      s.title,
+      s.source_path,
+      s.size_bytes,
+      s.mtime_ms,
+      s.first_seen_at,
+      s.last_seen_at,
+      s.content_sha256,
+      s.mime_type,
+      s.encoding,
+      s.line_count,
+      s.mode,
+      s.symlink_target,
+      s.git_repo_root,
+      s.git_branch,
+      s.git_commit,
+      s.git_dirty,
+      s.git_remote_url,
+      s.deleted_at,
+      count(e.id) as event_count
+    from chat_sessions s
+    join agents a on a.id = s.agent_id
+    join projects p on p.id = s.project_id
+    left join session_events e on e.session_db_id = s.id
+    where s.id = ${id}
+    group by s.id, a.hostname, p.project_key, p.display_name
+  `;
+  return rows.length ? mapSession(rows[0]) : null;
+}
+
+async function getSessionsMeta(ids: string[]): Promise<SessionInfo[]> {
+  if (!ids.length) return [];
+  const results = await Promise.all(ids.map((id) => getSessionMeta(id)));
+  return results.filter((s): s is SessionInfo => s !== null);
+}
+
 async function getSession(id: string): Promise<SessionPayload | null> {
   const sessionRows = await sql`
     select
@@ -957,9 +1001,9 @@ async function getSession(id: string): Promise<SessionPayload | null> {
 }
 
 async function sync(body: SyncRequest): Promise<SyncResponse> {
-  const limitBytes = clamp(Math.floor(body.limitBytes ?? 2 * 1024 * 1024), 64 * 1024, 10 * 1024 * 1024);
+  const limitBytes = clamp(Math.floor(body.limitBytes ?? 2 * 1024 * 1024), 64 * 1024, 16 * 1024 * 1024);
   const cursor = BigInt(body.cursor && /^\d+$/.test(body.cursor) ? body.cursor : "0");
-  const fetchLimit = 2500;
+  const fetchLimit = 10000;
   const rows = await sql`
     select id, session_db_id, source_line_no, source_offset, event_type, role, occurred_at, ingested_at, raw
     from session_events
@@ -995,12 +1039,7 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
 
   const nextCursor = events.length ? events[events.length - 1].id : cursor.toString();
   const sessionIds = [...new Set(events.map((event) => event.sessionDbId))];
-  const sessions = [];
-
-  for (const sessionId of sessionIds) {
-    const payload = await getSession(sessionId);
-    if (payload) sessions.push(payload.session);
-  }
+  const sessions = sessionIds.length ? await getSessionsMeta(sessionIds) : [];
 
   const hosts = await listHosts();
   const response: SyncResponse = {

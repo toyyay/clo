@@ -556,7 +556,12 @@ export function App() {
     setSyncState("syncing");
     setStatusText("Syncing");
     try {
-      const result = await pullUpdates();
+      const result = await pullUpdates({
+        onProgress: ({ events, hasMore }) => {
+          if (!events) return;
+          setStatusText(hasMore ? `Syncing ${events.toLocaleString()} events…` : `Applying ${events.toLocaleString()} events…`);
+        },
+      });
       const { sessions: refreshedSessions } = await refreshCache();
       const current = activeRef.current;
       let activeRemoved = false;
