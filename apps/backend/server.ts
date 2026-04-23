@@ -15,6 +15,7 @@ import type {
   YjsSyncRequest,
   YjsSyncResponse,
 } from "../../packages/shared/types";
+import { downloadAgentArchiveResponse } from "./agent-download";
 import { envFlag, envValue } from "../../packages/shared/env";
 import { prepareDatabase, sql, toId, toNumber } from "./db";
 
@@ -119,6 +120,11 @@ Bun.serve<{ docIds: Set<string> }>({
       const auth = requireWebAuth(req);
       if (auth) return auth;
       return stream(req);
+    },
+    "/api/agent/download": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      return downloadAgentArchiveResponse(agentToken);
     },
     "/api/ingest/batch": async (req: Request) => {
       if (req.method !== "POST") return text("method not allowed", 405);

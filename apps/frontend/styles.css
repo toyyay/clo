@@ -152,6 +152,9 @@ pre {
 .sync-line.offline, .sync-line.error { color: var(--danger); }
 .top-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-height: 30px;
   padding: 4px 8px;
   border: 1px solid var(--line);
@@ -159,6 +162,12 @@ pre {
   background: var(--panel);
   text-align: center;
   font-size: 13px;
+  color: inherit;
+  text-decoration: none;
+}
+.download-button {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+  background: var(--accent-soft);
 }
 .menu-button { min-width: 54px; }
 

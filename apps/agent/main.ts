@@ -7,6 +7,7 @@ import type { AgentIdentity, IngestBatchRequest, IngestEvent, IngestSession } fr
 import { envValue } from "../../packages/shared/env";
 
 const VERSION = "0.1.0";
+const DEFAULT_BACKEND_URL = "https://clo.vf.lc";
 
 type Config = {
   backendUrl: string;
@@ -87,7 +88,7 @@ function loadConfig(): Config {
   const readChunkBytes = arg("--read-chunk-bytes") ?? envValue(process.env, "READ_CHUNK_BYTES", "CHATVIEW_READ_CHUNK_BYTES");
 
   return {
-    backendUrl: trimSlash(arg("--backend") ?? envValue(process.env, "BACKEND_URL", "CHATVIEW_BACKEND_URL") ?? "http://localhost:3737"),
+    backendUrl: trimSlash(arg("--backend") ?? envValue(process.env, "BACKEND_URL", "CHATVIEW_BACKEND_URL") ?? DEFAULT_BACKEND_URL),
     token: arg("--token") ?? envValue(process.env, "AGENT_TOKEN", "CHATVIEW_AGENT_TOKEN") ?? "",
     projectsDir:
       arg("--projects-dir") ??
@@ -355,7 +356,7 @@ ${args.map((value) => `    <string>${xml(value)}</string>`).join("\n")}
 }
 
 function launchProgramArguments() {
-  if (Bun.argv[1]?.endsWith(".ts")) return [Bun.argv[0], Bun.argv[1], "run"];
+  if (Bun.argv[1] && /\.(?:[cm]?js|tsx?|jsx)$/.test(Bun.argv[1])) return [process.execPath, Bun.argv[1], "run"];
   return [process.execPath, "run"];
 }
 
@@ -368,7 +369,7 @@ Usage:
   chatview-agent install-launch-agent
 
 Options:
-  --backend <url>          Backend URL (default: http://localhost:3737)
+  --backend <url>          Backend URL (default: ${DEFAULT_BACKEND_URL})
   --token <token>          Agent token, or AGENT_TOKEN
   --projects-dir <path>    Claude projects dir (default: ~/.claude/projects)
   --state <path>           Agent state file (default: ~/.chatview-agent/state.json)
