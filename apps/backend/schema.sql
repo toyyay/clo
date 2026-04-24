@@ -164,3 +164,49 @@ create table if not exists import_request_media (
 
 create index if not exists idx_import_request_media_request
   on import_request_media (request_id, part_index);
+
+create table if not exists import_media_transcriptions (
+  id bigserial primary key,
+  media_id bigint not null references import_media_blobs(id) on delete cascade,
+  source text not null default 'auto',
+  status text not null default 'queued',
+  model text not null,
+  reasoning_effort text not null default 'medium',
+  source_format text,
+  mp3_sha256 text,
+  mp3_bytes bigint,
+  detected_language text,
+  transcript jsonb not null default '{}'::jsonb,
+  error text,
+  created_at timestamptz not null default now(),
+  started_at timestamptz,
+  completed_at timestamptz,
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists idx_import_media_transcriptions_media
+  on import_media_transcriptions (media_id, created_at desc);
+
+create index if not exists idx_import_media_transcriptions_status
+  on import_media_transcriptions (status, created_at asc);
+
+create table if not exists openrouter_call_logs (
+  id bigserial primary key,
+  media_id bigint references import_media_blobs(id) on delete set null,
+  transcription_id bigint references import_media_transcriptions(id) on delete set null,
+  model text,
+  endpoint text not null,
+  request_json jsonb not null,
+  response_status integer,
+  response_json jsonb,
+  error text,
+  duration_ms integer,
+  created_at timestamptz not null default now(),
+  completed_at timestamptz
+);
+
+create index if not exists idx_openrouter_call_logs_media
+  on openrouter_call_logs (media_id, created_at desc);
+
+create index if not exists idx_openrouter_call_logs_transcription
+  on openrouter_call_logs (transcription_id, created_at desc);

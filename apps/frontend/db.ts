@@ -11,6 +11,14 @@ export type CachedYDoc = {
   updatedAt: string;
 };
 
+export type CacheStats = {
+  indexedDb: Record<StoreName, number>;
+  storageUsageBytes?: number;
+  storageQuotaBytes?: number;
+  cacheNames: string[];
+  serviceWorkers: number;
+};
+
 let dbPromise: Promise<IDBDatabase> | null = null;
 
 export function openCacheDb() {
@@ -113,6 +121,55 @@ export async function saveYDocUpdate(docId: string, update: string) {
   const tx = db.transaction("ydocs", "readwrite");
   tx.objectStore("ydocs").put({ docId, update, updatedAt: new Date().toISOString() } satisfies CachedYDoc);
   await transactionDone(tx);
+}
+
+export async function loadCacheStats(): Promise<CacheStats> {
+  const db = await openCacheDb();
+  const storeNames: StoreName[] = ["meta", "hosts", "sessions", "events", "ydocs"];
+  const indexedDb = Object.fromEntries(
+    await Promise.all(
+      storeNames.map(async (name) => [name, await request<number>(db.transaction(name).objectStore(name).count())] as const),
+    ),
+  ) as Record<StoreName, number>;
+  const estimate: StorageEstimate = navigator.storage?.estimate ? await navigator.storage.estimate().catch(() => ({})) : {};
+  const cacheNames = "caches" in window ? await caches.keys().catch(() => []) : [];
+  const registrations = navigator.serviceWorker?.getRegistrations
+    ? await navigator.serviceWorker.getRegistrations().catch(() => [])
+    : [];
+
+  return {
+    indexedDb,
+    storageUsageBytes: estimate.usage,
+    storageQuotaBytes: estimate.quota,
+    cacheNames,
+    serviceWorkers: registrations.length,
+  };
+}
+
+export async function resetIndexedDbCache() {
+  const db = await openCacheDb();
+  db.close();
+  dbPromise = null;
+  await new Promise<void>((resolve, reject) => {
+    const deleteRequest = indexedDB.deleteDatabase(DB_NAME);
+    deleteRequest.onerror = () => reject(deleteRequest.error);
+    deleteRequest.onblocked = () => reject(new Error("IndexedDB deletion is blocked by another open tab"));
+    deleteRequest.onsuccess = () => resolve();
+  });
+}
+
+export async function clearBrowserCaches() {
+  if (!("caches" in window)) return 0;
+  const names = await caches.keys();
+  await Promise.all(names.map((name) => caches.delete(name)));
+  return names.length;
+}
+
+export async function unregisterServiceWorkers() {
+  if (!navigator.serviceWorker?.getRegistrations) return 0;
+  const registrations = await navigator.serviceWorker.getRegistrations();
+  const results = await Promise.all(registrations.map((registration) => registration.unregister()));
+  return results.filter(Boolean).length;
 }
 
 function request<T>(req: IDBRequest<T>): Promise<T> {

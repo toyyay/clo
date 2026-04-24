@@ -56,6 +56,7 @@ Backend:
 ```sh
 export DATABASE_URL=postgres://user:password@localhost:5432/chatview
 export AGENT_TOKEN=dev-token
+export OPENROUTER_API_KEY=...
 bun run dev:backend
 ```
 
@@ -88,6 +89,16 @@ bun run dev:local:agent
 ```
 
 Frontend is served by the backend at `http://localhost:3737`.
+
+## iPhone Media Imports
+
+The import endpoint is `POST /api/imports/media` with `?token=...` or `Authorization: Bearer ...`.
+The older shortcut-compatible endpoint `POST /api/shortcuts/audio` still maps to the same handler.
+In the web UI, open Settings to create/copy an upload URL and open Audio to view uploaded audio, play it, and retry transcription.
+
+Uploaded audio is converted to mono 16 kHz 32 kbps MP3 with FFmpeg before being sent to OpenRouter.
+Set `OPENROUTER_API_KEY`; the default model is `google/gemini-3-flash-preview` with medium reasoning.
+The backend checks the OpenRouter key on startup through `GET /api/v1/key`. The app still starts without a key, but Settings shows OpenRouter as missing/error and audio transcription will fail until the key is configured.
 
 ## Commands
 

@@ -20,6 +20,7 @@ Required deploy environment:
 - `POSTGRES_PASSWORD`
 - `AGENT_TOKEN`
 - `WEB_TOKEN`
+- `OPENROUTER_API_KEY`
 - `TUNNEL_TOKEN`
 
 The production app enables startup migrations with `AUTO_MIGRATION=true` in Docker Compose. The backend SQL pool is capped with `DB_POOL_MAX=5`. PostgreSQL is pinned to `postgres:18.3`, with `PGDATA=/var/lib/postgresql/18/docker` and the host bind mounted at `/var/lib/postgresql`, matching the PostgreSQL 18 image layout.

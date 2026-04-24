@@ -29,6 +29,9 @@ services:
       DB_POOL_MAX: "5"
       AGENT_TOKEN: ${AGENT_TOKEN}
       WEB_TOKEN: ${WEB_TOKEN}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-3-flash-preview}
+      OPENROUTER_REASONING_EFFORT: ${OPENROUTER_REASONING_EFFORT:-medium}
       PORT: "3737"
     ports:
       - "127.0.0.1:3737:3737"

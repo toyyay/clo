@@ -1,7 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
 import * as Y from "yjs";
-import type { HostInfo, SessionEvent, SessionInfo } from "../../packages/shared/types";
-import { getMeta, loadHosts, loadSessionEvents, loadSessions, setMeta } from "./db";
+import type {
+  AppSettingsInfo,
+  AudioTranscriptLevel,
+  AudioTranscriptionInfo,
+  HostInfo,
+  ImportedAudioInfo,
+  SessionEvent,
+  SessionInfo,
+} from "../../packages/shared/types";
+import {
+  clearBrowserCaches,
+  getMeta,
+  loadCacheStats,
+  loadHosts,
+  loadSessionEvents,
+  loadSessions,
+  resetIndexedDbCache,
+  setMeta,
+  unregisterServiceWorkers,
+  type CacheStats,
+} from "./db";
 import { pullUpdates, SyncAuthError } from "./sync";
 import {
   docIdForSession,
@@ -456,6 +475,334 @@ function renderChatItem(it: RenderItem, i: number) {
   return <ToolGroupBlock key={i} group={it} />;
 }
 
+type TranscriptLanguage = "ru" | "en";
+type TranscriptLevelKey = keyof AudioTranscriptLevel;
+
+const TRANSCRIPT_LEVELS: { key: TranscriptLevelKey; label: string }[] = [
+  { key: "literal", label: "Literal" },
+  { key: "clean", label: "Clean" },
+  { key: "summary", label: "Summary" },
+  { key: "brief", label: "Brief" },
+];
+
+function formatBytes(value?: number | null) {
+  if (!value) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let size = value;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${size.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+}
+
+function formatDate(value?: string | null) {
+  if (!value) return "never";
+  return new Date(value).toLocaleString();
+}
+
+function formatDuration(seconds?: number | null) {
+  if (!seconds || !Number.isFinite(seconds)) return "";
+  const rounded = Math.round(seconds);
+  const mins = Math.floor(rounded / 60);
+  const secs = String(rounded % 60).padStart(2, "0");
+  return `${mins}:${secs}`;
+}
+
+function formatNumber(value?: number | null) {
+  return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : "unknown";
+}
+
+function formatLimit(value?: number | null) {
+  return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : "unlimited";
+}
+
+function openRouterStatusLabel(settings: AppSettingsInfo | null) {
+  const status = settings?.openRouter.status;
+  if (status === "ok") return "ready";
+  if (status === "checking") return "checking";
+  if (status === "error") return "error";
+  return "missing";
+}
+
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init);
+  if (!response.ok) throw new Error(await response.text());
+  return (await response.json()) as T;
+}
+
+function latestTranscription(item: ImportedAudioInfo) {
+  return item.transcriptions[0] ?? null;
+}
+
+function ModalFrame({
+  title,
+  children,
+  onClose,
+}: {
+  title: string;
+  children: ReactElement | ReactElement[];
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal-panel" role="dialog" aria-modal="true" aria-label={title} onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-head">
+          <h2>{title}</h2>
+          <button className="icon-button compact-button" onClick={onClose}>
+            Close
+          </button>
+        </div>
+        {children}
+      </section>
+    </div>
+  );
+}
+
+function SettingsModal({
+  settings,
+  cacheStats,
+  loading,
+  message,
+  onClose,
+  onRefresh,
+  onCopy,
+  onCreateToken,
+  onCheckOpenRouter,
+  onResetIndexedDb,
+  onClearCaches,
+  onUnregisterServiceWorkers,
+}: {
+  settings: AppSettingsInfo | null;
+  cacheStats: CacheStats | null;
+  loading: boolean;
+  message: string;
+  onClose: () => void;
+  onRefresh: () => void;
+  onCopy: (value: string) => void;
+  onCreateToken: () => void;
+  onCheckOpenRouter: () => void;
+  onResetIndexedDb: () => void;
+  onClearCaches: () => void;
+  onUnregisterServiceWorkers: () => void;
+}) {
+  const openRouter = settings?.openRouter;
+  const openRouterReady = openRouter?.status === "ok";
+  const openRouterKey = openRouter?.key;
+  return (
+    <ModalFrame title="Settings" onClose={onClose}>
+      <div className="modal-body">
+        <div className="settings-section">
+          <div className="section-title">iPhone Upload</div>
+          {settings?.importTokens.length ? (
+            <div className="url-list">
+              {settings.importTokens.map((token) => (
+                <div className="url-row" key={token.id}>
+                  <div className="url-meta">
+                    <span>{token.label}</span>
+                    <span>{token.tokenPreview} / last used {formatDate(token.lastUsedAt)}</span>
+                  </div>
+                  <code>{token.uploadUrl}</code>
+                  <button className="icon-button compact-button" onClick={() => onCopy(token.uploadUrl)}>
+                    Copy
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="muted-text">No import tokens yet.</div>
+          )}
+          <button className="icon-button" onClick={onCreateToken} disabled={loading}>
+            New token
+          </button>
+        </div>
+
+        <div className="settings-section">
+          <div className="section-title">OpenRouter</div>
+          <div className={`service-status ${openRouterStatusLabel(settings)}`}>
+            <span>{openRouterStatusLabel(settings)}</span>
+            <b>{openRouter?.message ?? "OPENROUTER_API_KEY is not configured"}</b>
+          </div>
+          <div className="kv-grid">
+            <span>Configured</span>
+            <b>{openRouter?.configured ? "yes" : "no"}</b>
+            <span>Model</span>
+            <b>{openRouter?.model ?? "unknown"}</b>
+            <span>Reasoning</span>
+            <b>{openRouter?.reasoningEffort ?? "medium"}</b>
+            <span>Key label</span>
+            <b>{openRouterKey?.label ?? (openRouter?.configured ? "unknown" : "missing")}</b>
+            <span>Limit remaining</span>
+            <b>{openRouterReady ? formatLimit(openRouterKey?.limitRemaining) : "not available"}</b>
+            <span>Usage</span>
+            <b>{openRouterReady ? formatNumber(openRouterKey?.usage) : "not available"}</b>
+            <span>Rate limit</span>
+            <b>
+              {typeof openRouterKey?.rateLimit?.requests === "number" && openRouterKey.rateLimit.requests > 0
+                ? `${openRouterKey.rateLimit.requests.toLocaleString()} / ${openRouterKey.rateLimit.interval ?? "window"}`
+                : "not available"}
+            </b>
+            <span>Checked</span>
+            <b>{formatDate(openRouter?.checkedAt)}</b>
+          </div>
+          <div className="settings-actions">
+            <button className="icon-button" onClick={onCheckOpenRouter} disabled={loading}>
+              Check OpenRouter
+            </button>
+          </div>
+        </div>
+
+        <div className="settings-section">
+          <div className="section-title">Cache</div>
+          <div className="kv-grid">
+            <span>Storage</span>
+            <b>
+              {formatBytes(cacheStats?.storageUsageBytes)} / {formatBytes(cacheStats?.storageQuotaBytes)}
+            </b>
+            <span>IndexedDB</span>
+            <b>{cacheStats ? Object.entries(cacheStats.indexedDb).map(([k, v]) => `${k}:${v}`).join(" ") : "loading"}</b>
+            <span>Cache API</span>
+            <b>{cacheStats?.cacheNames.length ?? 0}</b>
+            <span>Service workers</span>
+            <b>{cacheStats?.serviceWorkers ?? 0}</b>
+          </div>
+          <div className="settings-actions">
+            <button className="icon-button" onClick={onRefresh} disabled={loading}>
+              Refresh
+            </button>
+            <button className="icon-button" onClick={onResetIndexedDb} disabled={loading}>
+              Reset IndexedDB
+            </button>
+            <button className="icon-button" onClick={onClearCaches} disabled={loading}>
+              Clear caches
+            </button>
+            <button className="icon-button" onClick={onUnregisterServiceWorkers} disabled={loading}>
+              Reset service workers
+            </button>
+          </div>
+        </div>
+
+        {message && <div className="modal-message">{message}</div>}
+      </div>
+    </ModalFrame>
+  );
+}
+
+function AudioModal({
+  items,
+  loading,
+  error,
+  language,
+  busyMediaId,
+  onLanguage,
+  onRefresh,
+  onRetry,
+  onInsert,
+  onClose,
+}: {
+  items: ImportedAudioInfo[];
+  loading: boolean;
+  error: string;
+  language: TranscriptLanguage;
+  busyMediaId: string;
+  onLanguage: (language: TranscriptLanguage) => void;
+  onRefresh: () => void;
+  onRetry: (mediaId: string) => void;
+  onInsert: (text: string) => void;
+  onClose: () => void;
+}) {
+  return (
+    <ModalFrame title="Audio" onClose={onClose}>
+      <div className="audio-toolbar">
+        <div className="segmented">
+          <button className={language === "ru" ? "active" : ""} onClick={() => onLanguage("ru")}>
+            RU
+          </button>
+          <button className={language === "en" ? "active" : ""} onClick={() => onLanguage("en")}>
+            EN
+          </button>
+        </div>
+        <button className="icon-button compact-button" onClick={onRefresh} disabled={loading}>
+          Refresh
+        </button>
+      </div>
+      <div className="modal-body audio-list">
+        {error && <div className="modal-error">{error}</div>}
+        {!items.length && !loading && <div className="empty-modal">No uploaded audio yet</div>}
+        {items.map((item) => (
+          <AudioItem
+            key={item.id}
+            item={item}
+            language={language}
+            busy={busyMediaId === item.id}
+            onRetry={() => onRetry(item.id)}
+            onInsert={onInsert}
+          />
+        ))}
+      </div>
+    </ModalFrame>
+  );
+}
+
+function AudioItem({
+  item,
+  language,
+  busy,
+  onRetry,
+  onInsert,
+}: {
+  item: ImportedAudioInfo;
+  language: TranscriptLanguage;
+  busy: boolean;
+  onRetry: () => void;
+  onInsert: (text: string) => void;
+}) {
+  const transcription = latestTranscription(item);
+  const transcript = transcription?.transcript?.[language];
+  return (
+    <article className="audio-item">
+      <div className="audio-item-head">
+        <div>
+          <div className="audio-title">{item.filename || `audio-${item.id}`}</div>
+          <div className="audio-meta">
+            {formatBytes(item.sizeBytes)} / {item.detectedFormat ?? item.contentType ?? "audio"}{" "}
+            {formatDuration(item.durationSeconds)}
+          </div>
+        </div>
+        <button className="icon-button compact-button" onClick={onRetry} disabled={busy}>
+          {busy ? "Queued" : "Retry"}
+        </button>
+      </div>
+      <audio controls preload="none" src={`/api/imports/media/file?id=${encodeURIComponent(item.id)}`} />
+      {transcription ? (
+        <div className={`transcription ${transcription.status}`}>
+          <div className="transcription-status">
+            {transcription.status} / {transcription.model}
+          </div>
+          {transcription.error && <div className="modal-error">{transcription.error}</div>}
+          {transcript &&
+            TRANSCRIPT_LEVELS.map(({ key, label }) =>
+              transcript[key] ? (
+                <div className="transcript-block" key={key}>
+                  <div className="transcript-row">
+                    <div className="transcript-label">{label}</div>
+                    <button className="mini-action" onClick={() => onInsert(transcript[key])}>
+                      Insert
+                    </button>
+                  </div>
+                  <p>{transcript[key]}</p>
+                </div>
+              ) : null,
+            )}
+        </div>
+      ) : (
+        <div className="muted-text">Transcription is queued after upload.</div>
+      )}
+    </article>
+  );
+}
+
 export function App() {
   const [authState, setAuthState] = useState<AuthState>("checking");
   const [authConfigured, setAuthConfigured] = useState(true);
@@ -473,6 +820,17 @@ export function App() {
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [sidebarOpen, setSidebarOpen] = useState(() => !window.matchMedia("(max-width: 780px)").matches);
   const [draft, setDraft] = useState("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settings, setSettings] = useState<AppSettingsInfo | null>(null);
+  const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
+  const [settingsBusy, setSettingsBusy] = useState(false);
+  const [settingsMessage, setSettingsMessage] = useState("");
+  const [audioOpen, setAudioOpen] = useState(false);
+  const [audioItems, setAudioItems] = useState<ImportedAudioInfo[]>([]);
+  const [audioLoading, setAudioLoading] = useState(false);
+  const [audioError, setAudioError] = useState("");
+  const [audioLanguage, setAudioLanguage] = useState<TranscriptLanguage>("ru");
+  const [audioRetryingId, setAudioRetryingId] = useState("");
   const syncing = useRef(false);
   const activeRef = useRef<SessionInfo | null>(null);
   const activeYDocId = useRef<string | null>(null);
@@ -541,6 +899,153 @@ export function App() {
     setAuthState("anonymous");
   }, []);
 
+  const refreshSettings = useCallback(async () => {
+    setSettingsBusy(true);
+    setSettingsMessage("");
+    try {
+      const [nextSettings, nextStats] = await Promise.all([
+        fetchJson<AppSettingsInfo>("/api/app/settings"),
+        loadCacheStats(),
+      ]);
+      setSettings(nextSettings);
+      setCacheStats(nextStats);
+    } catch (error) {
+      setSettingsMessage(error instanceof Error ? error.message : "Could not load settings");
+    } finally {
+      setSettingsBusy(false);
+    }
+  }, []);
+
+  const copyText = useCallback(async (value: string) => {
+    await navigator.clipboard.writeText(value);
+    setSettingsMessage("Copied");
+  }, []);
+
+  const createImportToken = useCallback(async () => {
+    setSettingsBusy(true);
+    setSettingsMessage("");
+    try {
+      await fetchJson("/api/imports/tokens", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ label: "iPhone Shortcut" }),
+      });
+      await refreshSettings();
+      setSettingsMessage("Token created");
+    } catch (error) {
+      setSettingsMessage(error instanceof Error ? error.message : "Could not create token");
+    } finally {
+      setSettingsBusy(false);
+    }
+  }, [refreshSettings]);
+
+  const checkOpenRouter = useCallback(async () => {
+    setSettingsBusy(true);
+    setSettingsMessage("");
+    try {
+      const nextSettings = await fetchJson<AppSettingsInfo["openRouter"]>("/api/app/openrouter/check", { method: "POST" });
+      setSettings((current) => (current ? { ...current, openRouter: nextSettings } : current));
+      setSettingsMessage(nextSettings.status === "ok" ? "OpenRouter check passed" : nextSettings.message ?? "OpenRouter check failed");
+    } catch (error) {
+      setSettingsMessage(error instanceof Error ? error.message : "Could not check OpenRouter");
+    } finally {
+      setSettingsBusy(false);
+    }
+  }, []);
+
+  const resetIndexedDb = useCallback(async () => {
+    setSettingsBusy(true);
+    setSettingsMessage("");
+    try {
+      await resetIndexedDbCache();
+      setHosts([]);
+      setSessions([]);
+      setEvents([]);
+      setActive(null);
+      setDraft("");
+      await refreshSettings();
+      setSettingsMessage("IndexedDB cache reset");
+    } catch (error) {
+      setSettingsMessage(error instanceof Error ? error.message : "Could not reset IndexedDB");
+    } finally {
+      setSettingsBusy(false);
+    }
+  }, [refreshSettings]);
+
+  const clearCaches = useCallback(async () => {
+    setSettingsBusy(true);
+    setSettingsMessage("");
+    try {
+      const count = await clearBrowserCaches();
+      await refreshSettings();
+      setSettingsMessage(`Cleared ${count} browser caches`);
+    } catch (error) {
+      setSettingsMessage(error instanceof Error ? error.message : "Could not clear caches");
+    } finally {
+      setSettingsBusy(false);
+    }
+  }, [refreshSettings]);
+
+  const resetServiceWorkers = useCallback(async () => {
+    setSettingsBusy(true);
+    setSettingsMessage("");
+    try {
+      const count = await unregisterServiceWorkers();
+      await refreshSettings();
+      setSettingsMessage(`Unregistered ${count} service workers`);
+    } catch (error) {
+      setSettingsMessage(error instanceof Error ? error.message : "Could not reset service workers");
+    } finally {
+      setSettingsBusy(false);
+    }
+  }, [refreshSettings]);
+
+  const refreshAudio = useCallback(async () => {
+    setAudioLoading(true);
+    setAudioError("");
+    try {
+      setAudioItems(await fetchJson<ImportedAudioInfo[]>("/api/imports/audio"));
+    } catch (error) {
+      setAudioError(error instanceof Error ? error.message : "Could not load audio");
+    } finally {
+      setAudioLoading(false);
+    }
+  }, []);
+
+  const retryAudioTranscription = useCallback(
+    async (mediaId: string) => {
+      setAudioRetryingId(mediaId);
+      setAudioError("");
+      try {
+        await fetchJson<AudioTranscriptionInfo>("/api/imports/audio/transcriptions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ mediaId }),
+        });
+        await refreshAudio();
+      } catch (error) {
+        setAudioError(error instanceof Error ? error.message : "Could not queue transcription");
+      } finally {
+        setAudioRetryingId("");
+      }
+    },
+    [refreshAudio],
+  );
+
+  const insertTranscriptIntoDraft = useCallback(
+    (text: string) => {
+      const value = text.trim();
+      if (!value) return;
+      const nextDraft = draft.trim() ? `${draft.trim()}\n\n${value}` : value;
+      const docId = active ? docIdForSession(active.id) : null;
+      const doc = docId ? yDocs.current.get(docId) : null;
+      if (doc) setYDraft(doc, nextDraft);
+      else setDraft(nextDraft);
+      setAudioOpen(false);
+    },
+    [active, draft],
+  );
+
   const refreshCache = useCallback(async () => {
     const [nextHosts, nextSessions] = await Promise.all([loadHosts(), loadSessions()]);
     setHosts(nextHosts);
@@ -602,6 +1107,24 @@ export function App() {
   useEffect(() => {
     checkAuth();
   }, [checkAuth]);
+
+  useEffect(() => {
+    if (settingsOpen) refreshSettings();
+  }, [refreshSettings, settingsOpen]);
+
+  useEffect(() => {
+    if (audioOpen) refreshAudio();
+  }, [audioOpen, refreshAudio]);
+
+  useEffect(() => {
+    if (!audioOpen) return;
+    const hasPending = audioItems.some((item) =>
+      item.transcriptions.some((transcription) => transcription.status === "queued" || transcription.status === "processing"),
+    );
+    if (!hasPending) return;
+    const id = window.setInterval(refreshAudio, 4000);
+    return () => window.clearInterval(id);
+  }, [audioItems, audioOpen, refreshAudio]);
 
   useEffect(() => {
     getMeta<"light" | "dark">("theme").then((stored) => {
@@ -813,6 +1336,12 @@ export function App() {
           <div className={`sync-line ${syncState}`}>{statusText}</div>
         </div>
         <div className="top-actions">
+          <button className="icon-button" onClick={() => setAudioOpen(true)} title="Uploaded audio">
+            Audio
+          </button>
+          <button className="icon-button" onClick={() => setSettingsOpen(true)} title="Settings">
+            Settings
+          </button>
           <a className="icon-button download-button" href="/api/agent/download?arch=arm64">
             Download Mac Agent (M1)
           </a>
@@ -920,6 +1449,36 @@ export function App() {
           )}
         </main>
       </div>
+      {settingsOpen && (
+        <SettingsModal
+          settings={settings}
+          cacheStats={cacheStats}
+          loading={settingsBusy}
+          message={settingsMessage}
+          onClose={() => setSettingsOpen(false)}
+          onRefresh={refreshSettings}
+          onCopy={copyText}
+          onCreateToken={createImportToken}
+          onCheckOpenRouter={checkOpenRouter}
+          onResetIndexedDb={resetIndexedDb}
+          onClearCaches={clearCaches}
+          onUnregisterServiceWorkers={resetServiceWorkers}
+        />
+      )}
+      {audioOpen && (
+        <AudioModal
+          items={audioItems}
+          loading={audioLoading}
+          error={audioError}
+          language={audioLanguage}
+          busyMediaId={audioRetryingId}
+          onLanguage={setAudioLanguage}
+          onRefresh={refreshAudio}
+          onRetry={retryAudioTranscription}
+          onInsert={insertTranscriptIntoDraft}
+          onClose={() => setAudioOpen(false)}
+        />
+      )}
     </div>
   );
 }

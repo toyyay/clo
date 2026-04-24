@@ -1,11 +1,19 @@
 import index from "../../index.html";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import * as Y from "yjs";
 import type { ServerWebSocket } from "bun";
 import type {
+  AppSettingsInfo,
+  AudioTranscriptPayload,
+  AudioTranscriptionInfo,
   HostInfo,
+  ImportedAudioInfo,
   IngestBatchRequest,
   IngestBatchResponse,
+  ImportTokenInfo,
   SessionInfo,
   SessionPayload,
   SyncRequest,
@@ -14,9 +22,10 @@ import type {
   YjsSocketMessage,
   YjsSyncRequest,
   YjsSyncResponse,
+  OpenRouterStatusInfo,
 } from "../../packages/shared/types";
 import { downloadAgentArchiveResponse } from "./agent-download";
-import { envFlag, envValue } from "../../packages/shared/env";
+import { envFlag, envPositiveInteger, envValue } from "../../packages/shared/env";
 import { prepareDatabase, sql, toId, toNumber } from "./db";
 
 const isProduction = process.env.NODE_ENV === "production";
@@ -24,6 +33,13 @@ const port = Number(envValue(process.env, "PORT", "CHATVIEW_PORT") ?? 3737);
 const agentToken = envValue(process.env, "AGENT_TOKEN", "CHATVIEW_AGENT_TOKEN") ?? (isProduction ? "" : "dev-token");
 const webToken = envValue(process.env, "WEB_TOKEN", "CHATVIEW_WEB_TOKEN") ?? "";
 const importStoreBody = envFlag(process.env, ["IMPORT_STORE_BODY", "CHATVIEW_IMPORT_STORE_BODY"]);
+const openRouterApiKey = envValue(process.env, "OPENROUTER_API_KEY");
+const openRouterModel = envValue(process.env, "OPENROUTER_MODEL") ?? "google/gemini-3-flash-preview";
+const openRouterReasoningEffort = envValue(process.env, "OPENROUTER_REASONING_EFFORT") ?? "medium";
+const openRouterEndpoint = envValue(process.env, "OPENROUTER_ENDPOINT") ?? "https://openrouter.ai/api/v1/chat/completions";
+const openRouterKeyEndpoint = envValue(process.env, "OPENROUTER_KEY_ENDPOINT") ?? "https://openrouter.ai/api/v1/key";
+const ffmpegBin = envValue(process.env, "FFMPEG_BIN") ?? "ffmpeg";
+const transcriptionConcurrency = envPositiveInteger(process.env, ["TRANSCRIPTION_CONCURRENCY"], 2);
 const webAuthCookie = "chatview_token";
 const webAuthCookieMaxAge = 60 * 60 * 24 * 30;
 const gitSha = process.env.GIT_SHA ?? "unknown";
@@ -31,6 +47,12 @@ const encoder = new TextEncoder();
 const streamClients = new Set<ReadableStreamDefaultController<Uint8Array>>();
 const redactedHeaderNames = new Set(["authorization", "proxy-authorization", "cookie", "set-cookie"]);
 const redactedQueryNames = new Set(["token"]);
+const transcriptionQueue: string[] = [];
+const queuedTranscriptionIds = new Set<string>();
+const runningTranscriptionIds = new Set<string>();
+let activeTranscriptionJobs = 0;
+let openRouterStatus: OpenRouterStatusInfo = initialOpenRouterStatus();
+let openRouterStatusCheck: Promise<OpenRouterStatusInfo> | null = null;
 type YjsWebSocket = ServerWebSocket<{ docIds: Set<string> }>;
 const yjsSocketsByDoc = new Map<string, Set<YjsWebSocket>>();
 const docIdsBySocket = new WeakMap<YjsWebSocket, Set<string>>();
@@ -52,6 +74,12 @@ if (!webToken) {
 }
 
 await prepareDatabase();
+void refreshOpenRouterStatus("startup").catch((error) => {
+  console.error("OpenRouter startup check failed", error instanceof Error ? error.message : String(error));
+});
+void resumeQueuedTranscriptionJobs().catch((error) => {
+  console.error("failed to resume queued transcriptions", error);
+});
 
 Bun.serve<{ docIds: Set<string> }>({
   port,
@@ -125,6 +153,51 @@ Bun.serve<{ docIds: Set<string> }>({
       const auth = requireWebAuth(req);
       if (auth) return auth;
       return downloadAgentArchiveResponse(req, agentToken);
+    },
+    "/api/app/settings": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      return json(await getAppSettings(req));
+    },
+    "/api/app/openrouter/check": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      if (req.method !== "POST") return text("method not allowed", 405);
+      return json(await refreshOpenRouterStatus("manual", true));
+    },
+    "/api/imports/tokens": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      if (req.method !== "POST") return text("method not allowed", 405);
+      const body = (await req.json().catch(() => ({}))) as { label?: unknown };
+      const label = typeof body.label === "string" && body.label.trim() ? body.label.trim() : "iPhone Shortcut";
+      return json(await createImportToken(req, label), 201);
+    },
+    "/api/imports/audio": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      if (req.method !== "GET") return text("method not allowed", 405);
+      return json(await listImportedAudio());
+    },
+    "/api/imports/audio/transcriptions": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      if (req.method !== "POST") return text("method not allowed", 405);
+      try {
+        const body = (await req.json().catch(() => ({}))) as { mediaId?: unknown };
+        if (typeof body.mediaId !== "string" && typeof body.mediaId !== "number") return text("missing mediaId", 400);
+        const transcription = await createAudioTranscription(String(body.mediaId), "manual");
+        enqueueAudioTranscription(transcription.id);
+        return json(transcription, 202);
+      } catch (error) {
+        return text(error instanceof Error ? error.message : "could not queue transcription", 400);
+      }
+    },
+    "/api/imports/media/file": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      if (req.method !== "GET") return text("method not allowed", 405);
+      return getImportedMediaFile(req);
     },
     "/api/ingest/batch": async (req: Request) => {
       if (req.method !== "POST") return text("method not allowed", 405);
@@ -238,6 +311,697 @@ function tokenMatches(candidate: string | undefined, expected: string) {
   const candidateHash = createHash("sha256").update(candidate).digest();
   const expectedHash = createHash("sha256").update(expected).digest();
   return timingSafeEqual(candidateHash, expectedHash);
+}
+
+function initialOpenRouterStatus(): OpenRouterStatusInfo {
+  return {
+    configured: Boolean(openRouterApiKey),
+    status: openRouterApiKey ? "checking" : "missing",
+    model: openRouterModel,
+    reasoningEffort: openRouterReasoningEffort,
+    endpoint: openRouterEndpoint,
+    keyEndpoint: openRouterKeyEndpoint,
+    checkedAt: null,
+    message: openRouterApiKey ? "OpenRouter check has not completed yet" : "OPENROUTER_API_KEY is not configured",
+    key: null,
+  };
+}
+
+async function refreshOpenRouterStatus(source: "startup" | "manual", force = false): Promise<OpenRouterStatusInfo> {
+  if (openRouterStatusCheck && !force) return openRouterStatusCheck;
+
+  openRouterStatus = {
+    ...openRouterStatus,
+    configured: Boolean(openRouterApiKey),
+    status: openRouterApiKey ? "checking" : "missing",
+    checkedAt: new Date().toISOString(),
+    message: openRouterApiKey ? "Checking OpenRouter key" : "OPENROUTER_API_KEY is not configured",
+    key: openRouterApiKey ? openRouterStatus.key ?? null : null,
+  };
+
+  if (!openRouterApiKey) {
+    console.warn("OpenRouter is disabled: OPENROUTER_API_KEY is not configured");
+    return openRouterStatus;
+  }
+
+  openRouterStatusCheck = checkOpenRouterKey()
+    .then((status) => {
+      openRouterStatus = status;
+      const remaining = status.key?.limitRemaining;
+      const remainingText = typeof remaining === "number" ? `, limit remaining ${remaining}` : "";
+      console.log(`OpenRouter ${source} check ok${remainingText}`);
+      return openRouterStatus;
+    })
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      openRouterStatus = {
+        ...openRouterStatus,
+        configured: true,
+        status: "error",
+        checkedAt: new Date().toISOString(),
+        message,
+      };
+      console.warn(`OpenRouter ${source} check failed: ${message}`);
+      return openRouterStatus;
+    })
+    .finally(() => {
+      openRouterStatusCheck = null;
+    });
+
+  return openRouterStatusCheck;
+}
+
+async function checkOpenRouterKey(): Promise<OpenRouterStatusInfo> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+
+  try {
+    const response = await fetch(openRouterKeyEndpoint, {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${openRouterApiKey}`,
+        "content-type": "application/json",
+      },
+      signal: controller.signal,
+    });
+    const bodyText = await response.text();
+    const responseJson = parseJsonObject(bodyText) ?? {};
+
+    if (!response.ok) {
+      throw new Error(`OpenRouter key check failed (${response.status}): ${openRouterErrorMessage(responseJson, bodyText)}`);
+    }
+
+    const key = normalizeOpenRouterKeyInfo(responseJson);
+    if (typeof key.limitRemaining === "number" && key.limitRemaining <= 0) {
+      throw new Error("OpenRouter key has no remaining credit limit");
+    }
+
+    return {
+      configured: true,
+      status: "ok",
+      model: openRouterModel,
+      reasoningEffort: openRouterReasoningEffort,
+      endpoint: openRouterEndpoint,
+      keyEndpoint: openRouterKeyEndpoint,
+      checkedAt: new Date().toISOString(),
+      message: "OpenRouter key is valid",
+      key,
+    };
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw new Error("OpenRouter key check timed out");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function normalizeOpenRouterKeyInfo(responseJson: any): NonNullable<OpenRouterStatusInfo["key"]> {
+  const data = responseJson?.data && typeof responseJson.data === "object" ? responseJson.data : {};
+  const rateLimit = data.rate_limit && typeof data.rate_limit === "object" ? data.rate_limit : null;
+  return {
+    label: typeof data.label === "string" ? data.label : null,
+    limit: numberOrNull(data.limit),
+    usage: numberOrNull(data.usage),
+    limitRemaining: numberOrNull(data.limit_remaining),
+    isFreeTier: typeof data.is_free_tier === "boolean" ? data.is_free_tier : null,
+    rateLimit: rateLimit
+      ? {
+          requests: numberOrNull(rateLimit.requests),
+          interval: typeof rateLimit.interval === "string" ? rateLimit.interval : null,
+        }
+      : null,
+  };
+}
+
+function numberOrNull(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function requestOrigin(req: Request) {
+  const url = new URL(req.url);
+  const forwardedProto = req.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
+  const forwardedHost = req.headers.get("x-forwarded-host")?.split(",")[0]?.trim();
+  const proto = forwardedProto || url.protocol.replace(/:$/, "");
+  const host = forwardedHost || req.headers.get("host") || url.host;
+  return `${proto}://${host}`;
+}
+
+function makeImportUrl(origin: string, path: string, token: string) {
+  const url = new URL(path, origin);
+  url.searchParams.set("token", token);
+  return url.toString();
+}
+
+function tokenPreview(token: string) {
+  return token.length <= 10 ? token : `${token.slice(0, 4)}...${token.slice(-4)}`;
+}
+
+async function getAppSettings(req: Request): Promise<AppSettingsInfo> {
+  const origin = requestOrigin(req);
+  const rows = await sql`
+    select id, token, label, created_at, last_used_at
+    from import_tokens
+    order by created_at desc
+  `;
+
+  return {
+    origin,
+    importUploadPath: "/api/imports/media",
+    shortcutUploadPath: "/api/shortcuts/audio",
+    importTokens: rows.map((row: any): ImportTokenInfo => ({
+      id: toId(row.id),
+      label: row.label,
+      tokenPreview: tokenPreview(row.token),
+      createdAt: row.created_at,
+      lastUsedAt: row.last_used_at ?? null,
+      uploadUrl: makeImportUrl(origin, "/api/imports/media", row.token),
+      shortcutUrl: makeImportUrl(origin, "/api/shortcuts/audio", row.token),
+    })),
+    openRouter: openRouterStatus,
+  };
+}
+
+async function createImportToken(req: Request, label: string): Promise<ImportTokenInfo> {
+  const token = `im_${randomBytes(24).toString("base64url")}`;
+  const rows = await sql`
+    insert into import_tokens (token, label)
+    values (${token}, ${label})
+    returning id, token, label, created_at, last_used_at
+  `;
+  const row = rows[0];
+  const origin = requestOrigin(req);
+  return {
+    id: toId(row.id),
+    label: row.label,
+    tokenPreview: tokenPreview(row.token),
+    createdAt: row.created_at,
+    lastUsedAt: row.last_used_at ?? null,
+    uploadUrl: makeImportUrl(origin, "/api/imports/media", row.token),
+    shortcutUrl: makeImportUrl(origin, "/api/shortcuts/audio", row.token),
+  };
+}
+
+async function listImportedAudio(): Promise<ImportedAudioInfo[]> {
+  const rows = await sql`
+    select
+      m.id,
+      m.sha256,
+      m.size_bytes,
+      m.content_type,
+      m.filename,
+      m.detected_format,
+      m.metadata,
+      m.created_at,
+      m.last_seen_at,
+      coalesce(
+        jsonb_agg(
+          jsonb_build_object(
+            'id', t.id::text,
+            'status', t.status,
+            'source', t.source,
+            'model', t.model,
+            'reasoningEffort', t.reasoning_effort,
+            'transcript', nullif(t.transcript, '{}'::jsonb),
+            'error', t.error,
+            'createdAt', t.created_at,
+            'startedAt', t.started_at,
+            'completedAt', t.completed_at
+          )
+          order by t.created_at desc
+        ) filter (where t.id is not null),
+        '[]'::jsonb
+      ) as transcriptions
+    from import_media_blobs m
+    left join import_media_transcriptions t on t.media_id = m.id
+    where m.media_kind = 'audio'
+    group by m.id
+    order by m.last_seen_at desc
+    limit 100
+  `;
+
+  return rows.map((row: any): ImportedAudioInfo => ({
+    id: toId(row.id),
+    sha256: row.sha256,
+    sizeBytes: toNumber(row.size_bytes),
+    contentType: row.content_type ?? null,
+    filename: row.filename ?? null,
+    detectedFormat: row.detected_format ?? null,
+    createdAt: row.created_at,
+    lastSeenAt: row.last_seen_at,
+    durationSeconds: typeof row.metadata?.durationSeconds === "number" ? row.metadata.durationSeconds : null,
+    transcriptions: Array.isArray(row.transcriptions)
+      ? row.transcriptions.map(mapAudioTranscription)
+      : [],
+  }));
+}
+
+function mapAudioTranscription(row: any): AudioTranscriptionInfo {
+  return {
+    id: toId(row.id),
+    status: ["queued", "processing", "completed", "failed"].includes(row.status) ? row.status : "failed",
+    source: row.source,
+    model: row.model,
+    reasoningEffort: row.reasoningEffort ?? row.reasoning_effort ?? "medium",
+    transcript: normalizeStoredTranscript(row.transcript),
+    error: row.error ?? null,
+    createdAt: row.createdAt ?? row.created_at,
+    startedAt: row.startedAt ?? row.started_at ?? null,
+    completedAt: row.completedAt ?? row.completed_at ?? null,
+  };
+}
+
+async function getImportedMediaFile(req: Request) {
+  const url = new URL(req.url);
+  const id = url.searchParams.get("id");
+  if (!id) return text("missing id", 400);
+
+  const rows = await sql`
+    select bytes, content_type, filename
+    from import_media_blobs
+    where id = ${id}
+      and media_kind = 'audio'
+  `;
+  if (!rows.length) return text("media not found", 404);
+
+  const row = rows[0];
+  const headers = new Headers({
+    "content-type": row.content_type || "application/octet-stream",
+    "cache-control": "private, max-age=3600",
+  });
+  if (row.filename) headers.set("content-disposition", `inline; filename="${String(row.filename).replace(/"/g, "")}"`);
+  return new Response(Buffer.from(toBytes(row.bytes)), { headers });
+}
+
+async function ensureAutoAudioTranscription(mediaId: string): Promise<AudioTranscriptionInfo | null> {
+  const existing = await sql`
+    select id
+    from import_media_transcriptions
+    where media_id = ${mediaId}
+      and source = 'auto'
+    limit 1
+  `;
+  if (existing.length) return null;
+  return createAudioTranscription(mediaId, "auto");
+}
+
+async function createAudioTranscription(mediaId: string, source: "auto" | "manual"): Promise<AudioTranscriptionInfo> {
+  const mediaRows = await sql`
+    select id
+    from import_media_blobs
+    where id = ${mediaId}
+      and media_kind = 'audio'
+  `;
+  if (!mediaRows.length) throw new Error("audio media not found");
+
+  const rows = await sql`
+    insert into import_media_transcriptions (
+      media_id,
+      source,
+      status,
+      model,
+      reasoning_effort
+    )
+    values (
+      ${mediaId},
+      ${source},
+      'queued',
+      ${openRouterModel},
+      ${openRouterReasoningEffort}
+    )
+    returning id, status, source, model, reasoning_effort, transcript, error, created_at, started_at, completed_at
+  `;
+  return mapAudioTranscription(rows[0]);
+}
+
+function enqueueAudioTranscription(transcriptionId: string) {
+  if (queuedTranscriptionIds.has(transcriptionId) || runningTranscriptionIds.has(transcriptionId)) return;
+  queuedTranscriptionIds.add(transcriptionId);
+  transcriptionQueue.push(transcriptionId);
+  drainTranscriptionQueue();
+}
+
+function drainTranscriptionQueue() {
+  while (activeTranscriptionJobs < transcriptionConcurrency && transcriptionQueue.length) {
+    const transcriptionId = transcriptionQueue.shift();
+    if (!transcriptionId) return;
+    queuedTranscriptionIds.delete(transcriptionId);
+    if (runningTranscriptionIds.has(transcriptionId)) continue;
+
+    activeTranscriptionJobs += 1;
+    runningTranscriptionIds.add(transcriptionId);
+    void processAudioTranscription(transcriptionId)
+      .catch((error) => {
+        console.error("audio transcription failed", {
+          transcriptionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      })
+      .finally(() => {
+        runningTranscriptionIds.delete(transcriptionId);
+        activeTranscriptionJobs -= 1;
+        drainTranscriptionQueue();
+      });
+  }
+}
+
+async function resumeQueuedTranscriptionJobs() {
+  await sql`
+    update import_media_transcriptions
+    set status = 'queued',
+        updated_at = now()
+    where status = 'processing'
+  `;
+  const rows = await sql`
+    select id
+    from import_media_transcriptions
+    where status = 'queued'
+    order by created_at asc
+    limit 100
+  `;
+  for (const row of rows) enqueueAudioTranscription(toId(row.id));
+}
+
+async function processAudioTranscription(transcriptionId: string) {
+  const rows = await sql`
+    select
+      t.id,
+      t.media_id,
+      t.model,
+      t.reasoning_effort,
+      m.bytes,
+      m.content_type,
+      m.filename,
+      m.detected_format
+    from import_media_transcriptions t
+    join import_media_blobs m on m.id = t.media_id
+    where t.id = ${transcriptionId}
+      and t.status in ('queued', 'processing')
+  `;
+  if (!rows.length) return;
+
+  const row = rows[0];
+  await sql`
+    update import_media_transcriptions
+    set status = 'processing',
+        started_at = coalesce(started_at, now()),
+        updated_at = now(),
+        error = null
+    where id = ${transcriptionId}
+  `;
+
+  try {
+    if (!openRouterApiKey) throw new Error("OPENROUTER_API_KEY is not configured");
+
+    const originalBytes = Buffer.from(toBytes(row.bytes));
+    const mp3 = await convertAudioToMp3(originalBytes, row.filename, row.detected_format);
+    const transcript = await transcribeWithOpenRouter({
+      mediaId: toId(row.media_id),
+      transcriptionId,
+      model: row.model,
+      reasoningEffort: row.reasoning_effort,
+      mp3,
+    });
+
+    await sql`
+      update import_media_transcriptions
+      set status = 'completed',
+          source_format = ${row.detected_format ?? row.content_type ?? null},
+          mp3_sha256 = ${sha256Hex(mp3)},
+          mp3_bytes = ${mp3.length},
+          detected_language = ${transcript.detectedLanguage ?? null},
+          transcript = ${transcript}::jsonb,
+          error = null,
+          completed_at = now(),
+          updated_at = now()
+      where id = ${transcriptionId}
+    `;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await sql`
+      update import_media_transcriptions
+      set status = 'failed',
+          error = ${message},
+          completed_at = now(),
+          updated_at = now()
+      where id = ${transcriptionId}
+    `;
+  }
+}
+
+async function convertAudioToMp3(bytes: Buffer, filename?: string | null, detectedFormat?: string | null) {
+  const dir = await mkdtemp(join(tmpdir(), "chatview-audio-"));
+  const extension = fileExtension(filename ?? undefined) ?? formatToExtension(detectedFormat) ?? "audio";
+  const inputPath = join(dir, `input.${extension}`);
+  const outputPath = join(dir, "output.mp3");
+
+  try {
+    await writeFile(inputPath, bytes);
+    const proc = Bun.spawn([
+      ffmpegBin,
+      "-y",
+      "-i",
+      inputPath,
+      "-vn",
+      "-ac",
+      "1",
+      "-ar",
+      "16000",
+      "-c:a",
+      "libmp3lame",
+      "-b:a",
+      "32k",
+      "-f",
+      "mp3",
+      outputPath,
+    ], {
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    if (exitCode !== 0) throw new Error(`ffmpeg failed (${exitCode}): ${truncateForLog(stderr, 1200)}`);
+    return await readFile(outputPath);
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+function formatToExtension(format?: string | null) {
+  if (!format) return undefined;
+  const lower = format.toLowerCase();
+  if (lower.includes("mp3")) return "mp3";
+  if (lower.includes("wav")) return "wav";
+  if (lower.includes("caf")) return "caf";
+  if (lower.includes("quicktime")) return "mov";
+  if (lower.includes("m4a") || lower.includes("mp4")) return "m4a";
+  if (lower.includes("aac")) return "aac";
+  return undefined;
+}
+
+type OpenRouterTranscriptionRequest = {
+  mediaId: string;
+  transcriptionId: string;
+  model: string;
+  reasoningEffort: string;
+  mp3: Buffer;
+};
+
+async function transcribeWithOpenRouter(input: OpenRouterTranscriptionRequest): Promise<AudioTranscriptPayload> {
+  const prompt = [
+    "Transcribe and rewrite the attached audio.",
+    "Return only valid JSON.",
+    "Use the language of the audio for detected-language fields, and produce both Russian and English versions.",
+    "Remove filler sounds and hesitation markers such as э, ээ, бэ, мэ, um, uh.",
+    "The JSON shape must be:",
+    JSON.stringify({
+      detectedLanguage: "ru",
+      detectedLanguageName: "Russian",
+      ru: {
+        literal: "very close transcript without filler sounds",
+        clean: "shorter clean sentences preserving the substance",
+        summary: "detailed clear summary in a reasonably formal style",
+        brief: "one short sentence for UI preview",
+      },
+      en: {
+        literal: "very close English translation without filler sounds",
+        clean: "shorter clean English sentences preserving the substance",
+        summary: "detailed clear English summary in a reasonably formal style",
+        brief: "one short English sentence for UI preview",
+      },
+    }),
+  ].join("\n");
+
+  const requestJson = {
+    model: input.model,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          {
+            type: "input_audio",
+            inputAudio: {
+              data: input.mp3.toString("base64"),
+              format: "mp3",
+            },
+          },
+        ],
+      },
+    ],
+    reasoning: { effort: normalizeReasoningEffort(input.reasoningEffort), exclude: true },
+    response_format: { type: "json_object" },
+    stream: false,
+  };
+
+  const logRequestJson = redactAudioFromOpenRouterRequest(requestJson, input.mp3);
+  const logRows = await sql`
+    insert into openrouter_call_logs (
+      media_id,
+      transcription_id,
+      model,
+      endpoint,
+      request_json
+    )
+    values (
+      ${input.mediaId},
+      ${input.transcriptionId},
+      ${input.model},
+      ${openRouterEndpoint},
+      ${logRequestJson}::jsonb
+    )
+    returning id
+  `;
+  const logId = logRows[0].id;
+  const started = performance.now();
+
+  try {
+    const response = await fetch(openRouterEndpoint, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${openRouterApiKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(requestJson),
+    });
+    const bodyText = await response.text();
+    const responseJson = parseJsonObject(bodyText) ?? { raw: truncateForLog(bodyText, 20000) };
+    const durationMs = Math.round(performance.now() - started);
+
+    await sql`
+      update openrouter_call_logs
+      set response_status = ${response.status},
+          response_json = ${responseJson}::jsonb,
+          error = ${response.ok ? null : openRouterErrorMessage(responseJson, bodyText)},
+          duration_ms = ${durationMs},
+          completed_at = now()
+      where id = ${logId}
+    `;
+
+    if (!response.ok) throw new Error(`OpenRouter failed (${response.status}): ${openRouterErrorMessage(responseJson, bodyText)}`);
+    const messageContent = extractOpenRouterMessageContent(responseJson);
+    if (!messageContent) throw new Error("OpenRouter returned no message content");
+    return normalizeStoredTranscript(parseJsonObjectLoose(messageContent) ?? messageContent);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await sql`
+      update openrouter_call_logs
+      set error = ${message},
+          duration_ms = ${Math.round(performance.now() - started)},
+          completed_at = now()
+      where id = ${logId}
+    `;
+    throw error;
+  }
+}
+
+function normalizeReasoningEffort(value: string) {
+  return ["minimal", "low", "medium", "high"].includes(value) ? value : "medium";
+}
+
+function redactAudioFromOpenRouterRequest(requestJson: any, mp3: Buffer) {
+  return {
+    ...requestJson,
+    messages: requestJson.messages.map((message: any) => ({
+      ...message,
+      content: message.content.map((part: any) =>
+        part.type === "input_audio"
+          ? {
+              type: "input_audio",
+              inputAudio: {
+                data: "<redacted audio base64>",
+                format: part.inputAudio?.format ?? "mp3",
+                sha256: sha256Hex(mp3),
+                bytes: mp3.length,
+              },
+            }
+          : part,
+      ),
+    })),
+  };
+}
+
+function parseJsonObject(raw: string): any | null {
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseJsonObjectLoose(raw: string): any | null {
+  const trimmed = stripJsonCodeFence(raw);
+  const parsed = parseJsonObject(trimmed);
+  if (parsed) return parsed;
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start >= 0 && end > start) return parseJsonObject(trimmed.slice(start, end + 1));
+  return null;
+}
+
+function stripJsonCodeFence(raw: string) {
+  return raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+}
+
+function extractOpenRouterMessageContent(responseJson: any) {
+  const content = responseJson?.choices?.[0]?.message?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => (typeof part === "string" ? part : typeof part?.text === "string" ? part.text : ""))
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+function openRouterErrorMessage(responseJson: any, fallback: string) {
+  const message = responseJson?.error?.message ?? responseJson?.message;
+  return typeof message === "string" ? message : truncateForLog(fallback, 1200);
+}
+
+function normalizeStoredTranscript(value: unknown): AudioTranscriptPayload {
+  const raw = typeof value === "string" ? parseJsonObjectLoose(value) : value;
+  const object = raw && typeof raw === "object" ? (raw as Record<string, any>) : {};
+  return {
+    detectedLanguage: typeof object.detectedLanguage === "string" ? object.detectedLanguage : null,
+    detectedLanguageName: typeof object.detectedLanguageName === "string" ? object.detectedLanguageName : null,
+    ru: normalizeTranscriptLevel(object.ru),
+    en: normalizeTranscriptLevel(object.en),
+  };
+}
+
+function normalizeTranscriptLevel(value: unknown) {
+  const object = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  return {
+    literal: typeof object.literal === "string" ? object.literal : "",
+    clean: typeof object.clean === "string" ? object.clean : "",
+    summary: typeof object.summary === "string" ? object.summary : "",
+    brief: typeof object.brief === "string" ? object.brief : "",
+  };
+}
+
+function truncateForLog(value: string, max: number) {
+  return value.length > max ? `${value.slice(0, max)}...` : value;
 }
 
 function readImportToken(req: Request, url: URL) {
@@ -454,6 +1218,9 @@ async function ingestImportMedia(req: Request, rawBody: Buffer, requestId: unkno
       detectedFormat: media.detected_format,
       createdAt: typeof metadata.createdAt === "string" ? metadata.createdAt : null,
     });
+
+    const transcription = await ensureAutoAudioTranscription(toId(media.id));
+    if (transcription) enqueueAudioTranscription(transcription.id);
   }
 
   return {

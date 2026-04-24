@@ -162,3 +162,83 @@ export type YjsSyncResponse = {
 export type YjsSocketMessage =
   | { type: "subscribe"; docIds: string[] }
   | { type: "update"; docId: string; sessionDbId?: string; update: string };
+
+export type ImportTokenInfo = {
+  id: string;
+  label: string;
+  tokenPreview: string;
+  createdAt: string;
+  lastUsedAt?: string | null;
+  uploadUrl: string;
+  shortcutUrl: string;
+};
+
+export type AppSettingsInfo = {
+  origin: string;
+  importUploadPath: string;
+  shortcutUploadPath: string;
+  importTokens: ImportTokenInfo[];
+  openRouter: OpenRouterStatusInfo;
+};
+
+export type OpenRouterStatusInfo = {
+  configured: boolean;
+  status: "missing" | "checking" | "ok" | "error";
+  model: string;
+  reasoningEffort: string;
+  endpoint: string;
+  keyEndpoint: string;
+  checkedAt?: string | null;
+  message?: string | null;
+  key?: {
+    label?: string | null;
+    limit?: number | null;
+    usage?: number | null;
+    limitRemaining?: number | null;
+    isFreeTier?: boolean | null;
+    rateLimit?: {
+      requests?: number | null;
+      interval?: string | null;
+    } | null;
+  } | null;
+};
+
+export type AudioTranscriptLevel = {
+  literal: string;
+  clean: string;
+  summary: string;
+  brief: string;
+};
+
+export type AudioTranscriptPayload = {
+  detectedLanguage?: string | null;
+  detectedLanguageName?: string | null;
+  ru: AudioTranscriptLevel;
+  en: AudioTranscriptLevel;
+};
+
+export type AudioTranscriptionInfo = {
+  id: string;
+  status: "queued" | "processing" | "completed" | "failed";
+  source: string;
+  model: string;
+  reasoningEffort: string;
+  transcript?: AudioTranscriptPayload | null;
+  error?: string | null;
+  createdAt: string;
+  startedAt?: string | null;
+  completedAt?: string | null;
+};
+
+export type ImportedAudioInfo = {
+  id: string;
+  sha256: string;
+  sizeBytes: number;
+  contentType?: string | null;
+  filename?: string | null;
+  detectedFormat?: string | null;
+  createdAt: string;
+  lastSeenAt: string;
+  durationSeconds?: number | null;
+  transcriptions: AudioTranscriptionInfo[];
+};
