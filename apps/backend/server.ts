@@ -1029,6 +1029,18 @@ type ImportMediaCandidate = {
   metadata: Record<string, unknown>;
 };
 
+type ImportRequestPartLog = {
+  sourceKind: string;
+  partIndex: number;
+  partName?: string;
+  filename?: string;
+  contentType?: string;
+  sizeBytes: number;
+  valueSha256?: string;
+  valueText?: string;
+  metadata: Record<string, unknown>;
+};
+
 type MediaDetection = {
   kind: "audio";
   format: string;
@@ -1135,7 +1147,8 @@ async function finishImportResponse(requestId: unknown, payload: Record<string, 
 }
 
 async function ingestImportMedia(req: Request, rawBody: Buffer, requestId: unknown) {
-  const candidates = await extractImportMediaCandidates(req, rawBody);
+  const { candidates, parts } = await extractImportMediaCandidates(req, rawBody);
+  await saveImportRequestParts(requestId, parts);
   const savedMedia = [];
 
   for (const candidate of candidates) {
@@ -1225,6 +1238,7 @@ async function ingestImportMedia(req: Request, rawBody: Buffer, requestId: unkno
 
   return {
     rawRequestBytes: rawBody.length,
+    parts: parts.length,
     candidates: candidates.length,
     mediaFiles: savedMedia.length,
     media: savedMedia,
@@ -1233,9 +1247,44 @@ async function ingestImportMedia(req: Request, rawBody: Buffer, requestId: unkno
   };
 }
 
-async function extractImportMediaCandidates(req: Request, rawBody: Buffer): Promise<ImportMediaCandidate[]> {
+async function saveImportRequestParts(requestId: unknown, parts: ImportRequestPartLog[]) {
+  for (const part of parts) {
+    await sql`
+      insert into import_request_parts (
+        request_id,
+        part_index,
+        part_name,
+        source_kind,
+        filename,
+        content_type,
+        size_bytes,
+        value_sha256,
+        value_text,
+        metadata
+      )
+      values (
+        ${requestId},
+        ${part.partIndex},
+        ${part.partName ?? null},
+        ${part.sourceKind},
+        ${part.filename ?? null},
+        ${part.contentType ?? null},
+        ${part.sizeBytes},
+        ${part.valueSha256 ?? null},
+        ${part.valueText ?? null},
+        ${part.metadata}::jsonb
+      )
+    `;
+  }
+}
+
+async function extractImportMediaCandidates(
+  req: Request,
+  rawBody: Buffer,
+): Promise<{ candidates: ImportMediaCandidate[]; parts: ImportRequestPartLog[] }> {
   const contentType = req.headers.get("content-type") ?? "";
   const candidates: ImportMediaCandidate[] = [];
+  const parts: ImportRequestPartLog[] = [];
 
   if (contentType.toLowerCase().includes("multipart/form-data")) {
     const form = await req.formData();
@@ -1243,20 +1292,45 @@ async function extractImportMediaCandidates(req: Request, rawBody: Buffer): Prom
 
     for (const [name, value] of form.entries()) {
       if (isUploadedFile(value)) {
+        const bytes = Buffer.from(await value.arrayBuffer());
+        const metadata = {
+          formField: name,
+          fileLastModifiedMs: value.lastModified || null,
+          fileLastModifiedAt: value.lastModified ? new Date(value.lastModified).toISOString() : null,
+        };
+        parts.push({
+          sourceKind: "multipart-file",
+          partIndex: index,
+          partName: name,
+          filename: value.name || undefined,
+          contentType: value.type || undefined,
+          sizeBytes: bytes.length,
+          valueSha256: sha256Hex(bytes),
+          metadata,
+        });
         candidates.push({
           sourceKind: "multipart-file",
           partIndex: index,
           partName: name,
           filename: value.name || undefined,
           contentType: value.type || undefined,
-          bytes: Buffer.from(await value.arrayBuffer()),
-          metadata: {
-            formField: name,
-            fileLastModifiedMs: value.lastModified || null,
-            fileLastModifiedAt: value.lastModified ? new Date(value.lastModified).toISOString() : null,
-          },
+          bytes,
+          metadata,
         });
       } else {
+        const bytes = Buffer.from(value, "utf8");
+        parts.push({
+          sourceKind: "multipart-field",
+          partIndex: index,
+          partName: name,
+          sizeBytes: bytes.length,
+          valueSha256: sha256Hex(bytes),
+          valueText: truncateForLog(value, 20000),
+          metadata: {
+            formField: name,
+            truncated: value.length > 20000,
+          },
+        });
         pushBase64MediaCandidates(candidates, value, {
           sourceKind: "multipart-field-base64",
           partIndex: index,
@@ -1267,19 +1341,51 @@ async function extractImportMediaCandidates(req: Request, rawBody: Buffer): Prom
       index += 1;
     }
 
-    return candidates;
+    if (!parts.length) {
+      parts.push({
+        sourceKind: "multipart-empty",
+        partIndex: 0,
+        contentType: contentType || undefined,
+        sizeBytes: rawBody.length,
+        valueSha256: sha256Hex(rawBody),
+        metadata: { note: "multipart parser returned no entries" },
+      });
+    }
+
+    return { candidates, parts };
   }
 
   if (contentType.toLowerCase().includes("json")) {
     try {
       const parsed = JSON.parse(rawBody.toString("utf8"));
+      const jsonText = JSON.stringify(parsed);
+      parts.push({
+        sourceKind: "json-body",
+        partIndex: 0,
+        contentType: contentType || undefined,
+        sizeBytes: rawBody.length,
+        valueSha256: sha256Hex(rawBody),
+        valueText: truncateForLog(jsonText, 20000),
+        metadata: { truncated: jsonText.length > 20000 },
+      });
+      pushJsonFieldParts(parts, parsed);
       pushJsonMediaCandidates(candidates, parsed);
-      if (candidates.length) return candidates;
+      if (candidates.length || parts.length) return { candidates, parts };
     } catch {
       // Keep the body hash for audit purposes and fall back to raw media detection below.
     }
   }
 
+  parts.push({
+    sourceKind: "raw-body",
+    partIndex: 0,
+    filename: filenameFromContentDisposition(req.headers.get("content-disposition")),
+    contentType: contentType || undefined,
+    sizeBytes: rawBody.length,
+    valueSha256: sha256Hex(rawBody),
+    valueText: isLikelyText(contentType) ? truncateForLog(rawBody.toString("utf8"), 20000) : undefined,
+    metadata: { truncated: isLikelyText(contentType) && rawBody.length > 20000 },
+  });
   candidates.push({
     sourceKind: "raw-body",
     partIndex: 0,
@@ -1288,7 +1394,7 @@ async function extractImportMediaCandidates(req: Request, rawBody: Buffer): Prom
     bytes: rawBody,
     metadata: {},
   });
-  return candidates;
+  return { candidates, parts };
 }
 
 function isUploadedFile(value: FormDataEntryValue): value is File {
@@ -1298,6 +1404,45 @@ function isUploadedFile(value: FormDataEntryValue): value is File {
     typeof (value as File).arrayBuffer === "function" &&
     typeof (value as File).name === "string"
   );
+}
+
+function pushJsonFieldParts(parts: ImportRequestPartLog[], value: unknown, path: string[] = [], depth = 0) {
+  if (depth > 12 || parts.length >= 100) return;
+
+  if (value === null || ["string", "number", "boolean"].includes(typeof value)) {
+    const valueText = String(value);
+    const bytes = Buffer.from(valueText, "utf8");
+    parts.push({
+      sourceKind: "json-field",
+      partIndex: parts.length,
+      partName: path.join(".") || "$",
+      sizeBytes: bytes.length,
+      valueSha256: sha256Hex(bytes),
+      valueText: truncateForLog(valueText, 20000),
+      metadata: {
+        jsonPath: path.join(".") || "$",
+        valueType: value === null ? "null" : typeof value,
+        truncated: valueText.length > 20000,
+      },
+    });
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => pushJsonFieldParts(parts, item, [...path, String(index)], depth + 1));
+    return;
+  }
+
+  if (value && typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) {
+      pushJsonFieldParts(parts, item, [...path, key], depth + 1);
+    }
+  }
+}
+
+function isLikelyText(contentType: string) {
+  const lower = contentType.toLowerCase();
+  return lower.startsWith("text/") || lower.includes("json") || lower.includes("xml") || lower.includes("x-www-form-urlencoded");
 }
 
 function pushJsonMediaCandidates(candidates: ImportMediaCandidate[], value: unknown, path: string[] = [], depth = 0) {

@@ -292,6 +292,29 @@ create index if not exists idx_openrouter_call_logs_transcription
   on openrouter_call_logs (transcription_id, created_at desc);
 `.trim(),
   },
+  {
+    id: "0005",
+    name: "import_request_parts",
+    sql: `
+create table if not exists import_request_parts (
+  id bigserial primary key,
+  request_id bigint not null references import_requests(id) on delete cascade,
+  part_index integer not null,
+  part_name text,
+  source_kind text not null,
+  filename text,
+  content_type text,
+  size_bytes bigint not null,
+  value_sha256 text,
+  value_text text,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_import_request_parts_request
+  on import_request_parts (request_id, part_index);
+`.trim(),
+  },
 ];
 
 export function migrationsEnabled(env = process.env) {
