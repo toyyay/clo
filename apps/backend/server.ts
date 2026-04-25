@@ -807,9 +807,11 @@ type OpenRouterTranscriptionRequest = {
 
 async function transcribeWithOpenRouter(input: OpenRouterTranscriptionRequest): Promise<AudioTranscriptPayload> {
   const prompt = [
-    "Transcribe and rewrite the attached audio.",
-    "Return only valid JSON.",
-    "Use the language of the audio for detected-language fields, and produce both Russian and English versions.",
+    "Transcribe the attached audio. If you cannot access or hear the audio, return JSON with error: \"AUDIO_NOT_AVAILABLE\".",
+    "Return only valid JSON. Do not invent example text.",
+    "First produce ru.literal from the audio. Derive ru.clean, ru.summary, ru.brief, and all English fields strictly from ru.literal.",
+    "Do not add facts, people, tasks, dates, places, or events that are not present in the literal transcript.",
+    "Use [inaudible] for uncertain spans.",
     "Remove filler sounds and hesitation markers such as э, ээ, бэ, мэ, um, uh.",
     "The JSON shape must be:",
     JSON.stringify({
@@ -839,7 +841,7 @@ async function transcribeWithOpenRouter(input: OpenRouterTranscriptionRequest): 
           { type: "text", text: prompt },
           {
             type: "input_audio",
-            inputAudio: {
+            input_audio: {
               data: input.mp3.toString("base64"),
               format: "mp3",
             },
@@ -850,6 +852,7 @@ async function transcribeWithOpenRouter(input: OpenRouterTranscriptionRequest): 
     reasoning: { effort: normalizeReasoningEffort(input.reasoningEffort), exclude: true },
     response_format: { type: "json_object" },
     stream: false,
+    temperature: 0,
   };
 
   const logRequestJson = redactAudioFromOpenRouterRequest(requestJson, input.mp3);
@@ -897,9 +900,13 @@ async function transcribeWithOpenRouter(input: OpenRouterTranscriptionRequest): 
     `;
 
     if (!response.ok) throw new Error(`OpenRouter failed (${response.status}): ${openRouterErrorMessage(responseJson, bodyText)}`);
+    assertOpenRouterProcessedAudio(responseJson);
     const messageContent = extractOpenRouterMessageContent(responseJson);
     if (!messageContent) throw new Error("OpenRouter returned no message content");
-    return normalizeStoredTranscript(parseJsonObjectLoose(messageContent) ?? messageContent);
+    if (messageContent.includes("AUDIO_NOT_AVAILABLE")) throw new Error("OpenRouter did not receive or process the audio input");
+    const transcript = normalizeStoredTranscript(parseJsonObjectLoose(messageContent) ?? messageContent);
+    validateStoredTranscript(transcript);
+    return transcript;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await sql`
@@ -917,6 +924,13 @@ function normalizeReasoningEffort(value: string) {
   return ["minimal", "low", "medium", "high"].includes(value) ? value : "medium";
 }
 
+function assertOpenRouterProcessedAudio(responseJson: any) {
+  const audioTokens = responseJson?.usage?.prompt_tokens_details?.audio_tokens;
+  if (typeof audioTokens === "number" && audioTokens <= 0) {
+    throw new Error("OpenRouter reported zero audio tokens; audio input was not processed");
+  }
+}
+
 function redactAudioFromOpenRouterRequest(requestJson: any, mp3: Buffer) {
   return {
     ...requestJson,
@@ -926,9 +940,9 @@ function redactAudioFromOpenRouterRequest(requestJson: any, mp3: Buffer) {
         part.type === "input_audio"
           ? {
               type: "input_audio",
-              inputAudio: {
+              input_audio: {
                 data: "<redacted audio base64>",
-                format: part.inputAudio?.format ?? "mp3",
+                format: part.input_audio?.format ?? part.inputAudio?.format ?? "mp3",
                 sha256: sha256Hex(mp3),
                 bytes: mp3.length,
               },
@@ -988,6 +1002,12 @@ function normalizeStoredTranscript(value: unknown): AudioTranscriptPayload {
     ru: normalizeTranscriptLevel(object.ru),
     en: normalizeTranscriptLevel(object.en),
   };
+}
+
+function validateStoredTranscript(transcript: AudioTranscriptPayload) {
+  if (transcript.ru.literal.trim().length < 3 && transcript.en.literal.trim().length < 3) {
+    throw new Error("OpenRouter returned an empty transcript");
+  }
 }
 
 function normalizeTranscriptLevel(value: unknown) {
