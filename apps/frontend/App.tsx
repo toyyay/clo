@@ -7,9 +7,12 @@ import type {
   ImportedAudioInfo,
   SessionEvent,
   SessionInfo,
+  SessionPayload,
 } from "../../packages/shared/types";
 import {
   clearBrowserCaches,
+  cacheSessionPayload,
+  cacheShell,
   getMeta,
   loadCacheStats,
   loadHosts,
@@ -62,7 +65,7 @@ import {
 type SyncState = "loading" | "syncing" | "idle" | "offline" | "error";
 type AuthState = "checking" | "authenticated" | "anonymous";
 type EventState = { sessionId: string | null; events: SessionEvent[] };
-type SyncNowOptions = { silent?: boolean };
+type SyncNowOptions = { silent?: boolean; metadataOnly?: boolean };
 
 function formatBytes(value?: number | null) {
   if (!value) return "0 B";
@@ -120,6 +123,27 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (!response.ok) throw new Error(await response.text());
   return (await response.json()) as T;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function fetchServerShell() {
+  const [hosts, sessions] = await Promise.all([fetchJson<HostInfo[]>("/api/hosts"), fetchJson<SessionInfo[]>("/api/sessions")]);
+  return { hosts, sessions };
 }
 
 function ModalFrame({
@@ -855,30 +879,56 @@ export function App() {
     if (!isAuthenticated) return;
     if (syncing.current) return;
     const silent = options.silent === true;
+    const metadataOnly = options.metadataOnly === true;
     syncing.current = true;
     const started = performance.now();
     if (!silent) {
       setSyncState("syncing");
-      setStatusText("Syncing");
-      void logClientEvent("debug", "sync.start", null, { online: navigator.onLine }, ["sync"]).catch(() => {});
+      setStatusText(metadataOnly ? "Refreshing metadata" : "Syncing");
+      void logClientEvent("debug", "sync.start", null, { online: navigator.onLine, metadataOnly }, ["sync"]).catch(() => {});
     }
     try {
       const result = await pullUpdates({
+        metadataOnly,
         maxBatches: 4,
         onProgress: ({ events, batches, hasMore }) => {
-          if (!events) return;
+          if (!events && !metadataOnly) return;
           if (!silent || hasMore) {
             setSyncState("syncing");
             setStatusText(
-              hasMore
+              metadataOnly
+                ? "Refreshing metadata"
+                : hasMore
                 ? `Syncing ${events.toLocaleString()} events (${batches} batches)…`
                 : `Applying ${events.toLocaleString()} events…`,
             );
           }
         },
       });
-      const shouldRefreshCache = !silent || result.events > 0 || result.hasMore;
-      const refreshedSessions = shouldRefreshCache ? (await refreshCache()).sessions : sessionsRef.current;
+      const shouldRefreshCache = !silent || result.events > 0 || result.hasMore || metadataOnly;
+      let refreshedSessions = sessionsRef.current;
+      if (shouldRefreshCache) {
+        if (metadataOnly) {
+          try {
+            refreshedSessions = (await withTimeout(refreshCache(), 1200, "metadata cache refresh timed out")).sessions;
+          } catch (error) {
+            void logClientEvent(
+              "warn",
+              "cache.metadata_refresh.fallback",
+              error instanceof Error ? error.message : String(error),
+              { durationMs: Math.round(performance.now() - started) },
+              ["cache", "sync"],
+            ).catch(() => {});
+            const shell = await fetchServerShell();
+            setHosts((current) => (sameEntityList(current, shell.hosts, (host) => host.agentId) ? current : shell.hosts));
+            setSessions((current) => (sameEntityList(current, shell.sessions, (session) => session.id) ? current : shell.sessions));
+            void cacheShell(shell.hosts, shell.sessions).catch(() => {});
+            refreshedSessions = shell.sessions;
+          }
+        } else {
+          refreshedSessions = (await refreshCache()).sessions;
+        }
+      }
       const current = activeRef.current;
       let activeRemoved = false;
       if (current) {
@@ -895,6 +945,8 @@ export function App() {
           activeRemoved = true;
           if (parseRoute().chatId === current.id) navigateRoute({}, { replace: true });
           console.warn("active session no longer available", current.id);
+        } else if (metadataOnly) {
+          setActiveSession(fresh);
         } else if (result.touchedSessionIds.includes(current.id)) {
           const loadedSessionId = current.id;
           const nextEvents = await loadSessionEvents(loadedSessionId);
@@ -911,8 +963,11 @@ export function App() {
             durationMs,
             events: result.events,
             batches: result.batches,
+            hosts: result.hosts,
+            sessions: result.sessions,
             cursor: result.cursor,
             hasMore: result.hasMore,
+            metadataOnly,
             activeRemoved,
           },
           ["sync"],
@@ -925,6 +980,8 @@ export function App() {
             ? "Active chat was removed"
             : result.hasMore
               ? `Synced ${result.events.toLocaleString()} events, more pending`
+              : metadataOnly
+                ? "Metadata refreshed"
               : result.events
                 ? `Synced ${result.events.toLocaleString()} events`
                 : "Up to date",
@@ -1051,31 +1108,56 @@ export function App() {
     let disposed = false;
     const started = performance.now();
     setSyncState("loading");
-    setStatusText("Loading cache");
+    setStatusText("Loading chat list");
     const stuckTimer = window.setTimeout(() => {
       if (disposed) return;
       setSyncState("error");
-      setStatusText("Browser cache is taking too long");
+      setStatusText("Chat list is taking too long");
       void logClientEvent(
         "error",
         "cache.initial_hydrate.stuck",
-        "initial browser cache hydrate did not finish",
+        "initial chat list hydrate did not finish",
         { durationMs: Math.round(performance.now() - started) },
         ["cache", "startup"],
       ).catch(() => {});
-    }, 15000);
-    refreshCache()
-      .then(() => {
+    }, 20000);
+    withTimeout(refreshCache(), 1200, "browser cache hydrate timed out")
+      .catch(async (error) => {
+        if (disposed) throw error;
+        setStatusText("Loading latest chat list");
+        void logClientEvent(
+          "warn",
+          "cache.initial_hydrate.fallback",
+          error instanceof Error ? error.message : String(error),
+          { durationMs: Math.round(performance.now() - started), fallback: "server-shell" },
+          ["cache", "startup"],
+        ).catch(() => {});
+        const shell = await fetchServerShell();
+        if (disposed) return shell;
+        setHosts((current) => (sameEntityList(current, shell.hosts, (host) => host.agentId) ? current : shell.hosts));
+        setSessions((current) => (sameEntityList(current, shell.sessions, (session) => session.id) ? current : shell.sessions));
+        void cacheShell(shell.hosts, shell.sessions).catch((cacheError) => {
+          void logClientEvent(
+            "warn",
+            "cache.shell_write.failed",
+            cacheError instanceof Error ? cacheError.message : String(cacheError),
+            { error: cacheError },
+            ["cache"],
+          ).catch(() => {});
+        });
+        return shell;
+      })
+      .then((shell) => {
         if (disposed) return;
         window.clearTimeout(stuckTimer);
         void logClientEvent(
           "info",
           "cache.initial_hydrate.complete",
           null,
-          { durationMs: Math.round(performance.now() - started) },
+          { durationMs: Math.round(performance.now() - started), hosts: shell.hosts.length, sessions: shell.sessions.length },
           ["cache", "startup"],
         ).catch(() => {});
-        void syncNow();
+        void syncNow({ silent: true, metadataOnly: true });
       })
       .catch((error) => {
         if (disposed) return;
@@ -1177,16 +1259,42 @@ export function App() {
     setEventState((current) =>
       current.sessionId === loadForSessionId ? current : { sessionId: loadForSessionId, events: [] },
     );
-    loadSessionEvents(loadForSessionId)
-      .then((nextEvents) => {
+    withTimeout(loadSessionEvents(loadForSessionId), 1000, "cached session events timed out")
+      .catch((error) => {
+        void logClientEvent(
+          "warn",
+          "cache.session_events.fallback",
+          error instanceof Error ? error.message : String(error),
+          { sessionId: loadForSessionId, expectedEvents: activeRef.current?.eventCount ?? null },
+          ["cache", "session"],
+        ).catch(() => {});
+        return [] as SessionEvent[];
+      })
+      .then(async (cachedEvents) => {
         if (disposed || activeRef.current?.id !== loadForSessionId) return;
-        setSessionEvents(loadForSessionId, nextEvents);
+        if (cachedEvents.length) setSessionEvents(loadForSessionId, cachedEvents);
+        const expectedEvents = activeRef.current?.eventCount ?? 0;
+        if (cachedEvents.length >= expectedEvents && expectedEvents > 0) return;
+
+        const payload = await fetchJson<SessionPayload>(`/api/session?id=${encodeURIComponent(loadForSessionId)}`);
+        if (disposed || activeRef.current?.id !== loadForSessionId) return;
+        setActiveSession(payload.session);
+        setSessionEvents(loadForSessionId, payload.events);
+        void cacheSessionPayload(payload).catch((cacheError) => {
+          void logClientEvent(
+            "warn",
+            "cache.session_write.failed",
+            cacheError instanceof Error ? cacheError.message : String(cacheError),
+            { sessionId: loadForSessionId, events: payload.events.length, error: cacheError },
+            ["cache", "session"],
+          ).catch(() => {});
+        });
       })
       .catch((error) => console.error(error));
     return () => {
       disposed = true;
     };
-  }, [activeId, isAuthenticated, setSessionEvents]);
+  }, [activeId, active?.eventCount, isAuthenticated, setActiveSession, setSessionEvents]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -1228,13 +1336,13 @@ export function App() {
   useEffect(() => {
     if (!isAuthenticated) return;
     const id = window.setInterval(() => {
-      if (!document.hidden) syncNow({ silent: true });
+      if (!document.hidden) syncNow({ silent: true, metadataOnly: true });
     }, 5000);
     const onVisible = () => {
-      if (!document.hidden) syncNow({ silent: true });
+      if (!document.hidden) syncNow({ silent: true, metadataOnly: true });
     };
     document.addEventListener("visibilitychange", onVisible);
-    const onOnline = () => syncNow({ silent: true });
+    const onOnline = () => syncNow({ silent: true, metadataOnly: true });
     window.addEventListener("online", onOnline);
     return () => {
       window.clearInterval(id);
@@ -1340,7 +1448,12 @@ export function App() {
           <a className="icon-button download-button" href="/api/agent/download?arch=arm64">
             Download Mac Agent (M1)
           </a>
-          <button className="icon-button" onClick={() => syncNow()} disabled={syncState === "syncing"} title="Sync now">
+          <button
+            className="icon-button"
+            onClick={() => syncNow({ metadataOnly: true })}
+            disabled={syncState === "syncing"}
+            title="Sync now"
+          >
             Sync
           </button>
           <button

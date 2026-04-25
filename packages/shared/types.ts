@@ -120,6 +120,7 @@ export type SessionPayload = {
 export type SyncRequest = {
   cursor?: string;
   limitBytes?: number;
+  metadataOnly?: boolean;
 };
 
 export type SyncResponse = {

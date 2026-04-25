@@ -1,4 +1,4 @@
-import type { HostInfo, SessionEvent, SessionInfo, SyncResponse } from "../../packages/shared/types";
+import type { HostInfo, SessionEvent, SessionInfo, SessionPayload, SyncResponse } from "../../packages/shared/types";
 
 const DB_NAME = "chatview-cache";
 const DB_VERSION = 4;
@@ -144,6 +144,37 @@ export async function applySync(payload: SyncResponse) {
   meta.put({ key: "syncCursor", value: payload.cursor });
   meta.put({ key: "lastSyncAt", value: new Date().toISOString() });
 
+  await transactionDone(tx);
+}
+
+export async function cacheShell(hostsInput: HostInfo[], sessionsInput: SessionInfo[]) {
+  const db = await openCacheDb();
+  const tx = db.transaction(["hosts", "sessions"] satisfies StoreName[], "readwrite");
+  const hosts = tx.objectStore("hosts");
+  const sessions = tx.objectStore("sessions");
+  for (const host of hostsInput) hosts.put(host);
+  for (const session of sessionsInput) {
+    if (session.deletedAt) sessions.delete(session.id);
+    else sessions.put(session);
+  }
+  await transactionDone(tx);
+}
+
+export async function cacheSessionPayload(payload: SessionPayload) {
+  const db = await openCacheDb();
+  const tx = db.transaction(["sessions", "events"] satisfies StoreName[], "readwrite");
+  const sessions = tx.objectStore("sessions");
+  const events = tx.objectStore("events");
+  sessions.put(payload.session);
+
+  const existing = events.index("sessionDbId").openKeyCursor(IDBKeyRange.only(payload.session.id));
+  existing.onsuccess = () => {
+    const cursor = existing.result;
+    if (!cursor) return;
+    events.delete(cursor.primaryKey);
+    cursor.continue();
+  };
+  for (const event of payload.events) events.put(event);
   await transactionDone(tx);
 }
 

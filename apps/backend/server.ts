@@ -224,6 +224,7 @@ Bun.serve<{ docIds: Set<string> }>({
               cursor: body.cursor ?? null,
               nextCursor: result.cursor,
               limitBytes: body.limitBytes ?? null,
+              metadataOnly: body.metadataOnly === true,
               hosts: result.hosts.length,
               sessions: result.sessions.length,
               events: result.events.length,
@@ -2006,6 +2007,20 @@ async function getSession(id: string): Promise<SessionPayload | null> {
 async function sync(body: SyncRequest): Promise<SyncResponse> {
   const limitBytes = clamp(Math.floor(body.limitBytes ?? 2 * 1024 * 1024), 64 * 1024, 16 * 1024 * 1024);
   const cursor = BigInt(body.cursor && /^\d+$/.test(body.cursor) ? body.cursor : "0");
+  if (body.metadataOnly) {
+    const maxRows = await sql`select coalesce(max(id), 0) as cursor from session_events`;
+    const response: SyncResponse = {
+      cursor: toId(maxRows[0]?.cursor ?? cursor.toString()),
+      hasMore: false,
+      approxBytes: 0,
+      hosts: await listHosts(),
+      sessions: await listSessions(),
+      events: [],
+    };
+    response.approxBytes = byteSize(JSON.stringify(response));
+    return response;
+  }
+
   const fetchLimit = 10000;
   const rows = await sql`
     select id, session_db_id, source_line_no, source_offset, event_type, role, occurred_at, ingested_at, raw
