@@ -31,7 +31,7 @@ import {
   type OpenRouterReasoningEffort,
 } from "../../packages/shared/types";
 import { downloadAgentArchiveResponse } from "./agent-download";
-import { handleClientLogRequest, listAppLogs, logBackendEvent } from "./app-logs";
+import { handleClientLogRequest, listAppLogs, logBackendEvent, logBackendRequestEvent } from "./app-logs";
 import {
   handleAgentAppend,
   handleAgentHello,
@@ -136,16 +136,50 @@ Bun.serve<{ docIds: Set<string> }>({
   routes: {
     "/": index,
     "/api/health": () => json({ ok: true, commit_sha: gitSha }),
-    "/api/auth/status": (req: Request) => json({ configured: Boolean(webToken), authenticated: isWebAuthorized(req) }),
+    "/api/auth/status": (req: Request) => {
+      const authenticated = isWebAuthorized(req);
+      void logBackendRequestEvent(
+        {
+          level: "debug",
+          event: "auth.status",
+          tags: ["auth", "request"],
+          context: {
+            configured: Boolean(webToken),
+            authenticated,
+          },
+        },
+        req,
+      );
+      return json({ configured: Boolean(webToken), authenticated });
+    },
     "/api/auth/login": async (req: Request) => {
       if (req.method !== "POST") return text("method not allowed", 405);
       if (!webToken) return text("auth token is not configured", 503);
 
       const body = (await req.json().catch(() => ({}))) as { token?: unknown };
       if (!tokenMatches(typeof body.token === "string" ? body.token : "", webToken)) {
+        void logBackendRequestEvent(
+          {
+            level: "warn",
+            event: "auth.login_failed",
+            message: "invalid web token",
+            tags: ["auth", "request"],
+            context: { configured: Boolean(webToken) },
+          },
+          req,
+        );
         return text("unauthorized", 401);
       }
 
+      void logBackendRequestEvent(
+        {
+          level: "info",
+          event: "auth.login_succeeded",
+          tags: ["auth", "request"],
+          context: { configured: Boolean(webToken) },
+        },
+        req,
+      );
       return json({ ok: true }, 200, { "set-cookie": makeWebAuthCookie(req, webToken) });
     },
     "/api/auth/logout": (req: Request) => json({ ok: true }, 200, { "set-cookie": clearWebAuthCookie(req) }),
@@ -180,7 +214,7 @@ Bun.serve<{ docIds: Set<string> }>({
         const result = await sync(body);
         const durationMs = Math.round(performance.now() - started);
         if (result.hasMore || durationMs > 1000) {
-          void logBackendEvent({
+          void logBackendRequestEvent({
             level: "info",
             event: "sync.batch",
             message: "served sync batch",
@@ -196,11 +230,11 @@ Bun.serve<{ docIds: Set<string> }>({
               approxBytes: result.approxBytes,
               hasMore: result.hasMore,
             },
-          });
+          }, req);
         }
         return json(result);
       } catch (error) {
-        void logBackendEvent({
+        void logBackendRequestEvent({
           level: "error",
           event: "sync.failed",
           message: error instanceof Error ? error.message : String(error),
@@ -210,7 +244,7 @@ Bun.serve<{ docIds: Set<string> }>({
             durationMs: Math.round(performance.now() - started),
             error: errorToLogContext(error),
           },
-        });
+        }, req);
         return text(error instanceof Error ? error.message : "sync failed", 500);
       }
     },

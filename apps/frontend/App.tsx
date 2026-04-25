@@ -358,15 +358,36 @@ export function App() {
   }, []);
 
   const checkAuth = useCallback(async () => {
+    const started = performance.now();
+    void logClientEvent("debug", "auth.status.start", null, { online: navigator.onLine }, ["auth"]).catch(() => {});
     try {
       const response = await fetch("/api/auth/status");
+      if (!response.ok) throw new Error(`auth status failed: ${response.status}`);
       const payload = (await response.json()) as { configured?: boolean; authenticated?: boolean };
       setAuthConfigured(Boolean(payload.configured));
       setAuthState(payload.authenticated ? "authenticated" : "anonymous");
       setAuthError(payload.configured ? "" : "WEB_TOKEN is not configured on the server.");
+      void logClientEvent(
+        "info",
+        "auth.status.complete",
+        null,
+        {
+          durationMs: Math.round(performance.now() - started),
+          configured: Boolean(payload.configured),
+          authenticated: Boolean(payload.authenticated),
+        },
+        ["auth"],
+      ).catch(() => {});
     } catch (error) {
       setAuthState("anonymous");
       setAuthError("Could not reach the auth endpoint.");
+      void logClientEvent(
+        "error",
+        "auth.status.failed",
+        error instanceof Error ? error.message : String(error),
+        { durationMs: Math.round(performance.now() - started), error },
+        ["auth"],
+      ).catch(() => {});
       console.error(error);
     }
   }, []);
@@ -378,6 +399,8 @@ export function App() {
 
       setAuthBusy(true);
       setAuthError("");
+      const started = performance.now();
+      void logClientEvent("info", "auth.login.start", null, { online: navigator.onLine }, ["auth"]).catch(() => {});
       try {
         const response = await fetch("/api/auth/login", {
           method: "POST",
@@ -388,14 +411,35 @@ export function App() {
         if (!response.ok) {
           setAuthError(response.status === 503 ? "WEB_TOKEN is not configured on the server." : "Token is not valid.");
           setAuthState("anonymous");
+          void logClientEvent(
+            "warn",
+            "auth.login.failed",
+            `login rejected: ${response.status}`,
+            { durationMs: Math.round(performance.now() - started), status: response.status },
+            ["auth"],
+          ).catch(() => {});
           return;
         }
 
         setAuthToken("");
         setAuthState("authenticated");
         setAuthConfigured(true);
+        void logClientEvent(
+          "info",
+          "auth.login.complete",
+          null,
+          { durationMs: Math.round(performance.now() - started) },
+          ["auth"],
+        ).catch(() => {});
       } catch (error) {
         setAuthError("Login failed.");
+        void logClientEvent(
+          "error",
+          "auth.login.failed",
+          error instanceof Error ? error.message : String(error),
+          { durationMs: Math.round(performance.now() - started), error },
+          ["auth"],
+        ).catch(() => {});
         console.error(error);
       } finally {
         setAuthBusy(false);
@@ -768,10 +812,43 @@ export function App() {
   );
 
   const refreshCache = useCallback(async () => {
-    const [nextHosts, nextSessions] = await Promise.all([loadHosts(), loadSessions()]);
-    setHosts((current) => (sameEntityList(current, nextHosts, (host) => host.agentId) ? current : nextHosts));
-    setSessions((current) => (sameEntityList(current, nextSessions, (session) => session.id) ? current : nextSessions));
-    return { hosts: nextHosts, sessions: nextSessions };
+    const started = performance.now();
+    const slowTimer = window.setTimeout(() => {
+      void logClientEvent(
+        "warn",
+        "cache.refresh.slow",
+        "browser cache refresh is still running",
+        { durationMs: Math.round(performance.now() - started) },
+        ["cache"],
+      ).catch(() => {});
+    }, 2500);
+    try {
+      const [nextHosts, nextSessions] = await Promise.all([loadHosts(), loadSessions()]);
+      setHosts((current) => (sameEntityList(current, nextHosts, (host) => host.agentId) ? current : nextHosts));
+      setSessions((current) => (sameEntityList(current, nextSessions, (session) => session.id) ? current : nextSessions));
+      const durationMs = Math.round(performance.now() - started);
+      if (durationMs > 500 || nextHosts.length || nextSessions.length) {
+        void logClientEvent(
+          "info",
+          "cache.refresh.complete",
+          null,
+          { durationMs, hosts: nextHosts.length, sessions: nextSessions.length },
+          ["cache"],
+        ).catch(() => {});
+      }
+      return { hosts: nextHosts, sessions: nextSessions };
+    } catch (error) {
+      void logClientEvent(
+        "error",
+        "cache.refresh.failed",
+        error instanceof Error ? error.message : String(error),
+        { durationMs: Math.round(performance.now() - started), error },
+        ["cache"],
+      ).catch(() => {});
+      throw error;
+    } finally {
+      window.clearTimeout(slowTimer);
+    }
   }, []);
 
   const syncNow = useCallback(async (options: SyncNowOptions = {}) => {
@@ -879,6 +956,17 @@ export function App() {
 
   useEffect(() => {
     installClientLogHandlers();
+    void logClientEvent(
+      "info",
+      "app.boot",
+      null,
+      {
+        route: parseRoute(),
+        online: navigator.onLine,
+        visibilityState: document.visibilityState,
+      },
+      ["app"],
+    ).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -960,7 +1048,46 @@ export function App() {
 
   useEffect(() => {
     if (!isAuthenticated) return;
-    refreshCache().then(() => syncNow());
+    let disposed = false;
+    const started = performance.now();
+    setSyncState("loading");
+    setStatusText("Loading cache");
+    const stuckTimer = window.setTimeout(() => {
+      if (disposed) return;
+      setSyncState("error");
+      setStatusText("Browser cache is taking too long");
+      void logClientEvent(
+        "error",
+        "cache.initial_hydrate.stuck",
+        "initial browser cache hydrate did not finish",
+        { durationMs: Math.round(performance.now() - started) },
+        ["cache", "startup"],
+      ).catch(() => {});
+    }, 15000);
+    refreshCache()
+      .then(() => {
+        if (disposed) return;
+        window.clearTimeout(stuckTimer);
+        void logClientEvent(
+          "info",
+          "cache.initial_hydrate.complete",
+          null,
+          { durationMs: Math.round(performance.now() - started) },
+          ["cache", "startup"],
+        ).catch(() => {});
+        void syncNow();
+      })
+      .catch((error) => {
+        if (disposed) return;
+        window.clearTimeout(stuckTimer);
+        setSyncState(navigator.onLine ? "error" : "offline");
+        setStatusText(navigator.onLine ? "Browser cache failed" : "Offline cache failed");
+        console.error(error);
+      });
+    return () => {
+      disposed = true;
+      window.clearTimeout(stuckTimer);
+    };
   }, [isAuthenticated, refreshCache, syncNow]);
 
   useEffect(() => {

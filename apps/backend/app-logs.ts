@@ -79,6 +79,15 @@ export async function logBackendEvent(input: AppLogInput) {
   }
 }
 
+export async function logBackendRequestEvent(input: AppLogInput, req: Request) {
+  try {
+    const stored = normalizeLogInput(input, "backend", req);
+    if (stored) await insertAppLog(stored);
+  } catch (error) {
+    console.warn("failed to persist app request log", error instanceof Error ? error.message : String(error));
+  }
+}
+
 export function sanitizeForJsonb(value: unknown): unknown {
   return sanitizeJson(value, 0, new WeakSet<object>());
 }
@@ -100,19 +109,63 @@ function normalizeLogInput(input: AppLogInput, fallbackSource: AppLogSource, req
     context: sanitizeForJsonb(input.context ?? {}),
     client: sanitizeForJsonb(input.client ?? {}),
     request: req
-      ? sanitizeForJsonb({
-          path: url?.pathname,
-          query: url ? Object.fromEntries(url.searchParams.entries()) : {},
-          method: req.method,
-          ip: req.headers.get("cf-connecting-ip") ?? req.headers.get("x-forwarded-for"),
-          cfRay: req.headers.get("cf-ray"),
-        })
+      ? sanitizeForJsonb(buildRequestContext(req, url))
       : {},
     url: req?.headers.get("referer") ?? null,
     userAgent: req?.headers.get("user-agent") ?? null,
     clientLogId: typeof input.id === "string" ? cleanText(input.id, 200) : null,
     clientCreatedAt: validDate(input.createdAt) ?? null,
   };
+}
+
+function buildRequestContext(req: Request, url: URL | null) {
+  const forwardedFor = req.headers.get("x-forwarded-for");
+  return {
+    method: req.method,
+    path: url?.pathname,
+    query: sanitizeQuery(url),
+    host: req.headers.get("host"),
+    origin: req.headers.get("origin"),
+    referer: req.headers.get("referer"),
+    ip: req.headers.get("cf-connecting-ip") ?? firstForwardedIp(forwardedFor),
+    forwardedFor: forwardedFor ? "<present>" : null,
+    forwardedProto: req.headers.get("x-forwarded-proto"),
+    cfRay: req.headers.get("cf-ray"),
+    cfCountry: req.headers.get("cf-ipcountry"),
+    contentType: req.headers.get("content-type"),
+    contentLength: positiveHeaderNumber(req.headers.get("content-length")),
+    accept: cleanHeader(req.headers.get("accept"), 300),
+    secFetchMode: req.headers.get("sec-fetch-mode"),
+    secFetchSite: req.headers.get("sec-fetch-site"),
+    secChUa: cleanHeader(req.headers.get("sec-ch-ua"), 300),
+    secChUaMobile: req.headers.get("sec-ch-ua-mobile"),
+    secChUaPlatform: cleanHeader(req.headers.get("sec-ch-ua-platform"), 80),
+  };
+}
+
+function sanitizeQuery(url: URL | null) {
+  if (!url) return {};
+  const out: Record<string, string> = {};
+  for (const [key, value] of url.searchParams.entries()) {
+    const normalized = key.toLowerCase();
+    out[key] = normalized.includes("token") || normalized.includes("key") ? "<redacted>" : cleanText(value, 500);
+  }
+  return out;
+}
+
+function firstForwardedIp(value: string | null) {
+  if (!value) return null;
+  return value.split(",")[0]?.trim() || null;
+}
+
+function positiveHeaderNumber(value: string | null) {
+  if (!value) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function cleanHeader(value: string | null, max: number) {
+  return value == null ? null : cleanText(value, max);
 }
 
 async function insertAppLog(log: StoredAppLog) {

@@ -21,6 +21,7 @@ const originalConsole = {
 
 let installed = false;
 let flushing = false;
+const pageSessionId = newLogId();
 
 export function installClientLogHandlers() {
   if (installed) return;
@@ -122,16 +123,25 @@ function collectClientInfo() {
   };
 
   return sanitizeForJsonb({
+    pageSessionId,
+    clientInstanceId: getClientInstanceId(),
     userAgent: navigator.userAgent,
     language: navigator.language,
     languages: navigator.languages,
     platform: navigator.platform,
+    vendor: navigator.vendor,
+    maxTouchPoints: navigator.maxTouchPoints,
     cookieEnabled: navigator.cookieEnabled,
     online: navigator.onLine,
     visibilityState: document.visibilityState,
     url: window.location.href,
+    origin: window.location.origin,
     pathname: window.location.pathname,
+    search: window.location.search,
+    hash: window.location.hash,
+    referrer: document.referrer,
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    localTime: new Date().toISOString(),
     viewport: {
       width: window.innerWidth,
       height: window.innerHeight,
@@ -154,6 +164,19 @@ function collectClientInfo() {
         }
       : null,
   });
+}
+
+function getClientInstanceId() {
+  try {
+    const key = "chatviewClientInstanceId";
+    const current = window.localStorage.getItem(key);
+    if (current) return current;
+    const next = newLogId();
+    window.localStorage.setItem(key, next);
+    return next;
+  } catch {
+    return null;
+  }
 }
 
 async function enqueueLog(log: QueuedClientLog) {
