@@ -35,7 +35,9 @@ services:
       DATA_DIR: /data
       PORT: "3737"
     volumes:
-      - ./data:/data
+      - type: bind
+        source: /root/clo/data
+        target: /data
     ports:
       - "127.0.0.1:3737:3737"
     healthcheck:
