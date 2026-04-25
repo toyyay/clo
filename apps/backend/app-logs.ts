@@ -136,7 +136,7 @@ async function insertAppLog(log: StoredAppLog) {
       ${log.level},
       ${log.event},
       ${log.message},
-      ${log.tags}::text[],
+      ${postgresTextArrayLiteral(log.tags)}::text[],
       ${log.context}::jsonb,
       ${log.client}::jsonb,
       ${log.request ?? {}}::jsonb,
@@ -188,6 +188,10 @@ function redactSensitiveText(value: string) {
     .replace(/sk-or-v1-[A-Za-z0-9_-]+/g, "<redacted-openrouter-key>")
     .replace(/\bim_[A-Za-z0-9_-]{16,}\b/g, "<redacted-import-token>")
     .replace(/([?&](?:token|key|api_key)=)[^&\s]+/gi, "$1<redacted>");
+}
+
+function postgresTextArrayLiteral(values: string[]) {
+  return `{${values.map((value) => `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`).join(",")}}`;
 }
 
 function validDate(value: unknown) {

@@ -1861,11 +1861,15 @@ async function getSessionsMeta(ids: string[]): Promise<SessionInfo[]> {
     join agents a on a.id = s.agent_id
     join projects p on p.id = s.project_id
     left join session_events e on e.session_db_id = s.id
-    where s.id = any(${uniqueIds}::bigint[])
+    where s.id = any(${postgresBigintArrayLiteral(uniqueIds)}::bigint[])
     group by s.id, a.hostname, p.project_key, p.display_name
   `;
   const byId = new Map(rows.map((row: any) => [toId(row.id), mapSession(row)] as const));
   return uniqueIds.map((id) => byId.get(id)).filter((session): session is SessionInfo => Boolean(session));
+}
+
+function postgresBigintArrayLiteral(values: string[]) {
+  return `{${values.join(",")}}`;
 }
 
 async function getSession(id: string): Promise<SessionPayload | null> {
