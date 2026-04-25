@@ -145,7 +145,7 @@ function redactJsonNode(value: JsonLike, counts: MutableCounts, parentKey: strin
 function redactStructuredTextValues(text: string, counts: MutableCounts): string {
   let value = text.replace(
     /(^|[\s;])((?:export\s+)?([A-Za-z_авекмнорстухАВЕКМНОРСТУХ][A-Za-z0-9_авекмнорстухАВЕКМНОРСТУХ-]*)\s*=\s*)(?:"([^"\n]{1,4096})"|'([^'\n]{1,4096})'|([^\s;#]{1,4096}))/gm,
-    (match, lead: string, prefix: string, key: string, doubleQuoted?: string, singleQuoted?: string, bare?: string) => {
+    (match, lead: string, prefix: string, key: string, doubleQuoted?: string, singleQuoted?: string, _bare?: string) => {
       if (!isSensitiveKey(key)) {
         return match;
       }
@@ -165,7 +165,7 @@ function redactStructuredTextValues(text: string, counts: MutableCounts): string
 
   value = value.replace(
     /(["'])([^"'\n]{1,128})\1(\s*:\s*)(?:"([^"\n]{1,4096})"|'([^'\n]{1,4096})')/g,
-    (match, quote: string, key: string, separator: string, doubleQuoted?: string, singleQuoted?: string) => {
+    (match, quote: string, key: string, separator: string, doubleQuoted?: string, _singleQuoted?: string) => {
       if (!isSensitiveKey(key)) {
         return match;
       }
@@ -179,7 +179,7 @@ function redactStructuredTextValues(text: string, counts: MutableCounts): string
 
   value = value.replace(
     /^([ \t-]*)([A-Za-z_авекмнорстухАВЕКМНОРСТУХ][A-Za-z0-9_авекмнорстухАВЕКМНОРСТУХ -]{0,127})(\s*:\s*)(?:"([^"\n]{1,4096})"|'([^'\n]{1,4096})'|([^\s#][^\n#]{0,4095}))/gm,
-    (match, indent: string, key: string, separator: string, doubleQuoted?: string, singleQuoted?: string, bare?: string) => {
+    (match, indent: string, key: string, separator: string, doubleQuoted?: string, singleQuoted?: string, _bare?: string) => {
       if (!isSensitiveKey(key)) {
         return match;
       }
@@ -231,7 +231,7 @@ function replaceJwtLike(text: string, counts: MutableCounts): string {
 function replaceSensitiveBasenamePaths(text: string, counts: MutableCounts): string {
   return text.replace(
     /(^|[\s"'(=:[,{])((?:[A-Za-z]:)?(?:(?:~|\.{1,2}|[A-Za-z0-9_.-]+)[\\/])+)(auth\.json|oauth_creds\.json|google_accounts\.json|cookies|local[ _-]?storage|localstorage)(?=$|[\s"',;)\]}])/gi,
-    (_match, lead: string, prefix: string, basename: string) => {
+    (_match, lead: string, prefix: string, _basename: string) => {
       addCount(counts, "sensitive_file");
       return `${lead}${prefix}${marker("sensitive_file")}`;
     },

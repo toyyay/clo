@@ -116,29 +116,36 @@ export async function loadSessionEvents(sessionDbId: string): Promise<SessionEve
   return events.sort((a, b) => a.lineNo - b.lineNo);
 }
 
-export async function applySync(payload: SyncResponse) {
+export async function applySync(payload: SyncResponse, options: { replaceShell?: boolean } = {}) {
   const db = await openCacheDb();
   const tx = db.transaction(["meta", "hosts", "sessions", "events"] satisfies StoreName[], "readwrite");
   const hosts = tx.objectStore("hosts");
   const sessions = tx.objectStore("sessions");
   const events = tx.objectStore("events");
   const meta = tx.objectStore("meta");
+  const liveSessionIds = new Set(payload.sessions.filter((session) => !session.deletedAt).map((session) => session.id));
 
   for (const host of payload.hosts) hosts.put(host);
   for (const session of payload.sessions) {
     if (session.deletedAt) {
       sessions.delete(session.id);
-      const eventIndex = events.index("sessionDbId");
-      const cursorReq = eventIndex.openKeyCursor(IDBKeyRange.only(session.id));
-      cursorReq.onsuccess = () => {
-        const cursor = cursorReq.result;
-        if (!cursor) return;
-        events.delete(cursor.primaryKey);
-        cursor.continue();
-      };
+      queueDeleteEventsForSession(events, session.id);
     } else {
       sessions.put(session);
     }
+  }
+  if (options.replaceShell) {
+    const cursorReq = sessions.openCursor();
+    cursorReq.onsuccess = () => {
+      const cursor = cursorReq.result;
+      if (!cursor) return;
+      const session = cursor.value as SessionInfo;
+      if (!liveSessionIds.has(session.id)) {
+        sessions.delete(cursor.primaryKey);
+        queueDeleteEventsForSession(events, session.id);
+      }
+      cursor.continue();
+    };
   }
   for (const event of payload.events) events.put(event);
   meta.put({ key: "syncCursor", value: payload.cursor });
@@ -149,31 +156,44 @@ export async function applySync(payload: SyncResponse) {
 
 export async function cacheShell(hostsInput: HostInfo[], sessionsInput: SessionInfo[]) {
   const db = await openCacheDb();
-  const tx = db.transaction(["hosts", "sessions"] satisfies StoreName[], "readwrite");
+  const tx = db.transaction(["hosts", "sessions", "events"] satisfies StoreName[], "readwrite");
   const hosts = tx.objectStore("hosts");
   const sessions = tx.objectStore("sessions");
+  const events = tx.objectStore("events");
+  const liveSessionIds = new Set(sessionsInput.filter((session) => !session.deletedAt).map((session) => session.id));
   for (const host of hostsInput) hosts.put(host);
   for (const session of sessionsInput) {
-    if (session.deletedAt) sessions.delete(session.id);
-    else sessions.put(session);
+    if (session.deletedAt) {
+      sessions.delete(session.id);
+      queueDeleteEventsForSession(events, session.id);
+    } else {
+      sessions.put(session);
+    }
   }
+  const cursorReq = sessions.openCursor();
+  cursorReq.onsuccess = () => {
+    const cursor = cursorReq.result;
+    if (!cursor) return;
+    const session = cursor.value as SessionInfo;
+    if (!liveSessionIds.has(session.id)) {
+      sessions.delete(cursor.primaryKey);
+      queueDeleteEventsForSession(events, session.id);
+    }
+    cursor.continue();
+  };
   await transactionDone(tx);
 }
 
 export async function cacheSessionPayload(payload: SessionPayload) {
   const db = await openCacheDb();
+  const deleteTx = db.transaction("events", "readwrite");
+  queueDeleteEventsForSession(deleteTx.objectStore("events"), payload.session.id);
+  await transactionDone(deleteTx);
+
   const tx = db.transaction(["sessions", "events"] satisfies StoreName[], "readwrite");
   const sessions = tx.objectStore("sessions");
   const events = tx.objectStore("events");
   sessions.put(payload.session);
-
-  const existing = events.index("sessionDbId").openKeyCursor(IDBKeyRange.only(payload.session.id));
-  existing.onsuccess = () => {
-    const cursor = existing.result;
-    if (!cursor) return;
-    events.delete(cursor.primaryKey);
-    cursor.continue();
-  };
   for (const event of payload.events) events.put(event);
   await transactionDone(tx);
 }
@@ -253,6 +273,16 @@ function request<T>(req: IDBRequest<T>): Promise<T> {
     req.onerror = () => reject(req.error);
     req.onsuccess = () => resolve(req.result);
   });
+}
+
+function queueDeleteEventsForSession(events: IDBObjectStore, sessionId: string) {
+  const existing = events.index("sessionDbId").openKeyCursor(IDBKeyRange.only(sessionId));
+  existing.onsuccess = () => {
+    const cursor = existing.result;
+    if (!cursor) return;
+    events.delete(cursor.primaryKey);
+    cursor.continue();
+  };
 }
 
 function transactionDone(tx: IDBTransaction) {

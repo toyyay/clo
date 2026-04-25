@@ -30,6 +30,7 @@ type Config = {
   backendUrl: string;
   token: string;
   projectsDir: string;
+  roots: string;
   statePath: string;
   pollMs: number;
   readChunkBytes: number;
@@ -63,10 +64,22 @@ const command = Bun.argv[2] ?? DEFAULT_COMMAND;
 
 switch (command) {
   case "run":
-    await run(false);
+    await runV2FromCli(false);
     break;
   case "scan-once":
-    await run(true);
+    await runV2FromCli(true);
+    break;
+  case "v2-run":
+    await runV2FromCli(false);
+    break;
+  case "v2-scan-once":
+    await runV2FromCli(true);
+    break;
+  case "legacy-run":
+    await runLegacy(false);
+    break;
+  case "legacy-scan-once":
+    await runLegacy(true);
     break;
   case "v2-dry-run":
     await import("./v2/dry-run").then((mod) => mod.runAgentV2DryRunFromCli(Bun.argv.slice(3)));
@@ -79,15 +92,19 @@ switch (command) {
     await installLaunchAgent();
     break;
   case "print-launch-agent":
-    console.log(launchAgentPlist(loadConfig()));
+    console.log(launchAgentPlist(loadConfig("v2")));
     break;
   default:
     printHelp();
     process.exit(command === "help" || command === "--help" ? 0 : 1);
 }
 
-async function run(once: boolean) {
-  const config = loadConfig();
+async function runV2FromCli(once: boolean) {
+  await import("./v2/run").then((mod) => mod.runAgentV2FromCli(Bun.argv.slice(3), once ? { once: true } : {}));
+}
+
+async function runLegacy(once: boolean) {
+  const config = loadConfig("legacy");
   if (!config.token) throw new Error("AGENT_TOKEN or --token is required");
 
   const state = await loadState(config.statePath);
@@ -110,18 +127,22 @@ async function run(once: boolean) {
   } while (true);
 }
 
-function loadConfig(): Config {
+function loadConfig(stateDefault: "legacy" | "v2" = "legacy"): Config {
   const pollMs = arg("--poll-ms") ?? envValue(process.env, "POLL_MS", "CHATVIEW_POLL_MS");
   const readChunkBytes = arg("--read-chunk-bytes") ?? envValue(process.env, "READ_CHUNK_BYTES", "CHATVIEW_READ_CHUNK_BYTES");
+  const defaultStatePath = stateDefault === "v2" ? "v2-state.json" : "state.json";
+  const projectsDir =
+    arg("--projects-dir") ??
+    envValue(process.env, "CLAUDE_PROJECTS_DIR", "CHATVIEW_CLAUDE_PROJECTS_DIR") ??
+    join(homedir(), ".claude", "projects");
 
   return {
     backendUrl: trimSlash(arg("--backend") ?? envValue(process.env, "BACKEND_URL", "CHATVIEW_BACKEND_URL") ?? DEFAULT_BACKEND_URL),
     token: arg("--token") ?? envValue(process.env, "AGENT_TOKEN", "CHATVIEW_AGENT_TOKEN") ?? DEFAULT_AGENT_TOKEN,
-    projectsDir:
-      arg("--projects-dir") ??
-      envValue(process.env, "CLAUDE_PROJECTS_DIR", "CHATVIEW_CLAUDE_PROJECTS_DIR") ??
-      join(homedir(), ".claude", "projects"),
-    statePath: arg("--state") ?? envValue(process.env, "AGENT_STATE", "CHATVIEW_AGENT_STATE") ?? join(homedir(), ".chatview-agent", "state.json"),
+    projectsDir,
+    roots: rootsConfigFromCliEnv(projectsDir),
+    statePath:
+      arg("--state") ?? envValue(process.env, "AGENT_STATE", "CHATVIEW_AGENT_STATE") ?? join(homedir(), ".chatview-agent", defaultStatePath),
     pollMs: positiveInteger(pollMs, 2000),
     readChunkBytes: positiveInteger(readChunkBytes, 1024 * 1024),
   };
@@ -498,7 +519,7 @@ function identityFor(config: Config, agentId: string): AgentIdentity {
 }
 
 async function installLaunchAgent() {
-  const config = loadConfig();
+  const config = loadConfig("v2");
   if (!config.token) throw new Error("AGENT_TOKEN or --token is required before installing launch agent");
   const plistPath = await writeLaunchAgentPlist(config);
   console.log(`wrote ${plistPath}`);
@@ -511,7 +532,7 @@ async function installSelf() {
     throw new Error("install-self is only supported on macOS");
   }
 
-  const config = loadConfig();
+  const config = loadConfig("v2");
   if (!config.token) throw new Error("AGENT_TOKEN or --token is required before installing the standalone agent");
 
   await mkdir(dirname(INSTALLED_EXECUTABLE_PATH), { recursive: true });
@@ -526,7 +547,17 @@ async function installSelf() {
 
   console.log(`installed ${INSTALLED_EXECUTABLE_PATH}`);
   console.log("running first sync...");
-  await run(true);
+  await import("./v2/run").then((mod) =>
+    mod.runAgentV2({
+      backendUrl: config.backendUrl,
+      token: config.token,
+      statePath: config.statePath,
+      pollMs: config.pollMs,
+      readChunkBytes: config.readChunkBytes,
+      once: true,
+      env: launchAgentEnv(config),
+    }),
+  );
   console.log(`launch agent active: ${LABEL}`);
 }
 
@@ -556,6 +587,8 @@ ${args.map((value) => `    <string>${xml(value)}</string>`).join("\n")}
     <string>${xml(config.token)}</string>
     <key>CLAUDE_PROJECTS_DIR</key>
     <string>${xml(config.projectsDir)}</string>
+    <key>ROOTS</key>
+    <string>${xml(config.roots)}</string>
     <key>AGENT_STATE</key>
     <string>${xml(config.statePath)}</string>
     <key>POLL_MS</key>
@@ -608,6 +641,8 @@ function printHelp() {
 Usage:
   chatview-agent run
   chatview-agent scan-once
+  chatview-agent legacy-run
+  chatview-agent legacy-scan-once
   chatview-agent v2-dry-run
   chatview-agent install-self
   chatview-agent install-launch-agent
@@ -615,9 +650,11 @@ Usage:
 Options:
   --backend <url>          Backend URL (default: ${DEFAULT_BACKEND_URL})
   --token <token>          Agent token, or AGENT_TOKEN
-  --projects-dir <path>    Claude projects dir (default: ~/.claude/projects)
-  --state <path>           Agent state file (default: ~/.chatview-agent/state.json)
+  --root <kind=path>       v2 sync root for claude, codex, or gemini; repeat for multiple roots
+  --projects-dir <path>    Legacy Claude projects dir alias
+  --state <path>           Agent state file (v2 default: ~/.chatview-agent/v2-state.json)
   --poll-ms <ms>           Poll interval (default: 2000)
+  --append-path <path>     v2 append endpoint path (default: /api/agent/v1/append)
 
 Agent v2 dry-run:
   --root <kind=path>       Scan a temp/specific root for claude, codex, or gemini
@@ -633,6 +670,33 @@ When a standalone downloadable executable is launched without arguments, it inst
 function arg(name: string) {
   const index = Bun.argv.indexOf(name);
   return index >= 0 ? Bun.argv[index + 1] : undefined;
+}
+
+function args(name: string) {
+  const values: string[] = [];
+  for (let index = 0; index < Bun.argv.length; index += 1) {
+    const value = Bun.argv[index];
+    if (value === name && Bun.argv[index + 1]) values.push(Bun.argv[index + 1]);
+    else if (value.startsWith(`${name}=`)) values.push(value.slice(name.length + 1));
+  }
+  return values;
+}
+
+function rootsConfigFromCliEnv(projectsDir: string) {
+  const explicit = args("--root");
+  if (explicit.length) return explicit.join(",");
+  return (
+    envValue(process.env, "ROOTS", "SYNC_ROOTS", "CHATVIEW_ROOTS", "CHATVIEW_SYNC_ROOTS") ??
+    `claude=${projectsDir},codex=${join(homedir(), ".codex", "sessions")},gemini=${join(homedir(), ".gemini")}`
+  );
+}
+
+function launchAgentEnv(config: Config) {
+  return {
+    ...process.env,
+    CLAUDE_PROJECTS_DIR: config.projectsDir,
+    ROOTS: config.roots,
+  };
 }
 
 function trimSlash(value: string) {

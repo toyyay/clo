@@ -1,3 +1,6 @@
 .env
+data/
 pgdata/
 *.dump
+*.tar
+*.tar.gz

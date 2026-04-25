@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
-import { basename } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
+import { basename, dirname, join, normalize } from "node:path";
+import { envValue } from "../../packages/shared/env";
 
 export const syncEnginePolicy = {
   protocol: "agent-v1",
@@ -67,6 +69,7 @@ type SourceFileInput = {
   sourcePath: string;
   provider: string;
   sourceKind: string;
+  sourceGeneration: number;
   pathSha256: string;
   sizeBytes: number;
   mtimeMs: number | null;
@@ -74,6 +77,8 @@ type SourceFileInput = {
   mimeType: string | null;
   encoding: string | null;
   lineCount: number | null;
+  rawStorageKey: string | null;
+  rawStorageBytes: number | null;
   git: Record<string, unknown>;
   metadata: Record<string, unknown>;
   redaction: Record<string, unknown>;
@@ -82,11 +87,14 @@ type SourceFileInput = {
 
 type AppendChunkInput = {
   chunkId: string;
+  appendIdentity: string;
+  sourceGeneration: number;
   sequence: number | null;
   cursorStart: string | null;
   cursorEnd: string | null;
   rawSha256: string | null;
   rawBytes: number;
+  rawPayload?: Uint8Array;
   compression: string | null;
   encoding: string | null;
   contentType: string | null;
@@ -106,6 +114,19 @@ type NormalizedEventInput = {
   metadata: Record<string, unknown>;
   redaction: Record<string, unknown>;
   normalized: Record<string, unknown>;
+};
+
+type NormalizeAppendOptions = {
+  includeRawPayload?: boolean;
+};
+
+export type RawChunkStoragePlan = {
+  kind: "hash_only" | "filesystem";
+  storageKey: string | null;
+  storedRaw: boolean;
+  rawBody: null;
+  rawText: null;
+  reason?: string;
 };
 
 export class SyncEngineHttpError extends Error {
@@ -155,7 +176,7 @@ export async function handleAgentInventory(req: Request, sql: any) {
 
     const cursor = normalizeCursor(body.cursor, "inventory");
     if (cursor) {
-      await upsertCursor(tx, agent.agentId, cursor.scope, null, cursor.value, cursor.metadata);
+      await upsertCursor(tx, agent.agentId, cursor.scope, null, cursor.value, cursor.metadata, 1);
     }
   });
 
@@ -170,9 +191,7 @@ export async function handleAgentInventory(req: Request, sql: any) {
 
 export async function handleAgentAppend(req: Request, sql: any) {
   const body = await readJsonObject(req, syncEnginePolicy.requestLimits.appendBytes);
-  const agent = normalizeAgent(body.agent);
-  const source = normalizeAppendSource(body.source ?? body.file ?? body);
-  const chunks = normalizeAppendChunks(body);
+  const { agent, source, chunks, cursor } = normalizeAppendRequest(body, { includeRawPayload: true });
   await upsertAgent(sql, agent);
 
   let acceptedChunks = 0;
@@ -185,16 +204,29 @@ export async function handleAgentAppend(req: Request, sql: any) {
     sourceFileId = String(sourceRows[0].id);
 
     for (const chunk of chunks) {
+      const storage = await storeRawChunkPayload({
+        agentId: agent.agentId,
+        sourceFileId: sourceRows[0].id,
+        sourceGeneration: chunk.sourceGeneration,
+        chunkId: chunk.chunkId,
+        rawSha256: chunk.rawSha256,
+        rawBytes: chunk.rawBytes,
+        rawPayload: chunk.rawPayload,
+      });
+      const chunkRedaction = rawStorageRedaction(chunk.redaction, storage);
       const chunkRows = await tx`
         insert into agent_raw_chunks (
           source_file_id,
           agent_id,
+          source_generation,
           chunk_id,
           sequence,
           cursor_start,
           cursor_end,
           raw_sha256,
           raw_bytes,
+          raw_storage_key,
+          raw_storage_kind,
           raw_body,
           raw_text,
           compression,
@@ -206,26 +238,37 @@ export async function handleAgentAppend(req: Request, sql: any) {
         values (
           ${sourceRows[0].id},
           ${agent.agentId},
+          ${chunk.sourceGeneration},
           ${chunk.chunkId},
           ${chunk.sequence},
           ${chunk.cursorStart},
           ${chunk.cursorEnd},
           ${chunk.rawSha256},
           ${chunk.rawBytes},
+          ${storage.storageKey},
+          ${storage.kind},
           ${null},
           ${null},
           ${chunk.compression},
           ${chunk.encoding},
           ${chunk.contentType},
-          ${chunk.redaction}::jsonb,
+          ${chunkRedaction}::jsonb,
           ${chunk.metadata}::jsonb
         )
-        on conflict (agent_id, source_file_id, chunk_id) do update set
+        on conflict (agent_id, source_file_id, source_generation, chunk_id) do update set
           cursor_start = coalesce(excluded.cursor_start, agent_raw_chunks.cursor_start),
           cursor_end = coalesce(excluded.cursor_end, agent_raw_chunks.cursor_end),
           raw_sha256 = coalesce(excluded.raw_sha256, agent_raw_chunks.raw_sha256),
           raw_bytes = excluded.raw_bytes,
-          redaction = agent_raw_chunks.redaction || excluded.redaction,
+          raw_storage_key = coalesce(excluded.raw_storage_key, agent_raw_chunks.raw_storage_key),
+          raw_storage_kind = case
+            when excluded.raw_storage_key is not null then excluded.raw_storage_kind
+            else agent_raw_chunks.raw_storage_kind
+          end,
+          redaction = case
+            when excluded.raw_storage_key is null and agent_raw_chunks.raw_storage_key is not null then agent_raw_chunks.redaction
+            else agent_raw_chunks.redaction || excluded.redaction
+          end,
           metadata = agent_raw_chunks.metadata || excluded.metadata
         returning id
       `;
@@ -239,6 +282,7 @@ export async function handleAgentAppend(req: Request, sql: any) {
             raw_chunk_id,
             source_file_id,
             agent_id,
+            source_generation,
             provider,
             event_uid,
             event_type,
@@ -255,6 +299,7 @@ export async function handleAgentAppend(req: Request, sql: any) {
             ${chunkRows[0].id},
             ${sourceRows[0].id},
             ${agent.agentId},
+            ${chunk.sourceGeneration},
             ${source.provider},
             ${event.eventUid},
             ${event.eventType},
@@ -267,7 +312,7 @@ export async function handleAgentAppend(req: Request, sql: any) {
             ${event.redaction}::jsonb,
             ${event.normalized}::jsonb
           )
-          on conflict (agent_id, source_file_id, event_uid) where event_uid is not null do update set
+          on conflict (agent_id, source_file_id, source_generation, event_uid) where event_uid is not null do update set
             raw_chunk_id = excluded.raw_chunk_id,
             event_type = coalesce(excluded.event_type, agent_normalized_events.event_type),
             role = coalesce(excluded.role, agent_normalized_events.role),
@@ -283,8 +328,8 @@ export async function handleAgentAppend(req: Request, sql: any) {
       }
     }
 
-    const cursor = normalizeCursor(body.cursor, "append") ?? { scope: "append", value: ackCursor, metadata: {} };
-    await upsertCursor(tx, agent.agentId, cursor.scope, sourceRows[0].id, ackCursor, cursor.metadata);
+    const cursorMetadata = appendCursorMetadata(cursor?.metadata ?? {}, source.sourceGeneration, chunks.at(-1), ackCursor);
+    await upsertCursor(tx, agent.agentId, cursor?.scope ?? "append", sourceRows[0].id, ackCursor, cursorMetadata, source.sourceGeneration);
   });
 
   return {
@@ -293,13 +338,14 @@ export async function handleAgentAppend(req: Request, sql: any) {
     acceptedChunks,
     acceptedEvents,
     cursor: ackCursor,
-    storage: syncEnginePolicy.storage,
+    storage: buildStoragePolicy(),
   };
 }
 
 export function buildSyncPolicy(_input?: unknown) {
   return {
     ...syncEnginePolicy,
+    storage: buildStoragePolicy(),
     maxUploadChunkBytes: syncEnginePolicy.requestLimits.rawChunkBytes,
     watchRules: [
       {
@@ -360,17 +406,66 @@ export function validateInventoryPayload(value: unknown) {
 
 export function validateAppendPayload(value: unknown) {
   const body = assertObject(value, "payload");
-  return {
-    agent: normalizeAgent(body.agent),
-    source: normalizeAppendSource(body.source ?? body.file ?? body),
-    chunks: normalizeAppendChunks(body),
-  };
+  return normalizeAppendRequest(body);
 }
 
 export function redactMetadata(value: unknown): Record<string, unknown> {
   const redacted = redactValue(value, "$", new Set<object>());
   if (!isPlainObject(redacted)) return {};
   return redacted;
+}
+
+export function appendIdentityKey(sourceGeneration: number, chunkId: string) {
+  return `g${sourceGeneration}:${chunkId}`;
+}
+
+export function planRawChunkStorage(
+  input: {
+    agentId: string;
+    sourceFileId: unknown;
+    sourceGeneration: number;
+    chunkId: string;
+    rawSha256: string | null;
+    rawBytes: number;
+    hasRawPayload: boolean;
+  },
+  env: Record<string, string | undefined> = process.env,
+): RawChunkStoragePlan {
+  const mode = rawSyncStorageMode(env);
+  if (!input.rawSha256 || input.rawBytes <= 0 || !input.hasRawPayload) {
+    return hashOnlyRawStoragePlan("no_raw_payload");
+  }
+
+  const dataDir = rawSyncDataDir(env);
+  if (mode !== "filesystem") return hashOnlyRawStoragePlan("filesystem_storage_not_requested");
+  if (!dataDir) throw new SyncEngineHttpError(500, "DATA_DIR is required when SYNC_RAW_STORAGE=filesystem");
+
+  return {
+    kind: "filesystem",
+    storageKey: rawChunkStorageKey(input),
+    storedRaw: true,
+    rawBody: null,
+    rawText: null,
+  };
+}
+
+function normalizeAppendRequest(body: Record<string, unknown>, options: NormalizeAppendOptions = {}) {
+  const sourceValue = body.source ?? body.file ?? body;
+  const sourceGeneration = appendSourceGeneration(body, sourceValue);
+  const source = normalizeAppendSource(sourceValue, { sourceGeneration });
+  const chunks = normalizeAppendChunks(body, source.sourceGeneration, options);
+  const cursor = normalizeCursor(body.cursor, "append");
+  return {
+    agent: normalizeAgent(body.agent),
+    source,
+    chunks,
+    cursor: cursor
+      ? {
+          ...cursor,
+          metadata: appendCursorMetadata(cursor.metadata, source.sourceGeneration, chunks[chunks.length - 1], cursor.value),
+        }
+      : null,
+  };
 }
 
 async function readJsonObject(req: Request, maxBytes: number) {
@@ -406,14 +501,14 @@ function normalizeInventoryFiles(body: Record<string, unknown>) {
   return files.map((file, index) => normalizeSourceFile(file, `files[${index}]`));
 }
 
-function normalizeAppendSource(value: unknown) {
-  return normalizeSourceFile(value, "source", { allowMissingSize: true });
+function normalizeAppendSource(value: unknown, options: { sourceGeneration: number }) {
+  return normalizeSourceFile(value, "source", { allowMissingSize: true, sourceGeneration: options.sourceGeneration });
 }
 
 function normalizeSourceFile(
   value: unknown,
   label: string,
-  options: { allowMissingSize?: boolean } = {},
+  options: { allowMissingSize?: boolean; sourceGeneration?: number } = {},
 ): SourceFileInput {
   const file = assertObject(value, label);
   const sourcePath = optionalString(file.sourcePath, { max: 4096 }) ?? optionalString(file.path, { max: 4096 });
@@ -426,6 +521,7 @@ function normalizeSourceFile(
     sourcePath: storedSourcePath,
     provider: normalizeProvider(file.provider),
     sourceKind: optionalString(file.sourceKind, { max: 80 }) ?? optionalString(file.kind, { max: 80 }) ?? "conversation",
+    sourceGeneration: options.sourceGeneration ?? generationFromObject(file, label) ?? 1,
     pathSha256: optionalSha256(file.pathSha256) ?? sha256Hex(Buffer.from(sourcePath, "utf8")),
     sizeBytes: optionalNonNegativeInteger(file.sizeBytes, `${label}.sizeBytes`) ?? (options.allowMissingSize ? 0 : requiredNumber(file.sizeBytes, `${label}.sizeBytes`)),
     mtimeMs: optionalNumber(file.mtimeMs, `${label}.mtimeMs`),
@@ -433,6 +529,8 @@ function normalizeSourceFile(
     mimeType: optionalString(file.mimeType, { max: 255 }),
     encoding: optionalString(file.encoding, { max: 80 }),
     lineCount: optionalNonNegativeInteger(file.lineCount, `${label}.lineCount`),
+    rawStorageKey: null,
+    rawStorageBytes: null,
     git,
     metadata,
     redaction: {
@@ -443,11 +541,11 @@ function normalizeSourceFile(
   };
 }
 
-function normalizeAppendChunks(body: Record<string, unknown>) {
+function normalizeAppendChunks(body: Record<string, unknown>, sourceGeneration: number, options: NormalizeAppendOptions = {}) {
   const chunks = arrayField(body.chunks, "chunks", syncEnginePolicy.requestLimits.chunksPerAppend);
   let eventCount = 0;
   return chunks.map((chunk, index) => {
-    const normalized = normalizeAppendChunk(chunk, `chunks[${index}]`);
+    const normalized = normalizeAppendChunk(chunk, `chunks[${index}]`, sourceGeneration, options);
     eventCount += normalized.events.length;
     if (eventCount > syncEnginePolicy.requestLimits.eventsPerAppend) {
       throw new SyncEngineHttpError(400, "too many append events");
@@ -456,26 +554,32 @@ function normalizeAppendChunks(body: Record<string, unknown>) {
   });
 }
 
-function normalizeAppendChunk(value: unknown, label: string): AppendChunkInput {
+function normalizeAppendChunk(value: unknown, label: string, sourceGeneration: number, options: NormalizeAppendOptions): AppendChunkInput {
   const chunk = assertObject(value, label);
-  const raw = readRawChunk(chunk, label);
+  const chunkGeneration = generationFromObject(chunk, label) ?? sourceGeneration;
+  if (chunkGeneration !== sourceGeneration) throw new SyncEngineHttpError(400, `${label}.generation must match source.generation`);
+  const raw = readRawChunk(chunk, label, options);
   const events = Array.isArray(chunk.events)
     ? arrayField(chunk.events, `${label}.events`, syncEnginePolicy.requestLimits.eventsPerAppend).map((event, index) =>
-        normalizeNormalizedEvent(event, `${label}.events[${index}]`),
+        normalizeNormalizedEvent(event, `${label}.events[${index}]`, sourceGeneration),
       )
     : [];
+  const chunkId = optionalString(chunk.chunkId, { max: 200 }) ?? raw.rawSha256 ?? sha256Hex(Buffer.from(`${label}:${Date.now()}`));
 
   return {
-    chunkId: optionalString(chunk.chunkId, { max: 200 }) ?? raw.rawSha256 ?? sha256Hex(Buffer.from(`${label}:${Date.now()}`)),
+    chunkId,
+    appendIdentity: appendIdentityKey(sourceGeneration, chunkId),
+    sourceGeneration,
     sequence: optionalNonNegativeInteger(chunk.sequence, `${label}.sequence`),
     cursorStart: optionalString(chunk.cursorStart, { max: 200 }),
     cursorEnd: optionalString(chunk.cursorEnd, { max: 200 }),
     rawSha256: raw.rawSha256 ?? optionalSha256(chunk.rawSha256),
     rawBytes: raw.rawBytes ?? optionalNonNegativeInteger(chunk.rawBytes, `${label}.rawBytes`) ?? 0,
+    ...("rawPayload" in raw && raw.rawPayload ? { rawPayload: raw.rawPayload } : {}),
     compression: optionalString(chunk.compression, { max: 80 }),
     encoding: optionalString(chunk.encoding, { max: 80 }),
     contentType: optionalString(chunk.contentType, { max: 255 }),
-    metadata: limitMetadata(redactMetadata(chunk.metadata), `${label}.metadata`),
+    metadata: limitMetadata({ ...redactMetadata(chunk.metadata), sourceGeneration }, `${label}.metadata`),
     redaction: {
       ...limitMetadata(redactMetadata(chunk.redaction), `${label}.redaction`),
       storedRaw: false,
@@ -486,7 +590,7 @@ function normalizeAppendChunk(value: unknown, label: string): AppendChunkInput {
   };
 }
 
-function normalizeNormalizedEvent(value: unknown, label: string): NormalizedEventInput {
+function normalizeNormalizedEvent(value: unknown, label: string, sourceGeneration: number): NormalizedEventInput {
   const event = assertObject(value, label);
   const source = isPlainObject(event.source) ? event.source : {};
   const normalized = limitMetadata(safeNormalizedEvent(event), `${label}.normalized`, syncEnginePolicy.requestLimits.normalizedEventBytes);
@@ -497,7 +601,7 @@ function normalizeNormalizedEvent(value: unknown, label: string): NormalizedEven
     eventUid:
       optionalString(event.eventUid, { max: 255 }) ??
       optionalString(event.id, { max: 255 }) ??
-      stableEventUid(label, sourceLineNo, sourceOffset, contentSha256),
+      stableEventUid(`g${sourceGeneration}:${label}`, sourceLineNo, sourceOffset, contentSha256),
     eventType: optionalString(event.eventType, { max: 120 }) ?? optionalString(event.kind, { max: 120 }) ?? optionalString(event.type, { max: 120 }),
     role: optionalString(event.role, { max: 80 }),
     occurredAt: optionalTimestamp(event.occurredAt ?? event.createdAt),
@@ -513,11 +617,15 @@ function normalizeNormalizedEvent(value: unknown, label: string): NormalizedEven
   };
 }
 
-function readRawChunk(chunk: Record<string, unknown>, label: string) {
+function readRawChunk(chunk: Record<string, unknown>, label: string, options: NormalizeAppendOptions) {
   if (typeof chunk.rawText === "string") {
     const bytes = Buffer.from(chunk.rawText, "utf8");
     assertRawChunkSize(bytes.length, label);
-    return { rawSha256: sha256Hex(bytes), rawBytes: bytes.length };
+    return {
+      rawSha256: sha256Hex(bytes),
+      rawBytes: bytes.length,
+      ...(options.includeRawPayload ? { rawPayload: new Uint8Array(bytes) } : {}),
+    };
   }
 
   if (typeof chunk.rawBase64 === "string") {
@@ -525,7 +633,11 @@ function readRawChunk(chunk: Record<string, unknown>, label: string) {
     if (!/^[A-Za-z0-9+/]+={0,2}$/.test(compact)) throw new SyncEngineHttpError(400, `${label}.rawBase64 is invalid`);
     const bytes = Buffer.from(compact, "base64");
     assertRawChunkSize(bytes.length, label);
-    return { rawSha256: sha256Hex(bytes), rawBytes: bytes.length };
+    return {
+      rawSha256: sha256Hex(bytes),
+      rawBytes: bytes.length,
+      ...(options.includeRawPayload ? { rawPayload: new Uint8Array(bytes) } : {}),
+    };
   }
 
   return { rawSha256: null, rawBytes: null };
@@ -580,6 +692,173 @@ function normalizeCursor(value: unknown, fallbackScope: string) {
   };
 }
 
+function appendSourceGeneration(body: Record<string, unknown>, sourceValue: unknown) {
+  const source = isPlainObject(sourceValue) ? sourceValue : {};
+  const cursor = isPlainObject(body.cursor) ? body.cursor : {};
+  const cursorMetadata = isPlainObject(cursor.metadata) ? cursor.metadata : {};
+  const chunks = Array.isArray(body.chunks) ? body.chunks : [];
+
+  const candidates: Array<[unknown, string]> = [
+    [source.generation, "source.generation"],
+    [source.sourceGeneration, "source.sourceGeneration"],
+    [source.fileGeneration, "source.fileGeneration"],
+    [body.generation, "generation"],
+    [body.sourceGeneration, "sourceGeneration"],
+    [body.fileGeneration, "fileGeneration"],
+    [generationFromCursorString(cursor.value), "cursor.value"],
+    [cursor.generation, "cursor.generation"],
+    [cursor.sourceGeneration, "cursor.sourceGeneration"],
+    [cursorMetadata.generation, "cursor.metadata.generation"],
+    [cursorMetadata.sourceGeneration, "cursor.metadata.sourceGeneration"],
+  ];
+
+  for (const [chunk, index] of chunks.entries()) {
+    if (!isPlainObject(chunk)) continue;
+    candidates.push([chunk.generation, `chunks[${index}].generation`]);
+    candidates.push([chunk.sourceGeneration, `chunks[${index}].sourceGeneration`]);
+    candidates.push([generationFromCursorString(chunk.cursorStart), `chunks[${index}].cursorStart`]);
+    candidates.push([generationFromCursorString(chunk.cursorEnd), `chunks[${index}].cursorEnd`]);
+  }
+
+  let generation: number | null = null;
+  for (const [value, label] of candidates) {
+    const next = optionalPositiveInteger(value, label);
+    if (next == null) continue;
+    if (generation != null && generation !== next) throw new SyncEngineHttpError(400, "append generation fields must agree");
+    generation = next;
+  }
+  return generation ?? 1;
+}
+
+function generationFromCursorString(value: unknown) {
+  if (typeof value !== "string") return null;
+  const match = /^(\d+):/.exec(value.trim());
+  if (!match) return null;
+  const generation = Number(match[1]);
+  return Number.isSafeInteger(generation) && generation > 0 ? generation : null;
+}
+
+function generationFromObject(value: Record<string, unknown>, label: string) {
+  return (
+    optionalPositiveInteger(value.generation, `${label}.generation`) ??
+    optionalPositiveInteger(value.sourceGeneration, `${label}.sourceGeneration`) ??
+    optionalPositiveInteger(value.fileGeneration, `${label}.fileGeneration`)
+  );
+}
+
+function appendCursorMetadata(
+  metadata: Record<string, unknown>,
+  sourceGeneration: number,
+  lastChunk: Pick<AppendChunkInput, "appendIdentity" | "chunkId" | "cursorEnd" | "sourceGeneration"> | undefined,
+  ackCursor: string,
+) {
+  return limitMetadata(
+    {
+      ...metadata,
+      generation: sourceGeneration,
+      sourceGeneration,
+      ackCursor,
+      lastChunkId: lastChunk?.chunkId,
+      lastAppendIdentity: lastChunk?.appendIdentity,
+    },
+    "cursor.metadata",
+  );
+}
+
+function buildStoragePolicy(env: Record<string, string | undefined> = process.env) {
+  const mode = rawSyncStorageMode(env);
+  return {
+    ...syncEnginePolicy.storage,
+    rawChunks: mode === "filesystem" && rawSyncDataDir(env) ? "filesystem" : syncEnginePolicy.storage.rawChunks,
+    rawFilesStoredByDefault: false,
+  };
+}
+
+async function storeRawChunkPayload(
+  input: {
+    agentId: string;
+    sourceFileId: unknown;
+    sourceGeneration: number;
+    chunkId: string;
+    rawSha256: string | null;
+    rawBytes: number;
+    rawPayload?: Uint8Array;
+  },
+  env: Record<string, string | undefined> = process.env,
+) {
+  const plan = planRawChunkStorage({ ...input, hasRawPayload: input.rawPayload != null }, env);
+  if (plan.kind !== "filesystem" || !plan.storageKey || !input.rawPayload) return plan;
+
+  const dataDir = rawSyncDataDir(env);
+  if (!dataDir) return hashOnlyRawStoragePlan("data_dir_not_configured");
+
+  const path = rawStorageDataPath(dataDir, plan.storageKey);
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, Buffer.from(input.rawPayload));
+  return plan;
+}
+
+function rawStorageRedaction(redaction: Record<string, unknown>, storage: RawChunkStoragePlan) {
+  return {
+    ...redaction,
+    storedRaw: storage.storedRaw,
+    rawPolicy: storage.kind,
+    rawStorageKey: storage.storageKey,
+    rawStorageReason: storage.reason,
+    applied: storage.storedRaw ? ["filesystem_raw_storage", "metadata_redacted"] : ["raw_not_stored", "metadata_redacted"],
+  };
+}
+
+function rawSyncStorageMode(env: Record<string, string | undefined>) {
+  const value = envValue(env, "SYNC_RAW_STORAGE")?.toLowerCase();
+  return value === "filesystem" ? "filesystem" : "hash_only";
+}
+
+function rawSyncDataDir(env: Record<string, string | undefined>) {
+  return envValue(env, "DATA_DIR", "CHATVIEW_DATA_DIR");
+}
+
+function hashOnlyRawStoragePlan(reason: string): RawChunkStoragePlan {
+  return {
+    kind: "hash_only",
+    storageKey: null,
+    storedRaw: false,
+    rawBody: null,
+    rawText: null,
+    reason,
+  };
+}
+
+function rawChunkStorageKey(input: {
+  agentId: string;
+  sourceFileId: unknown;
+  sourceGeneration: number;
+  chunkId: string;
+  rawSha256: string | null;
+}) {
+  const sha = input.rawSha256 ?? "unknown";
+  return [
+    "filesystem",
+    "sync",
+    "raw-chunks",
+    safePathPart(input.agentId),
+    safePathPart(String(input.sourceFileId)),
+    `g${input.sourceGeneration}`,
+    sha.slice(0, 2),
+    `${safePathPart(input.chunkId).slice(0, 80)}-${sha}`,
+  ].join("/");
+}
+
+function rawStorageDataPath(dataDir: string, storageKey: string) {
+  const normalized = normalize(storageKey).replace(/^(\.\.(\/|\\|$))+/, "");
+  if (normalized.startsWith("/") || normalized.includes("..")) throw new Error("invalid raw storage key");
+  return join(dataDir, normalized);
+}
+
+function safePathPart(value: string) {
+  return value.replace(/[^a-zA-Z0-9_.-]/g, "-") || "unknown";
+}
+
 async function upsertAgent(sql: any, agent: SyncAgent) {
   await sql`
     insert into agents (id, hostname, platform, arch, version, source_root, last_seen_at)
@@ -600,6 +879,7 @@ async function upsertSourceFile(sql: any, agentId: string, file: SourceFileInput
       agent_id,
       provider,
       source_kind,
+      current_generation,
       source_path,
       path_sha256,
       size_bytes,
@@ -608,6 +888,8 @@ async function upsertSourceFile(sql: any, agentId: string, file: SourceFileInput
       mime_type,
       encoding,
       line_count,
+      raw_storage_key,
+      raw_storage_bytes,
       git,
       metadata,
       redaction,
@@ -618,6 +900,7 @@ async function upsertSourceFile(sql: any, agentId: string, file: SourceFileInput
       ${agentId},
       ${file.provider},
       ${file.sourceKind},
+      ${file.sourceGeneration},
       ${file.sourcePath},
       ${file.pathSha256},
       ${file.sizeBytes},
@@ -626,6 +909,8 @@ async function upsertSourceFile(sql: any, agentId: string, file: SourceFileInput
       ${file.mimeType},
       ${file.encoding},
       ${file.lineCount},
+      ${file.rawStorageKey},
+      ${file.rawStorageBytes},
       ${file.git}::jsonb,
       ${file.metadata}::jsonb,
       ${file.redaction}::jsonb,
@@ -635,6 +920,7 @@ async function upsertSourceFile(sql: any, agentId: string, file: SourceFileInput
     on conflict (agent_id, path_sha256) do update set
       provider = excluded.provider,
       source_kind = excluded.source_kind,
+      current_generation = greatest(agent_source_files.current_generation, excluded.current_generation),
       source_path = excluded.source_path,
       size_bytes = excluded.size_bytes,
       mtime_ms = coalesce(excluded.mtime_ms, agent_source_files.mtime_ms),
@@ -642,10 +928,12 @@ async function upsertSourceFile(sql: any, agentId: string, file: SourceFileInput
       mime_type = coalesce(excluded.mime_type, agent_source_files.mime_type),
       encoding = coalesce(excluded.encoding, agent_source_files.encoding),
       line_count = coalesce(excluded.line_count, agent_source_files.line_count),
+      raw_storage_key = coalesce(excluded.raw_storage_key, agent_source_files.raw_storage_key),
+      raw_storage_bytes = coalesce(excluded.raw_storage_bytes, agent_source_files.raw_storage_bytes),
       git = agent_source_files.git || excluded.git,
       metadata = agent_source_files.metadata || excluded.metadata,
       redaction = agent_source_files.redaction || excluded.redaction,
-      deleted_at = case when excluded.deleted_at is not null then excluded.deleted_at else agent_source_files.deleted_at end,
+      deleted_at = excluded.deleted_at,
       last_seen_at = now()
     returning id
   `;
@@ -658,12 +946,14 @@ async function upsertCursor(
   sourceFileId: unknown,
   value: string,
   metadata: Record<string, unknown>,
+  sourceGeneration: number,
 ) {
   const sourceFileIdKey = sourceFileId ?? 0;
   await sql`
-    insert into agent_sync_cursors (agent_id, source_file_id, source_file_id_key, cursor_scope, cursor_value, metadata, updated_at)
-    values (${agentId}, ${sourceFileId}, ${sourceFileIdKey}, ${scope}, ${value}, ${metadata}::jsonb, now())
+    insert into agent_sync_cursors (agent_id, source_file_id, source_file_id_key, source_generation, cursor_scope, cursor_value, metadata, updated_at)
+    values (${agentId}, ${sourceFileId}, ${sourceFileIdKey}, ${sourceGeneration}, ${scope}, ${value}, ${metadata}::jsonb, now())
     on conflict (agent_id, cursor_scope, source_file_id_key) do update set
+      source_generation = excluded.source_generation,
       cursor_value = excluded.cursor_value,
       metadata = agent_sync_cursors.metadata || excluded.metadata,
       updated_at = now()
@@ -724,6 +1014,22 @@ function optionalNonNegativeInteger(value: unknown, label: string) {
   if (value == null) return null;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
     throw new SyncEngineHttpError(400, `${label} must be a non-negative integer`);
+  }
+  return value;
+}
+
+function optionalPositiveInteger(value: unknown, label: string) {
+  if (value == null) return null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    if (!/^\d+$/.test(trimmed)) throw new SyncEngineHttpError(400, `${label} must be a positive integer`);
+    const parsed = Number(trimmed);
+    if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+    throw new SyncEngineHttpError(400, `${label} must be a positive integer`);
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new SyncEngineHttpError(400, `${label} must be a positive integer`);
   }
   return value;
 }

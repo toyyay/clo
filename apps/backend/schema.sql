@@ -268,6 +268,7 @@ create table if not exists agent_source_files (
   agent_id text not null references agents(id) on delete cascade,
   provider text not null default 'unknown',
   source_kind text not null default 'conversation',
+  current_generation integer not null default 1,
   source_path text not null,
   path_sha256 text not null,
   size_bytes bigint not null default 0,
@@ -276,6 +277,8 @@ create table if not exists agent_source_files (
   mime_type text,
   encoding text,
   line_count integer,
+  raw_storage_key text,
+  raw_storage_bytes bigint,
   git jsonb not null default '{}'::jsonb,
   metadata jsonb not null default '{}'::jsonb,
   redaction jsonb not null default '{}'::jsonb,
@@ -299,6 +302,7 @@ create table if not exists agent_sync_cursors (
   agent_id text not null references agents(id) on delete cascade,
   source_file_id bigint references agent_source_files(id) on delete cascade,
   source_file_id_key bigint not null default 0,
+  source_generation integer not null default 1,
   cursor_scope text not null default 'global',
   cursor_value text not null default '0',
   metadata jsonb not null default '{}'::jsonb,
@@ -314,12 +318,15 @@ create table if not exists agent_raw_chunks (
   id bigserial primary key,
   source_file_id bigint not null references agent_source_files(id) on delete cascade,
   agent_id text not null references agents(id) on delete cascade,
+  source_generation integer not null default 1,
   chunk_id text not null,
   sequence integer,
   cursor_start text,
   cursor_end text,
   raw_sha256 text,
   raw_bytes bigint not null default 0,
+  raw_storage_key text,
+  raw_storage_kind text not null default 'hash_only',
   raw_body bytea,
   raw_text text,
   compression text,
@@ -328,7 +335,7 @@ create table if not exists agent_raw_chunks (
   redaction jsonb not null default '{}'::jsonb,
   metadata jsonb not null default '{}'::jsonb,
   received_at timestamptz not null default now(),
-  unique (agent_id, source_file_id, chunk_id)
+  unique (agent_id, source_file_id, source_generation, chunk_id)
 );
 
 create index if not exists idx_agent_raw_chunks_source_sequence
@@ -337,11 +344,18 @@ create index if not exists idx_agent_raw_chunks_source_sequence
 create index if not exists idx_agent_raw_chunks_sha
   on agent_raw_chunks (raw_sha256) where raw_sha256 is not null;
 
+create index if not exists idx_agent_raw_chunks_storage_key
+  on agent_raw_chunks (raw_storage_key) where raw_storage_key is not null;
+
+create index if not exists idx_agent_source_files_raw_storage_key
+  on agent_source_files (raw_storage_key) where raw_storage_key is not null;
+
 create table if not exists agent_normalized_events (
   id bigserial primary key,
   raw_chunk_id bigint references agent_raw_chunks(id) on delete set null,
   source_file_id bigint not null references agent_source_files(id) on delete cascade,
   agent_id text not null references agents(id) on delete cascade,
+  source_generation integer not null default 1,
   provider text not null default 'unknown',
   event_uid text,
   event_type text,
@@ -357,7 +371,7 @@ create table if not exists agent_normalized_events (
 );
 
 create unique index if not exists idx_agent_normalized_events_uid
-  on agent_normalized_events (agent_id, source_file_id, event_uid)
+  on agent_normalized_events (agent_id, source_file_id, source_generation, event_uid)
   where event_uid is not null;
 
 create index if not exists idx_agent_normalized_events_source_line

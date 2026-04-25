@@ -38,6 +38,16 @@ import {
   handleAgentInventory,
   isSyncEngineHttpError,
 } from "./sync-engine";
+import {
+  getV2Session,
+  isV2SessionId,
+  listV2EventsForSync,
+  listV2Hosts,
+  listV2Sessions,
+  mapV2EventRow,
+  mergeHostLists,
+  mergeSessionLists,
+} from "./v2-read-model";
 import { envFlag, envPositiveInteger, envValue } from "../../packages/shared/env";
 import { prepareDatabase, sql, toId, toNumber } from "./db";
 import { detectMedia, fileExtension, filenameFromContentDisposition } from "./media-detect";
@@ -61,6 +71,7 @@ const openRouterEndpoint = envValue(process.env, "OPENROUTER_ENDPOINT") ?? "http
 const openRouterKeyEndpoint = envValue(process.env, "OPENROUTER_KEY_ENDPOINT") ?? "https://openrouter.ai/api/v1/key";
 const ffmpegBin = envValue(process.env, "FFMPEG_BIN") ?? "ffmpeg";
 const dataDir = envValue(process.env, "DATA_DIR", "CHATVIEW_DATA_DIR") ?? "";
+const legacyIngestEnabled = envFlag(process.env, ["LEGACY_INGEST_ENABLED", "CHATVIEW_LEGACY_INGEST_ENABLED"]);
 const transcriptionConcurrency = envPositiveInteger(process.env, ["TRANSCRIPTION_CONCURRENCY"], 2);
 const webAuthCookie = "chatview_token";
 const webAuthCookieMaxAge = 60 * 60 * 24 * 30;
@@ -187,13 +198,33 @@ Bun.serve<{ docIds: Set<string> }>({
     "/api/hosts": async (req: Request) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;
-      return json(await listHosts());
+      return json(await listReadableHosts());
     },
     "/api/sessions": async (req: Request) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;
       const url = new URL(req.url);
-      return json(await listSessions(url.searchParams.get("agentId") ?? undefined));
+      return json(await listReadableSessions(url.searchParams.get("agentId") ?? undefined));
+    },
+    "/api/v2/hosts": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      return json(await listReadableHosts());
+    },
+    "/api/v2/sessions": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      const url = new URL(req.url);
+      return json(await listReadableSessions(url.searchParams.get("agentId") ?? undefined));
+    },
+    "/api/v2/sessions/:id/events": async (req: Request & { params?: { id?: string } }) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      const fallbackId = new URL(req.url).pathname.match(/^\/api\/v2\/sessions\/([^/]+)\/events$/)?.[1];
+      const id = decodeURIComponent(req.params?.id ?? fallbackId ?? "");
+      if (!id) return text("missing id", 400);
+      const payload = await getReadableSession(id);
+      return payload ? json(payload) : text("session not found", 404);
     },
     "/api/session": async (req: Request) => {
       const auth = requireWebAuth(req);
@@ -201,7 +232,7 @@ Bun.serve<{ docIds: Set<string> }>({
       const url = new URL(req.url);
       const id = url.searchParams.get("id");
       if (!id) return text("missing id", 400);
-      const payload = await getSession(id);
+      const payload = await getReadableSession(id);
       return payload ? json(payload) : text("session not found", 404);
     },
     "/api/sync": async (req: Request) => {
@@ -349,6 +380,7 @@ Bun.serve<{ docIds: Set<string> }>({
     "/api/ingest/batch": async (req: Request) => {
       if (req.method !== "POST") return text("method not allowed", 405);
       if (!isAuthorized(req)) return text("unauthorized", 401);
+      if (!legacyIngestEnabled) return text("legacy ingest disabled", 410);
       try {
         const body = (await req.json()) as IngestBatchRequest;
         const result = await ingestBatch(body);
@@ -1749,6 +1781,21 @@ function sha256Hex(bytes: Uint8Array) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+async function listReadableHosts(): Promise<HostInfo[]> {
+  const [legacyHosts, v2Hosts] = await Promise.all([listHosts(), listV2Hosts(sql)]);
+  return mergeHostLists(legacyHosts, v2Hosts);
+}
+
+async function listReadableSessions(agentId?: string): Promise<SessionInfo[]> {
+  const [legacySessions, v2Sessions] = await Promise.all([listSessions(agentId), listV2Sessions(sql, agentId)]);
+  return mergeSessionLists(legacySessions, v2Sessions);
+}
+
+async function getReadableSession(id: string): Promise<SessionPayload | null> {
+  if (isV2SessionId(id)) return getV2Session(sql, id);
+  return getSession(id);
+}
+
 async function listHosts(): Promise<HostInfo[]> {
   const rows = await sql`
     select
@@ -1860,44 +1907,6 @@ async function listSessions(agentId?: string): Promise<SessionInfo[]> {
   return rows.map(mapSession);
 }
 
-async function getSessionMeta(id: string): Promise<SessionInfo | null> {
-  const rows = await sql`
-    select
-      s.id,
-      s.agent_id,
-      a.hostname,
-      p.project_key,
-      p.display_name as project_name,
-      s.session_id,
-      s.title,
-      s.source_path,
-      s.size_bytes,
-      s.mtime_ms,
-      s.first_seen_at,
-      s.last_seen_at,
-      s.content_sha256,
-      s.mime_type,
-      s.encoding,
-      s.line_count,
-      s.mode,
-      s.symlink_target,
-      s.git_repo_root,
-      s.git_branch,
-      s.git_commit,
-      s.git_dirty,
-      s.git_remote_url,
-      s.deleted_at,
-      count(e.id) as event_count
-    from chat_sessions s
-    join agents a on a.id = s.agent_id
-    join projects p on p.id = s.project_id
-    left join session_events e on e.session_db_id = s.id
-    where s.id = ${id}
-    group by s.id, a.hostname, p.project_key, p.display_name
-  `;
-  return rows.length ? mapSession(rows[0]) : null;
-}
-
 async function getSessionsMeta(ids: string[]): Promise<SessionInfo[]> {
   const uniqueIds = [...new Set(ids.map(String).filter((id) => /^\d+$/.test(id)))];
   if (!uniqueIds.length) return [];
@@ -2006,15 +2015,18 @@ async function getSession(id: string): Promise<SessionPayload | null> {
 
 async function sync(body: SyncRequest): Promise<SyncResponse> {
   const limitBytes = clamp(Math.floor(body.limitBytes ?? 2 * 1024 * 1024), 64 * 1024, 16 * 1024 * 1024);
-  const cursor = BigInt(body.cursor && /^\d+$/.test(body.cursor) ? body.cursor : "0");
+  const cursor = parseSyncCursor(body.cursor);
   if (body.metadataOnly) {
-    const maxRows = await sql`select coalesce(max(id), 0) as cursor from session_events`;
+    const [legacyMaxRows, v2MaxRows] = await Promise.all([
+      sql`select coalesce(max(id), 0) as cursor from session_events`,
+      sql`select coalesce(max(id), 0) as cursor from agent_normalized_events`,
+    ]);
     const response: SyncResponse = {
-      cursor: toId(maxRows[0]?.cursor ?? cursor.toString()),
+      cursor: formatSyncCursor(legacyMaxRows[0]?.cursor ?? cursor.legacy.toString(), v2MaxRows[0]?.cursor ?? cursor.v2.toString()),
       hasMore: false,
       approxBytes: 0,
-      hosts: await listHosts(),
-      sessions: await listSessions(),
+      hosts: await listReadableHosts(),
+      sessions: await listReadableSessions(),
       events: [],
     };
     response.approxBytes = byteSize(JSON.stringify(response));
@@ -2022,19 +2034,24 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
   }
 
   const fetchLimit = 10000;
-  const rows = await sql`
+  const [legacyRows, v2Rows] = await Promise.all([
+    sql`
     select id, session_db_id, source_line_no, source_offset, event_type, role, occurred_at, ingested_at, raw
     from session_events
-    where id > ${cursor}
+    where id > ${cursor.legacy}
     order by id asc
     limit ${fetchLimit}
-  `;
+  `,
+    listV2EventsForSync(sql, cursor.v2, fetchLimit),
+  ]);
 
   const events = [];
   let approxBytes = 2;
-  let hasMore = rows.length === fetchLimit;
+  let hasMore = legacyRows.length === fetchLimit || v2Rows.length === fetchLimit;
+  let nextLegacyCursor = cursor.legacy.toString();
+  let nextV2Cursor = cursor.v2.toString();
 
-  for (const row of rows) {
+  for (const row of legacyRows) {
     const event = {
       id: toId(row.id),
       sessionDbId: toId(row.session_db_id),
@@ -2052,14 +2069,33 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
       break;
     }
     events.push(event);
+    nextLegacyCursor = toId(row.id);
     approxBytes += eventBytes;
   }
 
-  const nextCursor = events.length ? events[events.length - 1].id : cursor.toString();
-  const sessionIds = [...new Set(events.map((event) => event.sessionDbId))];
-  const sessions = sessionIds.length ? await getSessionsMeta(sessionIds) : [];
+  for (const row of v2Rows) {
+    const event = mapV2EventRow(row);
+    const eventBytes = byteSize(JSON.stringify(event)) + 1;
+    if (events.length && approxBytes + eventBytes > limitBytes) {
+      hasMore = true;
+      break;
+    }
+    events.push(event);
+    nextV2Cursor = toId(row.id);
+    approxBytes += eventBytes;
+  }
 
-  const hosts = await listHosts();
+  const nextCursor = formatSyncCursor(nextLegacyCursor, nextV2Cursor);
+  const sessionIds = [...new Set(events.map((event) => event.sessionDbId))];
+  const legacySessionIds = sessionIds.filter((id) => !isV2SessionId(id));
+  const v2SessionIds = new Set(sessionIds.filter(isV2SessionId));
+  const [legacySessions, v2Sessions] = await Promise.all([
+    legacySessionIds.length ? getSessionsMeta(legacySessionIds) : [],
+    v2SessionIds.size ? listV2Sessions(sql) : [],
+  ]);
+  const sessions = [...legacySessions, ...v2Sessions.filter((session) => v2SessionIds.has(session.id))];
+
+  const hosts = await listReadableHosts();
   const response: SyncResponse = {
     cursor: nextCursor,
     hasMore,
@@ -2070,6 +2106,18 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
   };
   response.approxBytes = byteSize(JSON.stringify(response));
   return response;
+}
+
+function parseSyncCursor(value: string | undefined): { legacy: bigint; v2: bigint } {
+  if (!value) return { legacy: 0n, v2: 0n };
+  const compound = /^sync:(\d+):(\d+)$/.exec(value);
+  if (compound) return { legacy: BigInt(compound[1]), v2: BigInt(compound[2]) };
+  if (/^\d+$/.test(value)) return { legacy: BigInt(value), v2: 0n };
+  return { legacy: 0n, v2: 0n };
+}
+
+function formatSyncCursor(legacy: unknown, v2: unknown) {
+  return `sync:${toId(legacy ?? "0")}:${toId(v2 ?? "0")}`;
 }
 
 function mapSession(row: any): SessionInfo {
@@ -2323,14 +2371,19 @@ async function readYjsDocument(docId: string): Promise<{ update: Uint8Array; upd
 async function mergeYjsUpdate(docId: string, update: Uint8Array, sessionDbId?: string) {
   const current = await readYjsDocument(docId);
   const merged = current ? Y.mergeUpdates([current.update, update]) : update;
+  const legacySessionDbId = numericSessionDbId(sessionDbId);
   await sql`
     insert into yjs_documents (doc_id, session_db_id, update, updated_at)
-    values (${docId}, ${sessionDbId ?? null}, ${Buffer.from(merged)}, now())
+    values (${docId}, ${legacySessionDbId}, ${Buffer.from(merged)}, now())
     on conflict (doc_id) do update set
       session_db_id = coalesce(excluded.session_db_id, yjs_documents.session_db_id),
       update = excluded.update,
       updated_at = now()
   `;
+}
+
+function numericSessionDbId(value?: string) {
+  return value && /^\d+$/.test(value) ? value : null;
 }
 
 function validateBatch(body: IngestBatchRequest) {

@@ -18,7 +18,7 @@ export function planUploadChunks(files: InventoryFile[], batches: TailBatch[], p
 
     const batch = batchByPath.get(file.sourcePath);
     if (!batch?.records.length) continue;
-    const chunked = chunkRecords(file, batch.records, policy);
+    const chunked = chunkRecords(file, batch.records, policy, batch);
     chunks.push(...chunked.chunks);
     skipped.push(...chunked.skipped);
   }
@@ -32,18 +32,21 @@ export async function executeUploadPlan(plan: UploadPlan, transport: UploadTrans
   }
 }
 
-function chunkRecords(file: InventoryFile, records: TailRecord[], policy: SyncPolicy): Pick<UploadPlan, "chunks" | "skipped"> {
+function chunkRecords(
+  file: InventoryFile,
+  records: TailRecord[],
+  policy: SyncPolicy,
+  batch: TailBatch,
+): Pick<UploadPlan, "chunks" | "skipped"> {
   const chunks: UploadChunk[] = [];
   const skipped: UploadPlan["skipped"] = [];
   let pending: TailRecord[] = [];
-  let pendingBytes = 0;
 
   for (const record of records) {
     if (record.byteLength > policy.maxUploadChunkBytes) {
       if (pending.length) {
-        chunks.push(toChunk(file, pending));
+        chunks.push(toChunk(file, pending, batch));
         pending = [];
-        pendingBytes = 0;
       }
       skipped.push({
         sourcePath: file.sourcePath,
@@ -51,28 +54,34 @@ function chunkRecords(file: InventoryFile, records: TailRecord[], policy: SyncPo
       });
       continue;
     }
-    const wouldExceedBytes = pendingBytes > 0 && pendingBytes + record.byteLength > policy.maxUploadChunkBytes;
+    const pendingStartOffset = pending[0]?.offset ?? record.offset;
+    const spanBytes = record.offset + record.byteLength - pendingStartOffset;
+    const wouldExceedBytes = pending.length > 0 && spanBytes > policy.maxUploadChunkBytes;
     const wouldExceedLines = pending.length >= policy.maxUploadLines;
     if (wouldExceedBytes || wouldExceedLines) {
-      chunks.push(toChunk(file, pending));
+      chunks.push(toChunk(file, pending, batch));
       pending = [];
-      pendingBytes = 0;
     }
     pending.push(record);
-    pendingBytes += record.byteLength;
   }
 
-  if (pending.length) chunks.push(toChunk(file, pending));
+  if (pending.length) chunks.push(toChunk(file, pending, batch));
   return { chunks, skipped };
 }
 
-function toChunk(file: InventoryFile, records: TailRecord[]): UploadChunk {
+function toChunk(file: InventoryFile, records: TailRecord[], batch: TailBatch): UploadChunk {
+  const generation = batch.nextCursor.generation;
   const first = records[0];
   const last = records[records.length - 1];
   const endOffset = last.offset + last.byteLength;
   const byteLength = endOffset - first.offset;
+  const rawStart = first.offset - batch.rawStartOffset;
+  const rawEnd = endOffset - batch.rawStartOffset;
+  const rawBytes = batch.rawBytes.slice(Math.max(0, rawStart), Math.max(0, rawEnd));
+  const rawText = new TextDecoder("utf-8").decode(rawBytes);
   const hash = createHash("sha256")
     .update(file.logicalId)
+    .update(String(generation))
     .update(String(first.offset))
     .update(String(endOffset))
     .digest("hex")
@@ -80,15 +89,19 @@ function toChunk(file: InventoryFile, records: TailRecord[]): UploadChunk {
 
   return {
     chunkId: hash,
+    generation,
     provider: file.provider,
     sourcePath: file.sourcePath,
     relativePath: file.relativePath,
     logicalId: file.logicalId,
+    sizeBytes: file.sizeBytes,
+    mtimeMs: file.mtimeMs,
     startOffset: first.offset,
     endOffset,
     startLine: first.lineNo,
     endLine: last.lineNo,
     byteLength,
+    rawText,
     records,
   };
 }

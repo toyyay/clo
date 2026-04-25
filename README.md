@@ -2,12 +2,12 @@
 
 Status: this is still a work-in-progress deployment target. No production data is expected to live in this repo yet, and it is fine to rebuild or wipe pre-prod database state while the schema and deploy flow are still settling.
 
-Chatview is a local-first viewer for Claude Code JSONL history collected from multiple macOS machines.
+Chatview is a local-first viewer for Claude Code, Codex, and Gemini JSONL history collected from multiple machines.
 
 It has three parts:
 
-- `apps/agent`: Bun agent that tails `~/.claude/projects` and posts appended JSONL events.
-- `apps/backend`: Bun HTTP server with Postgres storage and cursor sync API.
+- `apps/agent`: Bun agent that tails configured JSONL roots and uploads append chunks.
+- `apps/backend`: Bun HTTP server with Postgres projections, filesystem raw-chunk storage, and cursor sync API.
 - `apps/frontend`: React UI that renders from IndexedDB first, then pulls backend updates in batches.
 
 ## Sync Model
@@ -16,18 +16,21 @@ The source logs are append-only JSONL files, so every layer uses monotonic curso
 
 Agent to backend:
 
-- The agent polls the Claude projects directory.
-- For every `.jsonl` file it stores local `offset` and `lineNo` in `~/.chatview-agent/state.json`.
-- It sends only complete appended lines to `POST /api/ingest/batch`.
-- The backend deduplicates with `unique (session_db_id, source_line_no)`.
-- If a request fails, the agent does not advance local state.
+- The default `run` and `scan-once` commands use the v2 agent pipeline.
+- The agent scans configured roots for Claude, Codex, and Gemini. Defaults are `~/.claude/projects`, `~/.codex/sessions`, and `~/.gemini`; pass repeated `--root kind=path` values or set `ROOTS`.
+- For every `.jsonl` file it stores local generation, offset, line number, and tail hash in `~/.chatview-agent/v2-state.json`.
+- It sends complete appended spans to `POST /api/agent/v1/append` after the server policy handshake at `POST /api/agent/v1/hello`.
+- The backend stores raw chunks under `DATA_DIR/filesystem` when `SYNC_RAW_STORAGE=filesystem` is enabled, and stores normalized SQL projections in `agent_source_files`, `agent_raw_chunks`, and `agent_normalized_events`.
+- If a request fails or all pending records are skipped by policy, the agent does not advance local state.
+- Legacy `/api/ingest/batch` uploads are disabled by default and are kept only for an explicit rollback window with `LEGACY_INGEST_ENABLED=true`.
 
 Backend to frontend:
 
 - The browser stores `hosts`, `sessions`, `events`, and `syncCursor` in IndexedDB.
 - On open, the UI renders cached IndexedDB data immediately.
-- It then calls `POST /api/sync` with `{ cursor, limitBytes }`.
-- The backend returns changed hosts/sessions/events, a new cursor, and `hasMore`.
+- It then refreshes metadata first and lazily fetches active chat events from `/api/v2/sessions/:id/events`.
+- Full offline event sync uses `POST /api/sync` with `{ cursor, limitBytes }`.
+- The backend returns changed hosts/sessions/events, a compound cursor, and `hasMore`.
 - The frontend repeats while `hasMore` is true.
 - Default response target is 2 MB.
 
@@ -82,6 +85,15 @@ export AGENT_TOKEN=dev-token
 bun run dev:agent
 ```
 
+Custom roots example:
+
+```sh
+bun run apps/agent/main.ts scan-once \
+  --root claude="$HOME/.claude/projects" \
+  --root codex="$HOME/.codex/sessions" \
+  --root gemini="$HOME/.gemini"
+```
+
 Local helper with a project-local state file:
 
 ```sh
@@ -107,7 +119,9 @@ bun run dev:backend
 bun run dev:agent
 bun run dev:local:backend
 bun run dev:local:agent
+bun run dev:local:agent:legacy
 bun run dev:local:agent:scan
+bun run dev:local:agent:legacy:scan
 bun run agent:scan
 bun run db:up
 bun run db:down

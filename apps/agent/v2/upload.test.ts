@@ -15,25 +15,35 @@ describe("agent-v2 upload adapter", () => {
   test("builds a backend-valid append envelope from a planned chunk", () => {
     const chunk: UploadChunk = {
       chunkId: "chunk-1",
+      generation: 1,
       provider: "codex",
       sourcePath: "/Users/example/.codex/sessions/2026/04/25/session.jsonl",
       relativePath: "2026/04/25/session.jsonl",
       logicalId: "codex:2026/04/25/session.jsonl",
+      sizeBytes: 16,
+      mtimeMs: 1,
       startOffset: 0,
-      endOffset: 18,
+      endOffset: 16,
       startLine: 1,
       endLine: 1,
-      byteLength: 18,
-      records: [{ lineNo: 1, offset: 0, byteLength: 18, rawLine: "{\"type\":\"user\"}" }],
+      byteLength: 16,
+      rawText: "{\"type\":\"user\"}\n",
+      records: [{ lineNo: 1, offset: 0, byteLength: 16, rawLine: "{\"type\":\"user\"}" }],
     };
 
     const request = buildAgentV1AppendRequest(agent, chunk);
     const validated = validateAppendPayload(request);
 
     expect(request.source.sourcePath).toBe("codex:2026/04/25/session.jsonl");
+    expect(request.files[0].metadata.generation).toBe(1);
+    expect(request.chunks[0].rawText).toBe("{\"type\":\"user\"}\n");
+    expect(request.chunks[0].rawBytes).toBe(16);
     expect(validated.source.sourcePath).toBe("2026/04/25/session.jsonl");
-    expect(validated.chunks[0].cursorEnd).toBe("18");
-    expect(validated.chunks[0].events[0].eventUid).toBe("codex:2026/04/25/session.jsonl:1:0");
+    expect(validated.source.sourceGeneration).toBe(1);
+    expect(validated.chunks[0].cursorEnd).toBe("16");
+    expect(validated.chunks[0].sourceGeneration).toBe(1);
+    expect(validated.chunks[0].rawBytes).toBe(16);
+    expect(validated.chunks[0].events[0].eventUid).toBe("codex:2026/04/25/session.jsonl:g1:1:0");
     expect(validated.chunks[0].events[0].sourceLineNo).toBe(1);
   });
 });

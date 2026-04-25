@@ -475,6 +475,47 @@ create unique index if not exists idx_import_media_blobs_storage_key
   where storage_key is not null;
 `.trim(),
   },
+  {
+    id: "0009",
+    name: "agent_v1_generation_and_raw_storage",
+    sql: `
+alter table agent_source_files
+  add column if not exists current_generation integer not null default 1,
+  add column if not exists raw_storage_key text,
+  add column if not exists raw_storage_bytes bigint;
+
+alter table agent_sync_cursors
+  add column if not exists source_generation integer not null default 1;
+
+alter table agent_raw_chunks
+  add column if not exists source_generation integer not null default 1,
+  add column if not exists raw_storage_key text,
+  add column if not exists raw_storage_kind text not null default 'hash_only';
+
+alter table agent_normalized_events
+  add column if not exists source_generation integer not null default 1;
+
+alter table agent_raw_chunks
+  drop constraint if exists agent_raw_chunks_agent_id_source_file_id_chunk_id_key;
+
+create unique index if not exists idx_agent_raw_chunks_identity
+  on agent_raw_chunks (agent_id, source_file_id, source_generation, chunk_id);
+
+drop index if exists idx_agent_normalized_events_uid;
+
+create unique index if not exists idx_agent_normalized_events_uid
+  on agent_normalized_events (agent_id, source_file_id, source_generation, event_uid)
+  where event_uid is not null;
+
+create index if not exists idx_agent_raw_chunks_storage_key
+  on agent_raw_chunks (raw_storage_key)
+  where raw_storage_key is not null;
+
+create index if not exists idx_agent_source_files_raw_storage_key
+  on agent_source_files (raw_storage_key)
+  where raw_storage_key is not null;
+`.trim(),
+  },
 ];
 
 export function migrationsEnabled(env = process.env) {

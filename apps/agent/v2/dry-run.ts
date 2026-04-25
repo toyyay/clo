@@ -4,6 +4,7 @@ import { readAppendJsonl } from "./cursor";
 import { defaultSyncRoots, scanInventory } from "./inventory";
 import { DEFAULT_SYNC_POLICY, fetchServerSyncPolicy } from "./policy";
 import { planUploadChunks } from "./planner";
+import { parseRootSpec } from "./roots";
 import { identityForAgentV2, loadAgentV2State, saveAgentV2State } from "./state";
 import type { ProviderKind, SyncRootConfig, TailBatch } from "./types";
 
@@ -105,7 +106,7 @@ function parseDryRunArgs(argv: string[]): AgentV2DryRunOptions {
   for (let i = 0; i < argv.length; i++) {
     const value = argv[i];
     if (value === "--root") {
-      const parsed = parseRoot(argv[++i]);
+      const parsed = parseRootSpec(argv[++i]);
       if (parsed) roots.push(parsed);
     } else if (value === "--state") {
       statePath = argv[++i] ?? statePath;
@@ -131,17 +132,6 @@ function parseDryRunArgs(argv: string[]): AgentV2DryRunOptions {
     fetchPolicy,
     persistState,
   };
-}
-
-function parseRoot(value: string | undefined): SyncRootConfig | undefined {
-  if (!value) return undefined;
-  const separator = value.includes("=") ? "=" : ":";
-  const [provider, ...pathParts] = value.split(separator);
-  const rootPath = pathParts.join(separator);
-  if ((provider === "claude" || provider === "codex" || provider === "gemini") && rootPath) {
-    return { provider, rootPath };
-  }
-  return undefined;
 }
 
 function positiveInteger(value: string | undefined) {

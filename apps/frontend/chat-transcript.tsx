@@ -408,6 +408,7 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     restoredScrollKey.current = null;
     previousItemsLength.current = 0;
     setRange({ start: 0, end: 0, top: 0, bottom: 0 });
+    setShowBottom(false);
     setMeasureVersion((version) => version + 1);
   }, [cancelScrollFrame, resetKey]);
 
@@ -415,6 +416,7 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     if (!items.length) {
       previousItemsLength.current = 0;
       setRange({ start: 0, end: 0, top: 0, bottom: 0 });
+      setShowBottom(false);
       return;
     }
     const wasNearBottom = nearBottom.current;

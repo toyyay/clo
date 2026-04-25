@@ -33,6 +33,7 @@ services:
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-3-flash-preview}
       OPENROUTER_REASONING_EFFORT: ${OPENROUTER_REASONING_EFFORT:-medium}
       DATA_DIR: /data
+      SYNC_RAW_STORAGE: ${SYNC_RAW_STORAGE:-filesystem}
       PORT: "3737"
     volumes:
       - type: bind

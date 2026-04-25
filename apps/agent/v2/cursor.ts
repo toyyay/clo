@@ -25,7 +25,9 @@ export async function readAppendJsonl(
     return {
       file,
       records: [],
-      nextCursor: cursorWithStat(cursor.offset, cursor.lineNo, fileStat, cursor.tailSha256),
+      rawStartOffset: cursor.offset,
+      rawBytes: new Uint8Array(),
+      nextCursor: cursorWithStat(cursor.offset, cursor.lineNo, fileStat, cursor.tailSha256, cursor.generation),
       truncated: fileStat.size < cursor.offset,
       reset,
     };
@@ -44,7 +46,9 @@ export async function readAppendJsonl(
     return {
       file,
       records: [],
-      nextCursor: cursorWithStat(cursor.offset, cursor.lineNo, fileStat, cursor.tailSha256),
+      rawStartOffset: cursor.offset,
+      rawBytes: new Uint8Array(),
+      nextCursor: cursorWithStat(cursor.offset, cursor.lineNo, fileStat, cursor.tailSha256, cursor.generation),
       truncated: false,
       reset,
     };
@@ -76,6 +80,8 @@ export async function readAppendJsonl(
   return {
     file,
     records,
+    rawStartOffset: cursor.offset,
+    rawBytes: new Uint8Array(complete),
     nextCursor: cursorWithStat(
       cursor.offset + complete.length,
       lineNo,

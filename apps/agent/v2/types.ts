@@ -67,6 +67,8 @@ export type TailRecord = {
 export type TailBatch = {
   file: InventoryFile;
   records: TailRecord[];
+  rawStartOffset: number;
+  rawBytes: Uint8Array;
   nextCursor: AppendJsonlCursor;
   truncated: boolean;
   reset: boolean;
@@ -74,15 +76,19 @@ export type TailBatch = {
 
 export type UploadChunk = {
   chunkId: string;
+  generation: number;
   provider: ProviderKind;
   sourcePath: string;
   relativePath: string;
   logicalId: string;
+  sizeBytes: number;
+  mtimeMs: number;
   startOffset: number;
   endOffset: number;
   startLine: number;
   endLine: number;
   byteLength: number;
+  rawText: string;
   records: TailRecord[];
 };
 

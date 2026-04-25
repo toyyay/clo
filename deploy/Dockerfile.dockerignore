@@ -4,6 +4,7 @@
 node_modules
 dist
 deploy/.env
+deploy/data
 deploy/pgdata
 *.dump
 *.tar

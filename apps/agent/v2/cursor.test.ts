@@ -51,6 +51,9 @@ describe("agent-v2 append_jsonl cursor", () => {
     expect(second.reset).toBe(true);
     expect(second.nextCursor.generation).toBe(2);
     expect(second.records.map((record) => record.rawLine)).toEqual(["{\"n\":9}", "{\"n\":10}"]);
+
+    const unchanged = await readAppendJsonl(rewrittenFile, second.nextCursor, { readChunkBytes: 1024 });
+    expect(unchanged.nextCursor.generation).toBe(2);
   });
 });
 

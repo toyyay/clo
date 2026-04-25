@@ -7,7 +7,6 @@ import type {
   ImportedAudioInfo,
   SessionEvent,
   SessionInfo,
-  SessionPayload,
 } from "../../packages/shared/types";
 import {
   clearBrowserCaches,
@@ -47,7 +46,7 @@ import {
 import { flatten, groupItems, VirtualChat } from "./chat-transcript";
 import { flushClientLogs, installClientLogHandlers, logClientEvent } from "./client-logs";
 import { parseRoute, useRoute, type RoutePanel } from "./router";
-import { pullUpdates, SyncAuthError } from "./sync";
+import { fetchSessionEvents, fetchSessionMetadata, pullUpdates, SyncAuthError } from "./sync";
 import {
   docIdForSession,
   getDraft,
@@ -66,6 +65,8 @@ type SyncState = "loading" | "syncing" | "idle" | "offline" | "error";
 type AuthState = "checking" | "authenticated" | "anonymous";
 type EventState = { sessionId: string | null; events: SessionEvent[] };
 type SyncNowOptions = { silent?: boolean; metadataOnly?: boolean };
+
+const SIDEBAR_SESSION_PAGE_SIZE = 80;
 
 function formatBytes(value?: number | null) {
   if (!value) return "0 B";
@@ -139,11 +140,6 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
       },
     );
   });
-}
-
-async function fetchServerShell() {
-  const [hosts, sessions] = await Promise.all([fetchJson<HostInfo[]>("/api/hosts"), fetchJson<SessionInfo[]>("/api/sessions")]);
-  return { hosts, sessions };
 }
 
 function ModalFrame({
@@ -312,6 +308,7 @@ export function App() {
   const [active, setActive] = useState<SessionInfo | null>(null);
   const [eventState, setEventState] = useState<EventState>({ sessionId: null, events: [] });
   const [query, setQuery] = useState("");
+  const [visibleSessionLimit, setVisibleSessionLimit] = useState(SIDEBAR_SESSION_PAGE_SIZE);
   const [syncState, setSyncState] = useState<SyncState>("loading");
   const [statusText, setStatusText] = useState("Loading cache");
   const [theme, setTheme] = useState<"light" | "dark">("light");
@@ -346,6 +343,7 @@ export function App() {
   const recordingChunkWritesRef = useRef<Promise<void>[]>([]);
   const recordingTimerRef = useRef<number | null>(null);
   const activeRef = useRef<SessionInfo | null>(null);
+  const eventStateRef = useRef<EventState>({ sessionId: null, events: [] });
   const sessionsRef = useRef<SessionInfo[]>([]);
   const activeYDocId = useRef<string | null>(null);
   const yDocs = useRef(new Map<string, Y.Doc>());
@@ -835,7 +833,7 @@ export function App() {
     [activeId, closePanel, draft],
   );
 
-  const refreshCache = useCallback(async () => {
+  const refreshCache = useCallback(async (options: { apply?: boolean } = {}) => {
     const started = performance.now();
     const slowTimer = window.setTimeout(() => {
       void logClientEvent(
@@ -848,8 +846,10 @@ export function App() {
     }, 2500);
     try {
       const [nextHosts, nextSessions] = await Promise.all([loadHosts(), loadSessions()]);
-      setHosts((current) => (sameEntityList(current, nextHosts, (host) => host.agentId) ? current : nextHosts));
-      setSessions((current) => (sameEntityList(current, nextSessions, (session) => session.id) ? current : nextSessions));
+      if (options.apply !== false) {
+        setHosts((current) => (sameEntityList(current, nextHosts, (host) => host.agentId) ? current : nextHosts));
+        setSessions((current) => (sameEntityList(current, nextSessions, (session) => session.id) ? current : nextSessions));
+      }
       const durationMs = Math.round(performance.now() - started);
       if (durationMs > 500 || nextHosts.length || nextSessions.length) {
         void logClientEvent(
@@ -879,7 +879,7 @@ export function App() {
     if (!isAuthenticated) return;
     if (syncing.current) return;
     const silent = options.silent === true;
-    const metadataOnly = options.metadataOnly === true;
+    const metadataOnly = options.metadataOnly !== false;
     syncing.current = true;
     const started = performance.now();
     if (!silent) {
@@ -919,11 +919,18 @@ export function App() {
               { durationMs: Math.round(performance.now() - started) },
               ["cache", "sync"],
             ).catch(() => {});
-            const shell = await fetchServerShell();
+            const shell = await fetchSessionMetadata();
             setHosts((current) => (sameEntityList(current, shell.hosts, (host) => host.agentId) ? current : shell.hosts));
             setSessions((current) => (sameEntityList(current, shell.sessions, (session) => session.id) ? current : shell.sessions));
             void cacheShell(shell.hosts, shell.sessions).catch(() => {});
             refreshedSessions = shell.sessions;
+            void logClientEvent(
+              "info",
+              "read.metadata.fallback.complete",
+              null,
+              { source: shell.source, hosts: shell.hosts.length, sessions: shell.sessions.length },
+              ["read", "cache", "sync"],
+            ).catch(() => {});
           }
         } else {
           refreshedSessions = (await refreshCache()).sessions;
@@ -1121,7 +1128,7 @@ export function App() {
         ["cache", "startup"],
       ).catch(() => {});
     }, 20000);
-    withTimeout(refreshCache(), 1200, "browser cache hydrate timed out")
+    withTimeout(refreshCache({ apply: false }), 1200, "browser cache hydrate timed out")
       .catch(async (error) => {
         if (disposed) throw error;
         setStatusText("Loading latest chat list");
@@ -1129,10 +1136,10 @@ export function App() {
           "warn",
           "cache.initial_hydrate.fallback",
           error instanceof Error ? error.message : String(error),
-          { durationMs: Math.round(performance.now() - started), fallback: "server-shell" },
+          { durationMs: Math.round(performance.now() - started), fallback: "read-api-metadata" },
           ["cache", "startup"],
         ).catch(() => {});
-        const shell = await fetchServerShell();
+        const shell = await fetchSessionMetadata();
         if (disposed) return shell;
         setHosts((current) => (sameEntityList(current, shell.hosts, (host) => host.agentId) ? current : shell.hosts));
         setSessions((current) => (sameEntityList(current, shell.sessions, (session) => session.id) ? current : shell.sessions));
@@ -1150,11 +1157,18 @@ export function App() {
       .then((shell) => {
         if (disposed) return;
         window.clearTimeout(stuckTimer);
+        setHosts((current) => (sameEntityList(current, shell.hosts, (host) => host.agentId) ? current : shell.hosts));
+        setSessions((current) => (sameEntityList(current, shell.sessions, (session) => session.id) ? current : shell.sessions));
         void logClientEvent(
           "info",
           "cache.initial_hydrate.complete",
           null,
-          { durationMs: Math.round(performance.now() - started), hosts: shell.hosts.length, sessions: shell.sessions.length },
+          {
+            durationMs: Math.round(performance.now() - started),
+            hosts: shell.hosts.length,
+            sessions: shell.sessions.length,
+            readSource: "source" in shell ? shell.source : "indexeddb",
+          },
           ["cache", "startup"],
         ).catch(() => {});
         void syncNow({ silent: true, metadataOnly: true });
@@ -1175,6 +1189,10 @@ export function App() {
   useEffect(() => {
     activeRef.current = active;
   }, [active]);
+
+  useEffect(() => {
+    eventStateRef.current = eventState;
+  }, [eventState]);
 
   useEffect(() => {
     sessionsRef.current = sessions;
@@ -1272,25 +1290,81 @@ export function App() {
       })
       .then(async (cachedEvents) => {
         if (disposed || activeRef.current?.id !== loadForSessionId) return;
-        if (cachedEvents.length) setSessionEvents(loadForSessionId, cachedEvents);
+        const currentEvents = eventStateRef.current;
+        const hasLiveEvents = currentEvents.sessionId === loadForSessionId && currentEvents.events.length > 0;
+        if (cachedEvents.length && !hasLiveEvents) setSessionEvents(loadForSessionId, cachedEvents);
         const expectedEvents = activeRef.current?.eventCount ?? 0;
-        if (cachedEvents.length >= expectedEvents && expectedEvents > 0) return;
-
-        const payload = await fetchJson<SessionPayload>(`/api/session?id=${encodeURIComponent(loadForSessionId)}`);
-        if (disposed || activeRef.current?.id !== loadForSessionId) return;
-        setActiveSession(payload.session);
-        setSessionEvents(loadForSessionId, payload.events);
-        void cacheSessionPayload(payload).catch((cacheError) => {
+        if (hasLiveEvents && currentEvents.events.length >= expectedEvents && expectedEvents > 0) {
+          return;
+        }
+        if (cachedEvents.length >= expectedEvents && expectedEvents > 0) {
           void logClientEvent(
-            "warn",
-            "cache.session_write.failed",
-            cacheError instanceof Error ? cacheError.message : String(cacheError),
-            { sessionId: loadForSessionId, events: payload.events.length, error: cacheError },
-            ["cache", "session"],
+            "debug",
+            "read.session_events.cache_hit",
+            null,
+            { sessionId: loadForSessionId, cachedEvents: cachedEvents.length, expectedEvents },
+            ["read", "cache", "session"],
           ).catch(() => {});
-        });
+          return;
+        }
+        if (navigator.onLine === false) {
+          void logClientEvent(
+            "info",
+            "read.session_events.offline_cache",
+            null,
+            { sessionId: loadForSessionId, cachedEvents: cachedEvents.length, expectedEvents },
+            ["read", "cache", "session"],
+          ).catch(() => {});
+          return;
+        }
+
+        const readStarted = performance.now();
+        void logClientEvent(
+          "debug",
+          "read.session_events.start",
+          null,
+          { sessionId: loadForSessionId, cachedEvents: cachedEvents.length, expectedEvents },
+          ["read", "session"],
+        ).catch(() => {});
+        const payload = await fetchSessionEvents(loadForSessionId);
+        if (disposed || activeRef.current?.id !== loadForSessionId) return;
+        const sessionForCache = payload.session ?? activeRef.current;
+        if (payload.session) setActiveSession(payload.session);
+        setSessionEvents(loadForSessionId, payload.events);
+        if (sessionForCache) {
+          void cacheSessionPayload({ session: sessionForCache, events: payload.events }).catch((cacheError) => {
+            void logClientEvent(
+              "warn",
+              "cache.session_write.failed",
+              cacheError instanceof Error ? cacheError.message : String(cacheError),
+              { sessionId: loadForSessionId, events: payload.events.length, error: cacheError },
+              ["cache", "session"],
+            ).catch(() => {});
+          });
+        }
+        void logClientEvent(
+          "info",
+          "read.session_events.complete",
+          null,
+          {
+            sessionId: loadForSessionId,
+            source: payload.source,
+            events: payload.events.length,
+            durationMs: Math.round(performance.now() - readStarted),
+          },
+          ["read", "session"],
+        ).catch(() => {});
       })
-      .catch((error) => console.error(error));
+      .catch((error) => {
+        void logClientEvent(
+          "error",
+          "read.session_events.failed",
+          error instanceof Error ? error.message : String(error),
+          { sessionId: loadForSessionId, error },
+          ["read", "session"],
+        ).catch(() => {});
+        console.error(error);
+      });
     return () => {
       disposed = true;
     };
@@ -1362,11 +1436,23 @@ export function App() {
     });
   }, [activeHost, query, sessions]);
 
+  useEffect(() => {
+    setVisibleSessionLimit(SIDEBAR_SESSION_PAGE_SIZE);
+  }, [activeHost, query]);
+
+  const visibleSessions = useMemo(() => {
+    const visible = filteredSessions.slice(0, visibleSessionLimit);
+    const activeSession = active ? filteredSessions.find((session) => session.id === active.id) : undefined;
+    if (!activeSession || visible.some((session) => session.id === activeSession.id)) return visible;
+    return [activeSession, ...visible];
+  }, [active, filteredSessions, visibleSessionLimit]);
+
+  const hiddenSessionCount = Math.max(0, filteredSessions.length - visibleSessions.length);
   const items = useMemo(() => groupItems(flatten(events)), [events]);
   const yDocIdsToKeepWarm = useMemo(() => sessions.slice(0, 20).map((session) => docIdForSession(session.id)), [sessions]);
   const groupedSessions = useMemo(() => {
     const grouped = new Map<string, SessionInfo[]>();
-    for (const session of filteredSessions) {
+    for (const session of visibleSessions) {
       const key = session.projectName || session.projectKey || "unknown";
       const list = grouped.get(key) ?? [];
       list.push(session);
@@ -1375,7 +1461,7 @@ export function App() {
     const lastSeen = (list: SessionInfo[]) =>
       list.reduce((acc, s) => (s.lastSeenAt > acc ? s.lastSeenAt : acc), "");
     return [...grouped.entries()].sort(([, a], [, b]) => lastSeen(b).localeCompare(lastSeen(a)));
-  }, [filteredSessions]);
+  }, [visibleSessions]);
 
   const selectSession = useCallback((session: SessionInfo) => {
     setActiveSession(session);
@@ -1518,6 +1604,19 @@ export function App() {
                 ))}
               </div>
             ))}
+            {hiddenSessionCount > 0 && (
+              <div className="session-group">
+                <div className="session-group-head">
+                  Showing {visibleSessions.length.toLocaleString()} of {filteredSessions.length.toLocaleString()}
+                </div>
+                <button
+                  className="icon-button compact-button"
+                  onClick={() => setVisibleSessionLimit((limit) => limit + SIDEBAR_SESSION_PAGE_SIZE)}
+                >
+                  Load more
+                </button>
+              </div>
+            )}
           </div>
         </aside>
 
