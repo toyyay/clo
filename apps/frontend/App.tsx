@@ -699,6 +699,8 @@ export function App() {
         window.clearTimeout(stuckTimer);
         setHosts((current) => (sameEntityList(current, shell.hosts, (host) => host.agentId) ? current : shell.hosts));
         setSessions((current) => (sameEntityList(current, shell.sessions, (session) => session.id) ? current : shell.sessions));
+        setSyncState("idle");
+        setStatusText(shell.sessions.length ? `Loaded ${shell.sessions.length.toLocaleString()} chats` : "No cached chats yet");
         void logClientEvent(
           "info",
           "cache.initial_hydrate.complete",
