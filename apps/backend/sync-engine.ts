@@ -990,7 +990,7 @@ function stringField(object: Record<string, unknown>, key: string, options: { ma
 function optionalString(value: unknown, options: { max: number }) {
   if (value == null) return null;
   if (typeof value !== "string") throw new SyncEngineHttpError(400, "expected string value");
-  const trimmed = value.trim();
+  const trimmed = sanitizePostgresString(value).trim();
   if (!trimmed) return null;
   if (trimmed.length > options.max) throw new SyncEngineHttpError(400, "string value too long");
   return trimmed;
@@ -1056,7 +1056,7 @@ function limitMetadata(value: Record<string, unknown>, label: string, max = sync
 
 function redactValue(value: unknown, path: string, seen: Set<object>): unknown {
   if (typeof value === "string") {
-    return value.replace(bearerPattern, "Bearer <redacted>").replace(longSecretPattern, "<redacted>");
+    return sanitizePostgresString(value).replace(bearerPattern, "Bearer <redacted>").replace(longSecretPattern, "<redacted>");
   }
 
   if (Array.isArray(value)) return value.slice(0, 200).map((item, index) => redactValue(item, `${path}[${index}]`, seen));
@@ -1067,15 +1067,22 @@ function redactValue(value: unknown, path: string, seen: Set<object>): unknown {
 
   const output: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value).slice(0, 200)) {
-    const safeKey = sensitiveKeyPattern.test(key) ? `redacted_key_${sha256Hex(Buffer.from(key, "utf8")).slice(0, 12)}` : key;
-    if (sensitiveKeyPattern.test(key)) {
+    const keyWithoutNul = sanitizePostgresString(key);
+    const safeKey = sensitiveKeyPattern.test(keyWithoutNul)
+      ? `redacted_key_${sha256Hex(Buffer.from(keyWithoutNul, "utf8")).slice(0, 12)}`
+      : keyWithoutNul;
+    if (sensitiveKeyPattern.test(keyWithoutNul)) {
       output[safeKey] = "<redacted>";
     } else {
-      output[safeKey] = redactValue(child, `${path}.${key}`, seen);
+      output[safeKey] = redactValue(child, `${path}.${keyWithoutNul}`, seen);
     }
   }
   seen.delete(value);
   return output;
+}
+
+function sanitizePostgresString(value: string) {
+  return value.replace(/\u0000/g, "<nul>");
 }
 
 function sha256Hex(bytes: Uint8Array) {

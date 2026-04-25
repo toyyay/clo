@@ -266,6 +266,38 @@ describe("sync engine helpers", () => {
     expect(event.normalized.parts).toEqual([{ kind: "thinking", text: "safe summary" }]);
   });
 
+  test("scrubs null bytes from jsonb-bound normalized payloads", () => {
+    const result = validateAppendPayload({
+      agent,
+      source: {
+        provider: "codex",
+        sourcePath: "/Users/example/.codex/sessions/nul.jsonl",
+      },
+      chunks: [
+        {
+          chunkId: "chunk-nul",
+          events: [
+            {
+              eventUid: "event-nul",
+              eventType: "message",
+              role: "user",
+              normalized: {
+                kind: "message",
+                role: "user",
+                parts: [{ kind: "text", text: "before\u0000after" }],
+                source: { rawKind: "message\u0000item" },
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const event = result.chunks[0].events[0];
+    expect(event.normalized.parts).toEqual([{ kind: "text", text: "before<nul>after" }]);
+    expect(event.normalized.source).toEqual({ rawKind: "message<nul>item" });
+  });
+
   test("validation errors carry http status", () => {
     try {
       validateHelloPayload({ agent: {} });
