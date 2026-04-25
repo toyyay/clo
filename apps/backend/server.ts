@@ -2195,7 +2195,7 @@ async function listMetadataChangeKeys(cursor: MetadataChangeKey, limit: number):
   return rows.map((row: any) => ({
     kind: row.kind,
     id: String(row.row_id),
-    at: String(row.changed_at),
+    at: metadataTimestampString(row.changed_at),
   }));
 }
 
@@ -2218,7 +2218,7 @@ async function currentMetadataCursor() {
     limit 1
   `;
   if (!rows.length) return formatMetadataCursor(initialMetadataCursor());
-  return formatMetadataCursor({ kind: rows[0].kind, id: String(rows[0].row_id), at: String(rows[0].changed_at) });
+  return formatMetadataCursor({ kind: rows[0].kind, id: String(rows[0].row_id), at: metadataTimestampString(rows[0].changed_at) });
 }
 
 function initialMetadataCursor(): MetadataChangeKey {
@@ -2239,6 +2239,11 @@ function parseMetadataCursor(value: string | undefined): MetadataChangeKey | nul
   } catch {
     return null;
   }
+}
+
+function metadataTimestampString(value: unknown) {
+  if (value instanceof Date) return value.toISOString();
+  return String(value);
 }
 
 function formatMetadataCursor(cursor: MetadataChangeKey) {
