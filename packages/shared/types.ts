@@ -179,7 +179,36 @@ export type AppSettingsInfo = {
   shortcutUploadPath: string;
   importTokens: ImportTokenInfo[];
   openRouter: OpenRouterStatusInfo;
+  transcriptionModels: OpenRouterModelOption[];
+  reasoningEfforts: OpenRouterReasoningEffort[];
 };
+
+export type OpenRouterModelOption = {
+  id: string;
+  label: string;
+  description: string;
+};
+
+export const OPENROUTER_TRANSCRIPTION_MODELS = [
+  {
+    id: "google/gemini-3.1-pro-preview",
+    label: "Gemini 3.1 Pro",
+    description: "Best quality",
+  },
+  {
+    id: "google/gemini-3-flash-preview",
+    label: "Gemini 3 Flash",
+    description: "Fast default",
+  },
+  {
+    id: "google/gemini-3.1-flash-lite-preview",
+    label: "Gemini 3.1 Flash Lite",
+    description: "Cheaper retry",
+  },
+] as const satisfies OpenRouterModelOption[];
+
+export const OPENROUTER_REASONING_EFFORTS = ["low", "medium", "high"] as const;
+export type OpenRouterReasoningEffort = (typeof OPENROUTER_REASONING_EFFORTS)[number];
 
 export type OpenRouterStatusInfo = {
   configured: boolean;

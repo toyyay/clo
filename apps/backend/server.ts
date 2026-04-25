@@ -24,6 +24,11 @@ import type {
   YjsSyncResponse,
   OpenRouterStatusInfo,
 } from "../../packages/shared/types";
+import {
+  OPENROUTER_REASONING_EFFORTS,
+  OPENROUTER_TRANSCRIPTION_MODELS,
+  type OpenRouterReasoningEffort,
+} from "../../packages/shared/types";
 import { downloadAgentArchiveResponse } from "./agent-download";
 import { envFlag, envPositiveInteger, envValue } from "../../packages/shared/env";
 import { prepareDatabase, sql, toId, toNumber } from "./db";
@@ -34,8 +39,8 @@ const agentToken = envValue(process.env, "AGENT_TOKEN", "CHATVIEW_AGENT_TOKEN") 
 const webToken = envValue(process.env, "WEB_TOKEN", "CHATVIEW_WEB_TOKEN") ?? "";
 const importStoreBody = envFlag(process.env, ["IMPORT_STORE_BODY", "CHATVIEW_IMPORT_STORE_BODY"]);
 const openRouterApiKey = envValue(process.env, "OPENROUTER_API_KEY");
-const openRouterModel = envValue(process.env, "OPENROUTER_MODEL") ?? "google/gemini-3-flash-preview";
-const openRouterReasoningEffort = envValue(process.env, "OPENROUTER_REASONING_EFFORT") ?? "medium";
+const openRouterModel = normalizeTranscriptionModel(envValue(process.env, "OPENROUTER_MODEL"));
+const openRouterReasoningEffort = normalizeReasoningEffort(envValue(process.env, "OPENROUTER_REASONING_EFFORT"));
 const openRouterEndpoint = envValue(process.env, "OPENROUTER_ENDPOINT") ?? "https://openrouter.ai/api/v1/chat/completions";
 const openRouterKeyEndpoint = envValue(process.env, "OPENROUTER_KEY_ENDPOINT") ?? "https://openrouter.ai/api/v1/key";
 const ffmpegBin = envValue(process.env, "FFMPEG_BIN") ?? "ffmpeg";
@@ -176,17 +181,31 @@ Bun.serve<{ docIds: Set<string> }>({
     "/api/imports/audio": async (req: Request) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;
-      if (req.method !== "GET") return text("method not allowed", 405);
-      return json(await listImportedAudio());
+      if (req.method === "GET") return json(await listImportedAudio());
+      if (req.method === "DELETE") return deleteImportedAudio(req);
+      return text("method not allowed", 405);
+    },
+    "/api/imports/audio/upload": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      if (req.method !== "POST") return text("method not allowed", 405);
+      return handleAuthenticatedAudioUpload(req);
     },
     "/api/imports/audio/transcriptions": async (req: Request) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;
       if (req.method !== "POST") return text("method not allowed", 405);
       try {
-        const body = (await req.json().catch(() => ({}))) as { mediaId?: unknown };
+        const body = (await req.json().catch(() => ({}))) as {
+          mediaId?: unknown;
+          model?: unknown;
+          reasoningEffort?: unknown;
+        };
         if (typeof body.mediaId !== "string" && typeof body.mediaId !== "number") return text("missing mediaId", 400);
-        const transcription = await createAudioTranscription(String(body.mediaId), "manual");
+        const transcription = await createAudioTranscription(String(body.mediaId), "manual", {
+          model: requestedTranscriptionModel(body.model),
+          reasoningEffort: requestedReasoningEffort(body.reasoningEffort),
+        });
         enqueueAudioTranscription(transcription.id);
         return json(transcription, 202);
       } catch (error) {
@@ -478,6 +497,8 @@ async function getAppSettings(req: Request): Promise<AppSettingsInfo> {
       shortcutUrl: makeImportUrl(origin, "/api/shortcuts/audio", row.token),
     })),
     openRouter: openRouterStatus,
+    transcriptionModels: [...OPENROUTER_TRANSCRIPTION_MODELS],
+    reasoningEfforts: [...OPENROUTER_REASONING_EFFORTS],
   };
 }
 
@@ -592,19 +613,59 @@ async function getImportedMediaFile(req: Request) {
   return new Response(Buffer.from(toBytes(row.bytes)), { headers });
 }
 
+async function handleAuthenticatedAudioUpload(req: Request) {
+  const url = new URL(req.url);
+  const rawBody = Buffer.from(await req.clone().arrayBuffer());
+  const requestId = await createImportRequestLog(req, url, rawBody, null, null);
+
+  try {
+    const result = await ingestImportMedia(req, rawBody, requestId);
+    return finishImportResponse(requestId, { ok: true, requestId, ...result }, 200);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "audio upload failed";
+    return finishImportResponse(requestId, { ok: false, requestId, error: message }, 500);
+  }
+}
+
+async function deleteImportedAudio(req: Request) {
+  const url = new URL(req.url);
+  let mediaId: unknown = url.searchParams.get("id") ?? url.searchParams.get("mediaId");
+  if (!mediaId) {
+    const body = (await req.json().catch(() => ({}))) as { id?: unknown; mediaId?: unknown };
+    mediaId = body.mediaId ?? body.id;
+  }
+  if (typeof mediaId !== "string" && typeof mediaId !== "number") return text("missing mediaId", 400);
+
+  const rows = await sql`
+    delete from import_media_blobs
+    where id = ${String(mediaId)}
+      and media_kind = 'audio'
+    returning id
+  `;
+  if (!rows.length) return text("audio media not found", 404);
+  return json({ ok: true, mediaId: toId(rows[0].id) });
+}
+
 async function ensureAutoAudioTranscription(mediaId: string): Promise<AudioTranscriptionInfo | null> {
   const existing = await sql`
     select id
     from import_media_transcriptions
     where media_id = ${mediaId}
       and source = 'auto'
+      and status in ('queued', 'processing', 'completed')
     limit 1
   `;
   if (existing.length) return null;
   return createAudioTranscription(mediaId, "auto");
 }
 
-async function createAudioTranscription(mediaId: string, source: "auto" | "manual"): Promise<AudioTranscriptionInfo> {
+async function createAudioTranscription(
+  mediaId: string,
+  source: "auto" | "manual",
+  options: { model?: string; reasoningEffort?: string } = {},
+): Promise<AudioTranscriptionInfo> {
+  const model = requestedTranscriptionModel(options.model);
+  const reasoningEffort = requestedReasoningEffort(options.reasoningEffort);
   const mediaRows = await sql`
     select id
     from import_media_blobs
@@ -625,8 +686,8 @@ async function createAudioTranscription(mediaId: string, source: "auto" | "manua
       ${mediaId},
       ${source},
       'queued',
-      ${openRouterModel},
-      ${openRouterReasoningEffort}
+      ${model},
+      ${reasoningEffort}
     )
     returning id, status, source, model, reasoning_effort, transcript, error, created_at, started_at, completed_at
   `;
@@ -920,8 +981,32 @@ async function transcribeWithOpenRouter(input: OpenRouterTranscriptionRequest): 
   }
 }
 
-function normalizeReasoningEffort(value: string) {
-  return ["minimal", "low", "medium", "high"].includes(value) ? value : "medium";
+function normalizeTranscriptionModel(value?: string | null): string {
+  return OPENROUTER_TRANSCRIPTION_MODELS.some((model) => model.id === value)
+    ? String(value)
+    : "google/gemini-3-flash-preview";
+}
+
+function requestedTranscriptionModel(value: unknown) {
+  if (value === undefined || value === null || value === "") return openRouterModel;
+  if (typeof value !== "string") throw new Error("model must be a string");
+  const model = value.trim();
+  if (OPENROUTER_TRANSCRIPTION_MODELS.some((option) => option.id === model)) return model;
+  throw new Error("unsupported transcription model");
+}
+
+function normalizeReasoningEffort(value?: string | null): OpenRouterReasoningEffort {
+  return OPENROUTER_REASONING_EFFORTS.includes(value as OpenRouterReasoningEffort)
+    ? (value as OpenRouterReasoningEffort)
+    : "medium";
+}
+
+function requestedReasoningEffort(value: unknown): OpenRouterReasoningEffort {
+  if (value === undefined || value === null || value === "") return openRouterReasoningEffort;
+  if (typeof value !== "string") throw new Error("reasoningEffort must be a string");
+  const effort = value.trim();
+  if (OPENROUTER_REASONING_EFFORTS.includes(effort as OpenRouterReasoningEffort)) return effort as OpenRouterReasoningEffort;
+  throw new Error("reasoningEffort must be low, medium, or high");
 }
 
 function assertOpenRouterProcessedAudio(responseJson: any) {
@@ -1005,8 +1090,23 @@ function normalizeStoredTranscript(value: unknown): AudioTranscriptPayload {
 }
 
 function validateStoredTranscript(transcript: AudioTranscriptPayload) {
+  const required = [
+    ["ru.literal", transcript.ru.literal],
+    ["ru.clean", transcript.ru.clean],
+    ["ru.summary", transcript.ru.summary],
+    ["ru.brief", transcript.ru.brief],
+    ["en.literal", transcript.en.literal],
+    ["en.clean", transcript.en.clean],
+    ["en.summary", transcript.en.summary],
+    ["en.brief", transcript.en.brief],
+  ] as const;
+  const missing = required.filter(([, value]) => !value.trim());
+
   if (transcript.ru.literal.trim().length < 3 && transcript.en.literal.trim().length < 3) {
     throw new Error("OpenRouter returned an empty transcript");
+  }
+  if (missing.length) {
+    throw new Error(`OpenRouter returned a malformed transcript: missing ${missing.map(([key]) => key).join(", ")}`);
   }
 }
 

@@ -11,14 +11,22 @@ import type {
 } from "../../packages/shared/types";
 import {
   clearBrowserCaches,
+  appendCachedAudioChunk,
+  createCachedAudioRecording,
+  deleteCachedAudioRecording,
+  finalizeCachedAudioRecording,
+  loadCachedAudioBlob,
+  loadCachedAudioRecordings,
   getMeta,
   loadCacheStats,
   loadHosts,
   loadSessionEvents,
   loadSessions,
+  markCachedAudioRecordingStatus,
   resetIndexedDbCache,
   setMeta,
   unregisterServiceWorkers,
+  type CachedAudioRecording,
   type CacheStats,
 } from "./db";
 import { pullUpdates, SyncAuthError } from "./sync";
@@ -35,6 +43,7 @@ import {
   syncCachedDraftDocs,
   syncDraftDoc,
 } from "./yjs";
+import { OPENROUTER_REASONING_EFFORTS, OPENROUTER_TRANSCRIPTION_MODELS } from "../../packages/shared/types";
 
 type TextPart = { kind: "text"; role: "user" | "assistant"; text: string };
 type ThinkPart = { kind: "thinking"; text: string };
@@ -477,6 +486,14 @@ function renderChatItem(it: RenderItem, i: number) {
 
 type TranscriptLanguage = "ru" | "en";
 type TranscriptLevelKey = keyof AudioTranscriptLevel;
+type AudioRetryOptions = { model: string; reasoningEffort: string };
+type RecordingUiState = {
+  active: boolean;
+  elapsedMs: number;
+  chunkCount: number;
+  mimeType: string;
+  error: string;
+};
 
 const TRANSCRIPT_LEVELS: { key: TranscriptLevelKey; label: string }[] = [
   { key: "literal", label: "Literal" },
@@ -484,6 +501,8 @@ const TRANSCRIPT_LEVELS: { key: TranscriptLevelKey; label: string }[] = [
   { key: "summary", label: "Summary" },
   { key: "brief", label: "Brief" },
 ];
+const FALLBACK_TRANSCRIPTION_MODELS = [...OPENROUTER_TRANSCRIPTION_MODELS];
+const FALLBACK_REASONING_EFFORTS = [...OPENROUTER_REASONING_EFFORTS];
 
 function formatBytes(value?: number | null) {
   if (!value) return "0 B";
@@ -510,6 +529,11 @@ function formatDuration(seconds?: number | null) {
   return `${mins}:${secs}`;
 }
 
+function formatDurationMs(ms?: number | null) {
+  if (!ms || !Number.isFinite(ms)) return "0:00";
+  return formatDuration(Math.max(0, ms / 1000)) || "0:00";
+}
+
 function formatNumber(value?: number | null) {
   return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : "unknown";
 }
@@ -534,6 +558,42 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
 
 function latestTranscription(item: ImportedAudioInfo) {
   return item.transcriptions[0] ?? null;
+}
+
+function transcriptHasContent(transcription?: AudioTranscriptionInfo | null) {
+  const transcript = transcription?.transcript;
+  return Boolean(
+    transcript?.ru.literal?.trim() ||
+      transcript?.ru.clean?.trim() ||
+      transcript?.ru.summary?.trim() ||
+      transcript?.en.literal?.trim() ||
+      transcript?.en.clean?.trim() ||
+      transcript?.en.summary?.trim(),
+  );
+}
+
+function displayTranscription(item: ImportedAudioInfo) {
+  return (
+    item.transcriptions.find((transcription) => transcription.status === "completed" && transcriptHasContent(transcription)) ??
+    latestTranscription(item)
+  );
+}
+
+function chooseRecorderMimeType() {
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+  if (typeof MediaRecorder === "undefined" || !MediaRecorder.isTypeSupported) return "";
+  return candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate)) ?? "";
+}
+
+function extensionForMime(mimeType: string) {
+  if (mimeType.includes("mp4")) return "m4a";
+  if (mimeType.includes("ogg")) return "ogg";
+  if (mimeType.includes("mpeg")) return "mp3";
+  return "webm";
+}
+
+function isAudioLikeFile(file: File) {
+  return file.type.startsWith("audio/") || /\.(m4a|mp3|wav|aac|caf|ogg|opus|webm|mp4|mov)$/i.test(file.name);
 }
 
 function ModalFrame({
@@ -695,9 +755,18 @@ function AudioModal({
   error,
   language,
   busyMediaId,
+  uploadStatus,
+  recording,
+  cachedRecordings,
+  models,
+  reasoningEfforts,
   onLanguage,
   onRefresh,
+  onUploadFiles,
+  onFlushCache,
+  onToggleRecording,
   onRetry,
+  onDelete,
   onInsert,
   onClose,
 }: {
@@ -706,12 +775,30 @@ function AudioModal({
   error: string;
   language: TranscriptLanguage;
   busyMediaId: string;
+  uploadStatus: string;
+  recording: RecordingUiState;
+  cachedRecordings: CachedAudioRecording[];
+  models: AppSettingsInfo["transcriptionModels"];
+  reasoningEfforts: readonly string[];
   onLanguage: (language: TranscriptLanguage) => void;
   onRefresh: () => void;
-  onRetry: (mediaId: string) => void;
+  onUploadFiles: (files: File[]) => void;
+  onFlushCache: () => void;
+  onToggleRecording: () => void;
+  onRetry: (mediaId: string, options: AudioRetryOptions) => void;
+  onDelete: (mediaId: string) => void;
   onInsert: (text: string) => void;
   onClose: () => void;
 }) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const submitFiles = useCallback(
+    (files: FileList | File[]) => {
+      const audioFiles = Array.from(files).filter(isAudioLikeFile);
+      if (audioFiles.length) onUploadFiles(audioFiles);
+    },
+    [onUploadFiles],
+  );
+
   return (
     <ModalFrame title="Audio" onClose={onClose}>
       <div className="audio-toolbar">
@@ -729,6 +816,72 @@ function AudioModal({
       </div>
       <div className="modal-body audio-list">
         {error && <div className="modal-error">{error}</div>}
+        <section
+          className="audio-upload-panel"
+          tabIndex={0}
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={(event) => {
+            event.preventDefault();
+            submitFiles(event.dataTransfer.files);
+          }}
+          onPaste={(event) => submitFiles(event.clipboardData.files)}
+        >
+          <input
+            ref={inputRef}
+            className="hidden-file-input"
+            type="file"
+            accept="audio/*,.m4a,.mp3,.wav,.aac,.caf,.ogg,.opus,.webm,.mp4,.mov"
+            multiple
+            onChange={(event) => {
+              if (event.currentTarget.files) submitFiles(event.currentTarget.files);
+              event.currentTarget.value = "";
+            }}
+          />
+          <div className="audio-upload-main">
+            <div>
+              <div className="audio-title">Upload audio</div>
+              <div className="audio-meta">{uploadStatus || "Drop, paste, or choose files"}</div>
+            </div>
+            <button className="icon-button compact-button" onClick={() => inputRef.current?.click()}>
+              Choose
+            </button>
+          </div>
+        </section>
+
+        <section className="audio-record-panel">
+          <div className="audio-upload-main">
+            <div>
+              <div className="audio-title">{recording.active ? "Recording" : "Browser recording"}</div>
+              <div className="audio-meta">
+                {recording.active
+                  ? `${formatDurationMs(recording.elapsedMs)} / ${recording.chunkCount} chunks`
+                  : cachedRecordings.length
+                    ? `${cachedRecordings.length} cached`
+                    : "Idle"}
+              </div>
+            </div>
+            <button className={`icon-button compact-button ${recording.active ? "danger-button" : ""}`} onClick={onToggleRecording}>
+              {recording.active ? "Stop" : "Record"}
+            </button>
+          </div>
+          {recording.error && <div className="modal-error">{recording.error}</div>}
+          {cachedRecordings.length > 0 && (
+            <div className="audio-cache-list">
+              {cachedRecordings.map((record) => (
+                <div className={`audio-cache-row ${record.status}`} key={record.id}>
+                  <span>
+                    {record.status} / {formatDurationMs(record.durationMs)} / {record.chunkCount} chunks
+                  </span>
+                  {record.error ? <b>{record.error}</b> : <b>{record.filename}</b>}
+                </div>
+              ))}
+              <button className="mini-action" onClick={onFlushCache}>
+                Upload cached
+              </button>
+            </div>
+          )}
+        </section>
+
         {!items.length && !loading && <div className="empty-modal">No uploaded audio yet</div>}
         {items.map((item) => (
           <AudioItem
@@ -736,7 +889,10 @@ function AudioModal({
             item={item}
             language={language}
             busy={busyMediaId === item.id}
-            onRetry={() => onRetry(item.id)}
+            models={models}
+            reasoningEfforts={reasoningEfforts}
+            onRetry={(options) => onRetry(item.id, options)}
+            onDelete={() => onDelete(item.id)}
             onInsert={onInsert}
           />
         ))}
@@ -749,17 +905,31 @@ function AudioItem({
   item,
   language,
   busy,
+  models,
+  reasoningEfforts,
   onRetry,
+  onDelete,
   onInsert,
 }: {
   item: ImportedAudioInfo;
   language: TranscriptLanguage;
   busy: boolean;
-  onRetry: () => void;
+  models: AppSettingsInfo["transcriptionModels"];
+  reasoningEfforts: readonly string[];
+  onRetry: (options: AudioRetryOptions) => void;
+  onDelete: () => void;
   onInsert: (text: string) => void;
 }) {
-  const transcription = latestTranscription(item);
+  const transcription = displayTranscription(item);
+  const latestAttempt = latestTranscription(item);
   const transcript = transcription?.transcript?.[language];
+  const fallbackModel = transcription?.model || models[0]?.id || FALLBACK_TRANSCRIPTION_MODELS[0].id;
+  const fallbackEffort = transcription?.reasoningEffort || reasoningEfforts[1] || "medium";
+  const [model, setModel] = useState(fallbackModel);
+  const [reasoningEffort, setReasoningEffort] = useState(fallbackEffort);
+  const modelOptions = models.some((option) => option.id === model)
+    ? models
+    : [{ id: model, label: model, description: "Current" }, ...models];
   return (
     <article className="audio-item">
       <div className="audio-item-head">
@@ -770,15 +940,48 @@ function AudioItem({
             {formatDuration(item.durationSeconds)}
           </div>
         </div>
-        <button className="icon-button compact-button" onClick={onRetry} disabled={busy}>
-          {busy ? "Queued" : "Retry"}
-        </button>
+        <div className="audio-actions">
+          <button className="icon-button compact-button" onClick={() => onRetry({ model, reasoningEffort })} disabled={busy}>
+            {busy ? "Queued" : "Retry"}
+          </button>
+          <button className="icon-button compact-button danger-button" onClick={onDelete} disabled={busy}>
+            Delete
+          </button>
+        </div>
+      </div>
+      <div className="audio-retry-controls">
+        <label>
+          <span>Model</span>
+          <select value={model} onChange={(event) => setModel(event.currentTarget.value)}>
+            {modelOptions.map((option) => (
+              <option key={option.id} value={option.id}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Effort</span>
+          <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.currentTarget.value)}>
+            {reasoningEfforts.map((effort) => (
+              <option key={effort} value={effort}>
+                {effort}
+              </option>
+            ))}
+          </select>
+        </label>
       </div>
       <audio controls preload="none" src={`/api/imports/media/file?id=${encodeURIComponent(item.id)}`} />
+      {latestAttempt && latestAttempt.id !== transcription?.id && (
+        <div className={`transcription-attempt ${latestAttempt.status}`}>
+          Latest attempt: {latestAttempt.status} / {latestAttempt.model}
+          {latestAttempt.error ? ` / ${latestAttempt.error}` : ""}
+        </div>
+      )}
       {transcription ? (
         <div className={`transcription ${transcription.status}`}>
           <div className="transcription-status">
-            {transcription.status} / {transcription.model}
+            {transcription.status} / {transcription.model} / {transcription.reasoningEffort}
           </div>
           {transcription.error && <div className="modal-error">{transcription.error}</div>}
           {transcript &&
@@ -831,7 +1034,25 @@ export function App() {
   const [audioError, setAudioError] = useState("");
   const [audioLanguage, setAudioLanguage] = useState<TranscriptLanguage>("ru");
   const [audioRetryingId, setAudioRetryingId] = useState("");
+  const [audioUploadStatus, setAudioUploadStatus] = useState("");
+  const [cachedAudioRecordings, setCachedAudioRecordings] = useState<CachedAudioRecording[]>([]);
+  const [recordingState, setRecordingState] = useState<RecordingUiState>({
+    active: false,
+    elapsedMs: 0,
+    chunkCount: 0,
+    mimeType: "",
+    error: "",
+  });
   const syncing = useRef(false);
+  const cachedAudioUploadRunning = useRef(false);
+  const cachedAudioRecoveryStarted = useRef(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const recordingIdRef = useRef<string | null>(null);
+  const recordingStartedAtRef = useRef(0);
+  const recordingChunkIndexRef = useRef(0);
+  const recordingChunkWritesRef = useRef<Promise<void>[]>([]);
+  const recordingTimerRef = useRef<number | null>(null);
   const activeRef = useRef<SessionInfo | null>(null);
   const activeYDocId = useRef<string | null>(null);
   const yDocs = useRef(new Map<string, Y.Doc>());
@@ -896,6 +1117,7 @@ export function App() {
     setActive(null);
     setEvents([]);
     setDraft("");
+    cachedAudioRecoveryStarted.current = false;
     setAuthState("anonymous");
   }, []);
 
@@ -963,6 +1185,7 @@ export function App() {
       setEvents([]);
       setActive(null);
       setDraft("");
+      setCachedAudioRecordings([]);
       await refreshSettings();
       setSettingsMessage("IndexedDB cache reset");
     } catch (error) {
@@ -1012,15 +1235,198 @@ export function App() {
     }
   }, []);
 
+  const refreshCachedAudioRecordings = useCallback(async () => {
+    try {
+      setCachedAudioRecordings(await loadCachedAudioRecordings());
+    } catch (error) {
+      setAudioError(error instanceof Error ? error.message : "Could not load cached recordings");
+    }
+  }, []);
+
+  const uploadAudioFiles = useCallback(
+    async (files: File[]) => {
+      const audioFiles = files.filter(isAudioLikeFile);
+      if (!audioFiles.length) {
+        setAudioUploadStatus("No audio files selected");
+        return;
+      }
+
+      setAudioUploadStatus(`Uploading ${audioFiles.length} file${audioFiles.length === 1 ? "" : "s"}`);
+      setAudioError("");
+      try {
+        const form = new FormData();
+        for (const file of audioFiles) form.append("audio", file, file.name);
+        form.append("source", "browser-file-upload");
+        form.append("clientNow", new Date().toISOString());
+        const result = await fetchJson<{ audioFiles?: number; mediaFiles?: number }>("/api/imports/audio/upload", {
+          method: "POST",
+          body: form,
+        });
+        setAudioUploadStatus(`Uploaded ${result.audioFiles ?? result.mediaFiles ?? audioFiles.length} audio file(s)`);
+        await refreshAudio();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Could not upload audio";
+        setAudioError(message);
+        setAudioUploadStatus(message);
+      }
+    },
+    [refreshAudio],
+  );
+
+  const flushCachedAudioUploads = useCallback(async () => {
+    if (!isAuthenticated || cachedAudioUploadRunning.current) return;
+    cachedAudioUploadRunning.current = true;
+    setAudioError("");
+    try {
+      const records = await loadCachedAudioRecordings();
+      setCachedAudioRecordings(records);
+      for (const record of records) {
+        if (record.id === recordingIdRef.current || record.status === "uploading") continue;
+        await markCachedAudioRecordingStatus(record.id, "uploading");
+        await refreshCachedAudioRecordings();
+        setAudioUploadStatus(`Uploading cached ${record.filename}`);
+
+        try {
+          const blob = await loadCachedAudioBlob(record.id);
+          const filename = record.filename || `recording-${record.createdAt}.${extensionForMime(blob.type || record.mimeType)}`;
+          const form = new FormData();
+          form.append("audio", blob, filename);
+          form.append("source", "browser-recording");
+          form.append("recordingId", record.id);
+          form.append("recordedAt", record.createdAt);
+          form.append("durationMs", String(record.durationMs));
+          await fetchJson("/api/imports/audio/upload", { method: "POST", body: form });
+          await deleteCachedAudioRecording(record.id);
+          setAudioUploadStatus(`Uploaded cached ${filename}`);
+          await refreshAudio();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Could not upload cached recording";
+          await markCachedAudioRecordingStatus(record.id, "failed", message);
+          setAudioUploadStatus(message);
+        } finally {
+          await refreshCachedAudioRecordings();
+        }
+      }
+    } finally {
+      cachedAudioUploadRunning.current = false;
+    }
+  }, [isAuthenticated, refreshAudio, refreshCachedAudioRecordings]);
+
+  const stopAudioRecording = useCallback(() => {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder) return;
+    if (recorder.state !== "inactive") {
+      try {
+        recorder.requestData();
+      } catch {
+        // Some browsers do not allow requestData while stopping.
+      }
+      recorder.stop();
+    }
+  }, []);
+
+  const startAudioRecording = useCallback(async () => {
+    if (mediaRecorderRef.current?.state === "recording") return;
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setRecordingState((current) => ({ ...current, error: "Audio recording is not available in this browser" }));
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = chooseRecorderMimeType();
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      const cached = await createCachedAudioRecording(recorder.mimeType || mimeType || "audio/webm");
+      recordingStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+      recordingIdRef.current = cached.id;
+      recordingStartedAtRef.current = Date.now();
+      recordingChunkIndexRef.current = 0;
+      recordingChunkWritesRef.current = [];
+      setAudioUploadStatus("");
+      setRecordingState({
+        active: true,
+        elapsedMs: 0,
+        chunkCount: 0,
+        mimeType: recorder.mimeType || mimeType || "audio/webm",
+        error: "",
+      });
+      await refreshCachedAudioRecordings();
+
+      recorder.ondataavailable = (event) => {
+        if (!event.data.size || !recordingIdRef.current) return;
+        const index = recordingChunkIndexRef.current;
+        recordingChunkIndexRef.current += 1;
+        const elapsedMs = Date.now() - recordingStartedAtRef.current;
+        const write = appendCachedAudioChunk(recordingIdRef.current, index, event.data, elapsedMs).catch((error) => {
+          setRecordingState((current) => ({
+            ...current,
+            error: error instanceof Error ? error.message : "Could not cache recording chunk",
+          }));
+        });
+        recordingChunkWritesRef.current.push(write);
+        setRecordingState((current) => ({ ...current, elapsedMs, chunkCount: index + 1 }));
+      };
+      recorder.onerror = (event) => {
+        setRecordingState((current) => ({
+          ...current,
+          error: (event as ErrorEvent).message || "Recording failed",
+        }));
+      };
+      recorder.onstop = () => {
+        const recordingId = recordingIdRef.current;
+        const elapsedMs = Date.now() - recordingStartedAtRef.current;
+        if (recordingTimerRef.current) window.clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+        stream.getTracks().forEach((track) => track.stop());
+        mediaRecorderRef.current = null;
+        recordingStreamRef.current = null;
+        recordingIdRef.current = null;
+        const chunkWrites = recordingChunkWritesRef.current;
+        recordingChunkWritesRef.current = [];
+        setRecordingState((current) => ({ ...current, active: false, elapsedMs }));
+        if (recordingId) {
+          void Promise.allSettled(chunkWrites)
+            .then(() => finalizeCachedAudioRecording(recordingId, elapsedMs))
+            .then(refreshCachedAudioRecordings)
+            .then(flushCachedAudioUploads)
+            .catch((error) => {
+              setRecordingState((current) => ({
+                ...current,
+                error: error instanceof Error ? error.message : "Could not finalize recording",
+              }));
+            });
+        }
+      };
+      recorder.start(1000);
+      recordingTimerRef.current = window.setInterval(() => {
+        setRecordingState((current) => ({ ...current, elapsedMs: Date.now() - recordingStartedAtRef.current }));
+      }, 1000);
+    } catch (error) {
+      recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+      recordingStreamRef.current = null;
+      setRecordingState((current) => ({
+        ...current,
+        active: false,
+        error: error instanceof Error ? error.message : "Could not start audio recording",
+      }));
+    }
+  }, [flushCachedAudioUploads, refreshCachedAudioRecordings]);
+
+  const toggleAudioRecording = useCallback(() => {
+    if (recordingState.active) stopAudioRecording();
+    else void startAudioRecording();
+  }, [recordingState.active, startAudioRecording, stopAudioRecording]);
+
   const retryAudioTranscription = useCallback(
-    async (mediaId: string) => {
+    async (mediaId: string, options: AudioRetryOptions) => {
       setAudioRetryingId(mediaId);
       setAudioError("");
       try {
         await fetchJson<AudioTranscriptionInfo>("/api/imports/audio/transcriptions", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ mediaId }),
+          body: JSON.stringify({ mediaId, ...options }),
         });
         await refreshAudio();
       } catch (error) {
@@ -1030,6 +1436,23 @@ export function App() {
       }
     },
     [refreshAudio],
+  );
+
+  const deleteAudio = useCallback(
+    async (mediaId: string) => {
+      if (!window.confirm("Delete this audio and its transcriptions?")) return;
+      setAudioRetryingId(mediaId);
+      setAudioError("");
+      try {
+        await fetchJson(`/api/imports/audio?mediaId=${encodeURIComponent(mediaId)}`, { method: "DELETE" });
+        setAudioItems((current) => current.filter((item) => item.id !== mediaId));
+      } catch (error) {
+        setAudioError(error instanceof Error ? error.message : "Could not delete audio");
+      } finally {
+        setAudioRetryingId("");
+      }
+    },
+    [],
   );
 
   const insertTranscriptIntoDraft = useCallback(
@@ -1093,6 +1516,7 @@ export function App() {
       );
     } catch (error) {
       if (error instanceof SyncAuthError) {
+        cachedAudioRecoveryStarted.current = false;
         setAuthState("anonymous");
         setAuthError("Session expired. Enter the token again.");
       }
@@ -1117,6 +1541,16 @@ export function App() {
   }, [audioOpen, refreshAudio]);
 
   useEffect(() => {
+    if (audioOpen) refreshCachedAudioRecordings();
+  }, [audioOpen, refreshCachedAudioRecordings]);
+
+  useEffect(() => {
+    if (!isAuthenticated || cachedAudioRecoveryStarted.current) return;
+    cachedAudioRecoveryStarted.current = true;
+    void refreshCachedAudioRecordings().then(flushCachedAudioUploads);
+  }, [flushCachedAudioUploads, isAuthenticated, refreshCachedAudioRecordings]);
+
+  useEffect(() => {
     if (!audioOpen) return;
     const hasPending = audioItems.some((item) =>
       item.transcriptions.some((transcription) => transcription.status === "queued" || transcription.status === "processing"),
@@ -1125,6 +1559,27 @@ export function App() {
     const id = window.setInterval(refreshAudio, 4000);
     return () => window.clearInterval(id);
   }, [audioItems, audioOpen, refreshAudio]);
+
+  useEffect(() => {
+    const flushActiveRecording = () => {
+      const recorder = mediaRecorderRef.current;
+      if (recorder?.state === "recording") {
+        try {
+          recorder.requestData();
+        } catch {
+          return;
+        }
+      }
+    };
+    document.addEventListener("visibilitychange", flushActiveRecording);
+    window.addEventListener("beforeunload", flushActiveRecording);
+    return () => {
+      document.removeEventListener("visibilitychange", flushActiveRecording);
+      window.removeEventListener("beforeunload", flushActiveRecording);
+      if (recordingTimerRef.current) window.clearInterval(recordingTimerRef.current);
+      recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+    };
+  }, []);
 
   useEffect(() => {
     getMeta<"light" | "dark">("theme").then((stored) => {
@@ -1472,9 +1927,18 @@ export function App() {
           error={audioError}
           language={audioLanguage}
           busyMediaId={audioRetryingId}
+          uploadStatus={audioUploadStatus}
+          recording={recordingState}
+          cachedRecordings={cachedAudioRecordings}
+          models={settings?.transcriptionModels?.length ? settings.transcriptionModels : FALLBACK_TRANSCRIPTION_MODELS}
+          reasoningEfforts={settings?.reasoningEfforts?.length ? settings.reasoningEfforts : FALLBACK_REASONING_EFFORTS}
           onLanguage={setAudioLanguage}
           onRefresh={refreshAudio}
+          onUploadFiles={uploadAudioFiles}
+          onFlushCache={flushCachedAudioUploads}
+          onToggleRecording={toggleAudioRecording}
           onRetry={retryAudioTranscription}
+          onDelete={deleteAudio}
           onInsert={insertTranscriptIntoDraft}
           onClose={() => setAudioOpen(false)}
         />
