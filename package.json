@@ -12,6 +12,7 @@
     "dev:local:agent": "BACKEND_URL=http://localhost:3737 AGENT_TOKEN=dev-token AGENT_STATE=.chatview-agent-dev/state.json bun run apps/agent/main.ts run",
     "dev:local:agent:scan": "BACKEND_URL=http://localhost:3737 AGENT_TOKEN=dev-token AGENT_STATE=.chatview-agent-dev/state.json bun run apps/agent/main.ts scan-once",
     "agent:scan": "bun run apps/agent/main.ts scan-once",
+    "test": "bun test",
     "build:agent": "mkdir -p dist && bun build apps/agent/main.ts --compile --outfile dist/chatview-agent",
     "build:frontend": "bun build index.html --outdir dist/frontend"
   },

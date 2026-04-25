@@ -43,6 +43,7 @@ import {
 } from "./audio-panel";
 import { flatten, groupItems, VirtualChat } from "./chat-transcript";
 import { flushClientLogs, installClientLogHandlers, logClientEvent } from "./client-logs";
+import { parseRoute, useRoute, type RoutePanel } from "./router";
 import { pullUpdates, SyncAuthError } from "./sync";
 import {
   docIdForSession,
@@ -60,6 +61,8 @@ import {
 
 type SyncState = "loading" | "syncing" | "idle" | "offline" | "error";
 type AuthState = "checking" | "authenticated" | "anonymous";
+type EventState = { sessionId: string | null; events: SessionEvent[] };
+type SyncNowOptions = { silent?: boolean };
 
 function formatBytes(value?: number | null) {
   if (!value) return "0 B";
@@ -84,6 +87,25 @@ function formatNumber(value?: number | null) {
 
 function formatLimit(value?: number | null) {
   return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : "unlimited";
+}
+
+function shallowEqualObject(a: object, b: object) {
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const key of aKeys) {
+    if ((a as Record<string, unknown>)[key] !== (b as Record<string, unknown>)[key]) return false;
+  }
+  return true;
+}
+
+function sameEntityList<T extends object>(current: T[], next: T[], keyOf: (item: T) => string) {
+  if (current.length !== next.length) return false;
+  for (let index = 0; index < current.length; index += 1) {
+    if (keyOf(current[index]) !== keyOf(next[index])) return false;
+    if (!shallowEqualObject(current[index], next[index])) return false;
+  }
+  return true;
 }
 
 function openRouterStatusLabel(settings: AppSettingsInfo | null) {
@@ -254,6 +276,7 @@ function SettingsModal({
 }
 
 export function App() {
+  const [route, navigateRoute] = useRoute();
   const [authState, setAuthState] = useState<AuthState>("checking");
   const [authConfigured, setAuthConfigured] = useState(true);
   const [authToken, setAuthToken] = useState("");
@@ -263,19 +286,17 @@ export function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeHost, setActiveHost] = useState("all");
   const [active, setActive] = useState<SessionInfo | null>(null);
-  const [events, setEvents] = useState<SessionEvent[]>([]);
+  const [eventState, setEventState] = useState<EventState>({ sessionId: null, events: [] });
   const [query, setQuery] = useState("");
   const [syncState, setSyncState] = useState<SyncState>("loading");
   const [statusText, setStatusText] = useState("Loading cache");
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [sidebarOpen, setSidebarOpen] = useState(() => !window.matchMedia("(max-width: 780px)").matches);
   const [draft, setDraft] = useState("");
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<AppSettingsInfo | null>(null);
   const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState("");
-  const [audioOpen, setAudioOpen] = useState(false);
   const [audioItems, setAudioItems] = useState<ImportedAudioInfo[]>([]);
   const [audioLoading, setAudioLoading] = useState(false);
   const [audioError, setAudioError] = useState("");
@@ -301,11 +322,40 @@ export function App() {
   const recordingChunkWritesRef = useRef<Promise<void>[]>([]);
   const recordingTimerRef = useRef<number | null>(null);
   const activeRef = useRef<SessionInfo | null>(null);
+  const sessionsRef = useRef<SessionInfo[]>([]);
   const activeYDocId = useRef<string | null>(null);
   const yDocs = useRef(new Map<string, Y.Doc>());
   const ySocket = useRef<WebSocket | null>(null);
   const yPushTimers = useRef(new Map<string, number>());
   const isAuthenticated = authState === "authenticated";
+  const settingsOpen = route.panel === "settings";
+  const audioOpen = route.panel === "audio";
+  const activeId = active?.id ?? null;
+  const events = eventState.sessionId === activeId ? eventState.events : [];
+
+  const openPanel = useCallback(
+    (panel: RoutePanel) => {
+      navigateRoute({ chatId: activeId ?? route.chatId, panel });
+    },
+    [activeId, navigateRoute, route.chatId],
+  );
+
+  const closePanel = useCallback(() => {
+    navigateRoute({ chatId: route.chatId ?? activeId ?? undefined }, { replace: true });
+  }, [activeId, navigateRoute, route.chatId]);
+
+  const setActiveSession = useCallback((next: SessionInfo | null) => {
+    setActive((current) => {
+      if (current === null && next === null) return current;
+      if (current === null || next === null) return next;
+      if (current.id !== next.id) return next;
+      return shallowEqualObject(current, next) ? current : next;
+    });
+  }, []);
+
+  const setSessionEvents = useCallback((sessionId: string | null, nextEvents: SessionEvent[]) => {
+    setEventState({ sessionId, events: nextEvents });
+  }, []);
 
   const checkAuth = useCallback(async () => {
     try {
@@ -362,11 +412,11 @@ export function App() {
     setHosts([]);
     setSessions([]);
     setActive(null);
-    setEvents([]);
+    setSessionEvents(null, []);
     setDraft("");
     cachedAudioRecoveryStarted.current = false;
     setAuthState("anonymous");
-  }, []);
+  }, [setSessionEvents]);
 
   const refreshSettings = useCallback(async () => {
     setSettingsBusy(true);
@@ -429,10 +479,11 @@ export function App() {
       await resetIndexedDbCache();
       setHosts([]);
       setSessions([]);
-      setEvents([]);
+      setSessionEvents(null, []);
       setActive(null);
       setDraft("");
       setCachedAudioRecordings([]);
+      navigateRoute({}, { replace: true });
       await refreshSettings();
       setSettingsMessage("IndexedDB cache reset");
     } catch (error) {
@@ -440,7 +491,7 @@ export function App() {
     } finally {
       setSettingsBusy(false);
     }
-  }, [refreshSettings]);
+  }, [navigateRoute, refreshSettings, setSessionEvents]);
 
   const clearCaches = useCallback(async () => {
     setSettingsBusy(true);
@@ -707,44 +758,50 @@ export function App() {
       const value = text.trim();
       if (!value) return;
       const nextDraft = draft.trim() ? `${draft.trim()}\n\n${value}` : value;
-      const docId = active ? docIdForSession(active.id) : null;
+      const docId = activeId ? docIdForSession(activeId) : null;
       const doc = docId ? yDocs.current.get(docId) : null;
       if (doc) setYDraft(doc, nextDraft);
       else setDraft(nextDraft);
-      setAudioOpen(false);
+      closePanel();
     },
-    [active, draft],
+    [activeId, closePanel, draft],
   );
 
   const refreshCache = useCallback(async () => {
     const [nextHosts, nextSessions] = await Promise.all([loadHosts(), loadSessions()]);
-    setHosts(nextHosts);
-    setSessions(nextSessions);
-    setActive((current) => current ?? nextSessions[0] ?? null);
+    setHosts((current) => (sameEntityList(current, nextHosts, (host) => host.agentId) ? current : nextHosts));
+    setSessions((current) => (sameEntityList(current, nextSessions, (session) => session.id) ? current : nextSessions));
     return { hosts: nextHosts, sessions: nextSessions };
   }, []);
 
-  const syncNow = useCallback(async () => {
+  const syncNow = useCallback(async (options: SyncNowOptions = {}) => {
     if (!isAuthenticated) return;
     if (syncing.current) return;
+    const silent = options.silent === true;
     syncing.current = true;
     const started = performance.now();
-    setSyncState("syncing");
-    setStatusText("Syncing");
-    void logClientEvent("debug", "sync.start", null, { online: navigator.onLine }, ["sync"]).catch(() => {});
+    if (!silent) {
+      setSyncState("syncing");
+      setStatusText("Syncing");
+      void logClientEvent("debug", "sync.start", null, { online: navigator.onLine }, ["sync"]).catch(() => {});
+    }
     try {
       const result = await pullUpdates({
         maxBatches: 4,
         onProgress: ({ events, batches, hasMore }) => {
           if (!events) return;
-          setStatusText(
-            hasMore
-              ? `Syncing ${events.toLocaleString()} events (${batches} batches)…`
-              : `Applying ${events.toLocaleString()} events…`,
-          );
+          if (!silent || hasMore) {
+            setSyncState("syncing");
+            setStatusText(
+              hasMore
+                ? `Syncing ${events.toLocaleString()} events (${batches} batches)…`
+                : `Applying ${events.toLocaleString()} events…`,
+            );
+          }
         },
       });
-      const { sessions: refreshedSessions } = await refreshCache();
+      const shouldRefreshCache = !silent || result.events > 0 || result.hasMore;
+      const refreshedSessions = shouldRefreshCache ? (await refreshCache()).sessions : sessionsRef.current;
       const current = activeRef.current;
       let activeRemoved = false;
       if (current) {
@@ -755,13 +812,16 @@ export function App() {
             yDocs.current.delete(docId);
             activeYDocId.current = null;
           }
-          setActive(null);
-          setEvents([]);
+          setActiveSession(null);
+          setSessionEvents(null, []);
           setDraft("");
           activeRemoved = true;
+          if (parseRoute().chatId === current.id) navigateRoute({}, { replace: true });
           console.warn("active session no longer available", current.id);
-        } else if (result.events > 0) {
-          setEvents(await loadSessionEvents(current.id));
+        } else if (result.touchedSessionIds.includes(current.id)) {
+          const loadedSessionId = current.id;
+          const nextEvents = await loadSessionEvents(loadedSessionId);
+          if (activeRef.current?.id === loadedSessionId) setSessionEvents(loadedSessionId, nextEvents);
         }
       }
       const durationMs = Math.round(performance.now() - started);
@@ -781,16 +841,20 @@ export function App() {
           ["sync"],
         ).catch(() => {});
       }
-      setSyncState("idle");
-      setStatusText(
-        activeRemoved
-          ? "Active chat was removed"
-          : result.hasMore
-            ? `Synced ${result.events.toLocaleString()} events, more pending`
-            : result.events
-              ? `Synced ${result.events.toLocaleString()} events`
-              : "Up to date",
-      );
+      if (!silent || result.events || result.hasMore || activeRemoved) {
+        setSyncState("idle");
+        setStatusText(
+          activeRemoved
+            ? "Active chat was removed"
+            : result.hasMore
+              ? `Synced ${result.events.toLocaleString()} events, more pending`
+              : result.events
+                ? `Synced ${result.events.toLocaleString()} events`
+                : "Up to date",
+        );
+      } else {
+        setSyncState((currentState) => (currentState === "syncing" ? "idle" : currentState));
+      }
     } catch (error) {
       if (error instanceof SyncAuthError) {
         cachedAudioRecoveryStarted.current = false;
@@ -811,7 +875,7 @@ export function App() {
       syncing.current = false;
       void flushClientLogs().catch(() => {});
     }
-  }, [isAuthenticated, refreshCache]);
+  }, [isAuthenticated, navigateRoute, refreshCache, setActiveSession, setSessionEvents]);
 
   useEffect(() => {
     installClientLogHandlers();
@@ -904,6 +968,34 @@ export function App() {
   }, [active]);
 
   useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    if (!sessions.length) {
+      setActiveSession(null);
+      return;
+    }
+
+    if (route.chatId) {
+      const routedSession = sessions.find((session) => session.id === route.chatId) ?? null;
+      if (routedSession) {
+        setActiveSession(routedSession);
+        return;
+      }
+
+      const fallback = sessions[0];
+      setActiveSession(fallback);
+      navigateRoute({ chatId: fallback.id, panel: route.panel }, { replace: true });
+      return;
+    }
+
+    setActiveSession(sessions[0]);
+  }, [isAuthenticated, navigateRoute, route.chatId, route.panel, sessions, setActiveSession]);
+
+  useEffect(() => {
     if (!isAuthenticated) return;
     const socket = openYjsSocket(async (docId, update) => {
       const doc = yDocs.current.get(docId);
@@ -947,19 +1039,33 @@ export function App() {
 
   useEffect(() => {
     if (!isAuthenticated) return;
-    if (!active) {
-      setEvents([]);
+    if (!activeId) {
+      setSessionEvents(null, []);
       activeYDocId.current = null;
       setDraft("");
       return;
     }
-    loadSessionEvents(active.id).then(setEvents);
-  }, [active, isAuthenticated]);
+    const loadForSessionId = activeId;
+    let disposed = false;
+    setEventState((current) =>
+      current.sessionId === loadForSessionId ? current : { sessionId: loadForSessionId, events: [] },
+    );
+    loadSessionEvents(loadForSessionId)
+      .then((nextEvents) => {
+        if (disposed || activeRef.current?.id !== loadForSessionId) return;
+        setSessionEvents(loadForSessionId, nextEvents);
+      })
+      .catch((error) => console.error(error));
+    return () => {
+      disposed = true;
+    };
+  }, [activeId, isAuthenticated, setSessionEvents]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
-    if (!active) return;
-    const docId = docIdForSession(active.id);
+    if (!activeId) return;
+    const sessionDbId = activeId;
+    const docId = docIdForSession(sessionDbId);
     let disposed = false;
     let cleanup: (() => void) | null = null;
     activeYDocId.current = docId;
@@ -974,12 +1080,12 @@ export function App() {
         const onUpdate = (update: Uint8Array, origin: unknown) => {
           persistDraftDoc(docId, doc).catch((error) => console.error(error));
           if (activeYDocId.current === docId) setDraft(getDraft(doc));
-          if (origin !== "remote" && origin !== "cache") scheduleYjsPush(docId, active.id, doc, update);
+          if (origin !== "remote" && origin !== "cache") scheduleYjsPush(docId, sessionDbId, doc, update);
         };
 
         doc.on("update", onUpdate);
         cleanup = () => doc.off("update", onUpdate);
-        await syncDraftDoc(docId, active.id, doc, true);
+        await syncDraftDoc(docId, sessionDbId, doc, true);
         if (!disposed) setDraft(getDraft(doc));
 
         if (disposed) cleanup();
@@ -990,22 +1096,23 @@ export function App() {
       disposed = true;
       cleanup?.();
     };
-  }, [active, isAuthenticated, scheduleYjsPush]);
+  }, [activeId, isAuthenticated, scheduleYjsPush]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
     const id = window.setInterval(() => {
-      if (!document.hidden) syncNow();
+      if (!document.hidden) syncNow({ silent: true });
     }, 5000);
     const onVisible = () => {
-      if (!document.hidden) syncNow();
+      if (!document.hidden) syncNow({ silent: true });
     };
     document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("online", syncNow);
+    const onOnline = () => syncNow({ silent: true });
+    window.addEventListener("online", onOnline);
     return () => {
       window.clearInterval(id);
       document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("online", syncNow);
+      window.removeEventListener("online", onOnline);
     };
   }, [isAuthenticated, syncNow]);
 
@@ -1036,9 +1143,10 @@ export function App() {
   }, [filteredSessions]);
 
   const selectSession = useCallback((session: SessionInfo) => {
-    setActive(session);
+    setActiveSession(session);
+    navigateRoute({ chatId: session.id });
     if (window.matchMedia("(max-width: 780px)").matches) setSidebarOpen(false);
-  }, []);
+  }, [navigateRoute, setActiveSession]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -1096,16 +1204,16 @@ export function App() {
           <div className={`sync-line ${syncState}`}>{statusText}</div>
         </div>
         <div className="top-actions">
-          <button className="icon-button" onClick={() => setAudioOpen(true)} title="Uploaded audio">
+          <button className="icon-button" onClick={() => openPanel("audio")} title="Uploaded audio">
             Audio
           </button>
-          <button className="icon-button" onClick={() => setSettingsOpen(true)} title="Settings">
+          <button className="icon-button" onClick={() => openPanel("settings")} title="Settings">
             Settings
           </button>
           <a className="icon-button download-button" href="/api/agent/download?arch=arm64">
             Download Mac Agent (M1)
           </a>
-          <button className="icon-button" onClick={syncNow} disabled={syncState === "syncing"} title="Sync now">
+          <button className="icon-button" onClick={() => syncNow()} disabled={syncState === "syncing"} title="Sync now">
             Sync
           </button>
           <button
@@ -1193,7 +1301,7 @@ export function App() {
                 <textarea
                   value={draft}
                   onChange={(event) => {
-                    const docId = active ? docIdForSession(active.id) : null;
+                    const docId = activeId ? docIdForSession(activeId) : null;
                     const doc = docId ? yDocs.current.get(docId) : null;
                     if (doc) setYDraft(doc, event.target.value);
                     else setDraft(event.target.value);
@@ -1215,7 +1323,7 @@ export function App() {
           cacheStats={cacheStats}
           loading={settingsBusy}
           message={settingsMessage}
-          onClose={() => setSettingsOpen(false)}
+          onClose={closePanel}
           onRefresh={refreshSettings}
           onCopy={copyText}
           onCreateToken={createImportToken}
@@ -1245,7 +1353,7 @@ export function App() {
           onRetry={retryAudioTranscription}
           onDelete={deleteAudio}
           onInsert={insertTranscriptIntoDraft}
-          onClose={() => setAudioOpen(false)}
+          onClose={closePanel}
         />
       )}
     </div>

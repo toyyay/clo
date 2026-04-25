@@ -68,6 +68,9 @@ switch (command) {
   case "scan-once":
     await run(true);
     break;
+  case "v2-dry-run":
+    await import("./v2/dry-run").then((mod) => mod.runAgentV2DryRunFromCli(Bun.argv.slice(3)));
+    break;
   case "install":
   case "install-self":
     await installSelf();
@@ -605,6 +608,7 @@ function printHelp() {
 Usage:
   chatview-agent run
   chatview-agent scan-once
+  chatview-agent v2-dry-run
   chatview-agent install-self
   chatview-agent install-launch-agent
 
@@ -614,6 +618,12 @@ Options:
   --projects-dir <path>    Claude projects dir (default: ~/.claude/projects)
   --state <path>           Agent state file (default: ~/.chatview-agent/state.json)
   --poll-ms <ms>           Poll interval (default: 2000)
+
+Agent v2 dry-run:
+  --root <kind=path>       Scan a temp/specific root for claude, codex, or gemini
+  --state <path>           Agent v2 state file (default: ~/.chatview-agent/v2-state.json)
+  --fetch-policy           Try /api/agent/v1/hello before using safe local defaults
+  --persist-state          Persist append_jsonl cursors after the dry run
 
 When a standalone downloadable executable is launched without arguments, it installs itself into:
   ${INSTALLED_EXECUTABLE_PATH}

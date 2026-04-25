@@ -6,6 +6,7 @@ export type PullResult = {
   batches: number;
   cursor: string;
   hasMore: boolean;
+  touchedSessionIds: string[];
 };
 
 export type PullProgress = {
@@ -67,19 +68,21 @@ export async function pullUpdates(options: PullOptions = {}): Promise<PullResult
   let events = 0;
   let batches = 0;
   let hasMore = false;
+  const touchedSessionIds = new Set<string>();
 
   while (batches < maxBatches) {
     const previousCursor = cursor;
     const payload = await fetchBatch(previousCursor, limitBytes, timeoutMs);
+    if (payload.hasMore && payload.cursor === previousCursor) throw new Error("sync cursor did not advance");
     cursor = payload.cursor;
     hasMore = payload.hasMore;
     await applySync(payload);
+    for (const event of payload.events) touchedSessionIds.add(event.sessionDbId);
     events += payload.events.length;
     batches += 1;
     onProgress?.({ events, batches, hasMore: payload.hasMore });
     if (!payload.hasMore) break;
-    if (payload.cursor === previousCursor) throw new Error("sync cursor did not advance");
   }
 
-  return { events, batches, cursor, hasMore };
+  return { events, batches, cursor, hasMore, touchedSessionIds: [...touchedSessionIds] };
 }

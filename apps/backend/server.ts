@@ -32,6 +32,12 @@ import {
 } from "../../packages/shared/types";
 import { downloadAgentArchiveResponse } from "./agent-download";
 import { handleClientLogRequest, listAppLogs, logBackendEvent } from "./app-logs";
+import {
+  handleAgentAppend,
+  handleAgentHello,
+  handleAgentInventory,
+  isSyncEngineHttpError,
+} from "./sync-engine";
 import { envFlag, envPositiveInteger, envValue } from "../../packages/shared/env";
 import { prepareDatabase, sql, toId, toNumber } from "./db";
 import { detectMedia, fileExtension, filenameFromContentDisposition } from "./media-detect";
@@ -238,6 +244,9 @@ Bun.serve<{ docIds: Set<string> }>({
       if (auth) return auth;
       return downloadAgentArchiveResponse(req, agentToken);
     },
+    "/api/agent/v1/hello": async (req: Request) => handleAgentV1(req, () => handleAgentHello(req, sql)),
+    "/api/agent/v1/inventory": async (req: Request) => handleAgentV1(req, () => handleAgentInventory(req, sql)),
+    "/api/agent/v1/append": async (req: Request) => handleAgentV1(req, () => handleAgentAppend(req, sql)),
     "/api/app/settings": async (req: Request) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;
@@ -349,6 +358,19 @@ function json(value: unknown, status = 200, headers?: HeadersInit) {
 
 function text(value: string, status = 200) {
   return new Response(value, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
+}
+
+async function handleAgentV1(req: Request, handler: () => Promise<unknown>) {
+  if (req.method !== "POST") return text("method not allowed", 405);
+  if (!isAuthorized(req)) return text("unauthorized", 401);
+
+  try {
+    return json(await handler());
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "bad request";
+    const status = isSyncEngineHttpError(error) ? error.status : 500;
+    return text(message, status);
+  }
 }
 
 function errorToLogContext(error: unknown) {
