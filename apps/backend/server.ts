@@ -40,6 +40,7 @@ import {
 } from "./sync-engine";
 import {
   getV2Session,
+  getV2SessionsMeta,
   isV2SessionId,
   listV2EventsForSync,
   listV2Hosts,
@@ -47,6 +48,7 @@ import {
   mapV2EventRow,
   mergeHostLists,
   mergeSessionLists,
+  parseV2SessionId,
 } from "./v2-read-model";
 import { envFlag, envPositiveInteger, envValue } from "../../packages/shared/env";
 import { prepareDatabase, sql, toId, toNumber } from "./db";
@@ -2017,16 +2019,17 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
   const limitBytes = clamp(Math.floor(body.limitBytes ?? 2 * 1024 * 1024), 64 * 1024, 16 * 1024 * 1024);
   const cursor = parseSyncCursor(body.cursor);
   if (body.metadataOnly) {
-    const [legacyMaxRows, v2MaxRows] = await Promise.all([
-      sql`select coalesce(max(id), 0) as cursor from session_events`,
-      sql`select coalesce(max(id), 0) as cursor from agent_normalized_events`,
-    ]);
+    const metadata = await syncMetadata(body);
     const response: SyncResponse = {
-      cursor: formatSyncCursor(legacyMaxRows[0]?.cursor ?? cursor.legacy.toString(), v2MaxRows[0]?.cursor ?? cursor.v2.toString()),
-      hasMore: false,
+      cursor: formatSyncCursor(cursor.legacy.toString(), cursor.v2.toString()),
+      hasMore: metadata.hasMore,
       approxBytes: 0,
-      hosts: await listReadableHosts(),
-      sessions: await listReadableSessions(),
+      metadataCursor: metadata.cursor,
+      metadataHasMore: metadata.hasMore,
+      metadataMode: metadata.mode,
+      metadataFull: metadata.full,
+      hosts: metadata.hosts,
+      sessions: metadata.sessions,
       events: [],
     };
     response.approxBytes = byteSize(JSON.stringify(response));
@@ -2091,9 +2094,9 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
   const v2SessionIds = new Set(sessionIds.filter(isV2SessionId));
   const [legacySessions, v2Sessions] = await Promise.all([
     legacySessionIds.length ? getSessionsMeta(legacySessionIds) : [],
-    v2SessionIds.size ? listV2Sessions(sql) : [],
+    v2SessionIds.size ? getV2SessionsMeta(sql, [...v2SessionIds].map((id) => parseV2SessionId(id)).filter((id): id is string => Boolean(id))) : [],
   ]);
-  const sessions = [...legacySessions, ...v2Sessions.filter((session) => v2SessionIds.has(session.id))];
+  const sessions = [...legacySessions, ...v2Sessions];
 
   const hosts = await listReadableHosts();
   const response: SyncResponse = {
@@ -2106,6 +2109,140 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
   };
   response.approxBytes = byteSize(JSON.stringify(response));
   return response;
+}
+
+type MetadataMode = "full" | "delta";
+type MetadataChangeKey = {
+  kind: "" | "h" | "l" | "v";
+  id: string;
+  at: string;
+};
+
+async function syncMetadata(body: SyncRequest): Promise<{
+  mode: MetadataMode;
+  full: boolean;
+  hasMore: boolean;
+  cursor: string;
+  hosts: HostInfo[];
+  sessions: SessionInfo[];
+}> {
+  const requestedMode = body.metadataMode === "delta" || body.metadataMode === "full" ? body.metadataMode : null;
+  const mode: MetadataMode = requestedMode ?? (body.metadataCursor ? "delta" : "full");
+  const parsedCursor = body.metadataCursor ? parseMetadataCursor(body.metadataCursor) : null;
+
+  if (mode === "full" || !parsedCursor) return syncFullMetadata();
+
+  const limit = clamp(Math.floor(body.metadataLimit ?? 500), 50, 2000);
+  const rows = await listMetadataChangeKeys(parsedCursor, limit + 1);
+  const page = rows.slice(0, limit);
+  const hasMore = rows.length > limit;
+  const hostIds = new Set(page.filter((row) => row.kind === "h").map((row) => row.id));
+  const legacySessionIds = page.filter((row) => row.kind === "l").map((row) => row.id);
+  const v2SourceFileIds = page.filter((row) => row.kind === "v").map((row) => row.id);
+
+  const [legacySessions, v2Sessions] = await Promise.all([
+    legacySessionIds.length ? getSessionsMeta(legacySessionIds) : Promise.resolve([]),
+    v2SourceFileIds.length ? getV2SessionsMeta(sql, v2SourceFileIds, { includeDeleted: true }) : Promise.resolve([]),
+  ]);
+  for (const session of [...legacySessions, ...v2Sessions]) hostIds.add(session.agentId);
+  const hosts = hostIds.size ? (await listReadableHosts()).filter((host) => hostIds.has(host.agentId)) : [];
+  const cursor = page.length ? formatMetadataCursor(page[page.length - 1]) : body.metadataCursor ?? (await currentMetadataCursor());
+  return { mode, full: false, hasMore, cursor, hosts, sessions: [...legacySessions, ...v2Sessions] };
+}
+
+async function syncFullMetadata(): Promise<{
+  mode: MetadataMode;
+  full: boolean;
+  hasMore: boolean;
+  cursor: string;
+  hosts: HostInfo[];
+  sessions: SessionInfo[];
+}> {
+  const cursor = await currentMetadataCursor();
+  const [hosts, sessions] = await Promise.all([listReadableHosts(), listReadableSessions()]);
+  return { mode: "full", full: true, hasMore: false, cursor, hosts, sessions };
+}
+
+async function listMetadataChangeKeys(cursor: MetadataChangeKey, limit: number): Promise<MetadataChangeKey[]> {
+  const rows = await sql`
+    with changes as (
+      select 'h'::text as kind, a.id::text as row_id, a.last_seen_at as changed_at
+      from agents a
+      where (a.last_seen_at, 'h'::text, a.id::text) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
+      union all
+      select 'l'::text as kind, s.id::text as row_id, greatest(s.last_seen_at, coalesce(s.deleted_at, s.last_seen_at)) as changed_at
+      from chat_sessions s
+      where (
+        greatest(s.last_seen_at, coalesce(s.deleted_at, s.last_seen_at)),
+        'l'::text,
+        s.id::text
+      ) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
+      union all
+      select 'v'::text as kind, f.id::text as row_id, greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)) as changed_at
+      from agent_source_files f
+      where f.source_kind = 'conversation'
+        and (
+          greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)),
+          'v'::text,
+          f.id::text
+        ) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
+    )
+    select kind, row_id, changed_at
+    from changes
+    order by changed_at asc, kind asc, row_id asc
+    limit ${limit}
+  `;
+  return rows.map((row: any) => ({
+    kind: row.kind,
+    id: String(row.row_id),
+    at: String(row.changed_at),
+  }));
+}
+
+async function currentMetadataCursor() {
+  const rows = await sql`
+    with changes as (
+      select 'h'::text as kind, a.id::text as row_id, a.last_seen_at as changed_at
+      from agents a
+      union all
+      select 'l'::text as kind, s.id::text as row_id, greatest(s.last_seen_at, coalesce(s.deleted_at, s.last_seen_at)) as changed_at
+      from chat_sessions s
+      union all
+      select 'v'::text as kind, f.id::text as row_id, greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)) as changed_at
+      from agent_source_files f
+      where f.source_kind = 'conversation'
+    )
+    select kind, row_id, changed_at
+    from changes
+    order by changed_at desc, kind desc, row_id desc
+    limit 1
+  `;
+  if (!rows.length) return formatMetadataCursor(initialMetadataCursor());
+  return formatMetadataCursor({ kind: rows[0].kind, id: String(rows[0].row_id), at: String(rows[0].changed_at) });
+}
+
+function initialMetadataCursor(): MetadataChangeKey {
+  return { at: "1970-01-01T00:00:00.000Z", kind: "", id: "" };
+}
+
+function parseMetadataCursor(value: string | undefined): MetadataChangeKey | null {
+  if (!value?.startsWith("meta:")) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(value.slice("meta:".length), "base64url").toString("utf8"));
+    if (!parsed || typeof parsed !== "object") return null;
+    const at = typeof parsed.at === "string" && parsed.at ? parsed.at : null;
+    const kind: MetadataChangeKey["kind"] | null =
+      parsed.kind === "h" || parsed.kind === "l" || parsed.kind === "v" ? parsed.kind : null;
+    const id = typeof parsed.id === "string" ? parsed.id : "";
+    if (!at || !kind || !id) return null;
+    return { at, kind, id };
+  } catch {
+    return null;
+  }
+}
+
+function formatMetadataCursor(cursor: MetadataChangeKey) {
+  return `meta:${Buffer.from(JSON.stringify(cursor)).toString("base64url")}`;
 }
 
 function parseSyncCursor(value: string | undefined): { legacy: bigint; v2: bigint } {
@@ -2125,6 +2262,10 @@ function mapSession(row: any): SessionInfo {
     id: toId(row.id),
     agentId: row.agent_id,
     hostname: row.hostname,
+    sourceProvider: "claude",
+    sourceKind: "conversation",
+    sourceGeneration: null,
+    sourceId: toId(row.id),
     projectKey: row.project_key,
     projectName: row.project_name,
     sessionId: row.session_id,

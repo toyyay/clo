@@ -289,6 +289,14 @@ pre {
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+.session-source {
+  color: var(--muted);
+  font-size: 10px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  opacity: 0.78;
+}
 .session-title {
   font-size: 13px;
   font-weight: 600;
@@ -329,6 +337,9 @@ pre {
   background: color-mix(in srgb, var(--panel) 94%, transparent);
   backdrop-filter: blur(12px);
 }
+.chat-head > div:first-child {
+  min-width: 0;
+}
 .chat-title {
   font-weight: 700;
   overflow-wrap: anywhere;
@@ -337,6 +348,30 @@ pre {
   color: var(--muted);
   font-size: 12px;
   margin-top: 1px;
+}
+.chat-source {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.source-pill {
+  flex: 0 0 auto;
+  padding: 1px 4px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 10px;
+}
+.chat-source-path {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 .chat-count {
   align-self: start;
@@ -929,6 +964,7 @@ pre {
     line-height: 1.25;
   }
   .chat-subtitle { font-size: 11px; }
+  .chat-source { font-size: 10px; }
   .chat-scroll {
     padding: 0 4px;
     scrollbar-gutter: auto;

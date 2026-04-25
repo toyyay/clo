@@ -9,6 +9,8 @@ type V2SessionRow = {
   agent_id: string;
   hostname: string;
   provider?: unknown;
+  source_kind?: unknown;
+  current_generation?: unknown;
   source_path?: unknown;
   size_bytes?: unknown;
   mtime_ms?: unknown;
@@ -85,6 +87,8 @@ export async function listV2Sessions(sql: SqlTag, agentId?: string): Promise<Ses
           f.agent_id,
           a.hostname,
           f.provider,
+          f.source_kind,
+          f.current_generation,
           f.source_path,
           f.size_bytes,
           f.mtime_ms,
@@ -115,6 +119,8 @@ export async function listV2Sessions(sql: SqlTag, agentId?: string): Promise<Ses
           f.agent_id,
           a.hostname,
           f.provider,
+          f.source_kind,
+          f.current_generation,
           f.source_path,
           f.size_bytes,
           f.mtime_ms,
@@ -142,6 +148,75 @@ export async function listV2Sessions(sql: SqlTag, agentId?: string): Promise<Ses
   return rows.map(mapV2SessionRow);
 }
 
+export async function getV2SessionsMeta(sql: SqlTag, sourceFileIds: string[], options: { includeDeleted?: boolean } = {}): Promise<SessionInfo[]> {
+  const ids = [...new Set(sourceFileIds.filter((id) => /^\d+$/.test(id)))];
+  if (!ids.length) return [];
+  const rows = options.includeDeleted
+    ? await sql`
+        select
+          f.id,
+          f.agent_id,
+          a.hostname,
+          f.provider,
+          f.source_kind,
+          f.current_generation,
+          f.source_path,
+          f.size_bytes,
+          f.mtime_ms,
+          f.content_sha256,
+          f.mime_type,
+          f.encoding,
+          f.line_count,
+          f.git,
+          f.metadata,
+          f.first_seen_at,
+          f.last_seen_at,
+          f.deleted_at,
+          count(e.id) as event_count
+        from agent_source_files f
+        join agents a on a.id = f.agent_id
+        left join agent_normalized_events e
+          on e.source_file_id = f.id
+          and e.source_generation = f.current_generation
+        where f.id = any(${postgresBigintArrayLiteral(ids)}::bigint[])
+          and f.source_kind = 'conversation'
+        group by f.id, a.hostname
+      `
+    : await sql`
+        select
+          f.id,
+          f.agent_id,
+          a.hostname,
+          f.provider,
+          f.source_kind,
+          f.current_generation,
+          f.source_path,
+          f.size_bytes,
+          f.mtime_ms,
+          f.content_sha256,
+          f.mime_type,
+          f.encoding,
+          f.line_count,
+          f.git,
+          f.metadata,
+          f.first_seen_at,
+          f.last_seen_at,
+          f.deleted_at,
+          count(e.id) as event_count
+        from agent_source_files f
+        join agents a on a.id = f.agent_id
+        left join agent_normalized_events e
+          on e.source_file_id = f.id
+          and e.source_generation = f.current_generation
+        where f.id = any(${postgresBigintArrayLiteral(ids)}::bigint[])
+          and f.source_kind = 'conversation'
+          and f.deleted_at is null
+        group by f.id, a.hostname
+      `;
+  const byId = new Map(rows.map((row: any) => [toId(row.id), mapV2SessionRow(row)] as const));
+  return ids.map((id) => byId.get(id)).filter((session): session is SessionInfo => Boolean(session));
+}
+
 export async function getV2Session(sql: SqlTag, sessionId: string): Promise<SessionPayload | null> {
   const sourceFileId = parseV2SessionId(sessionId);
   if (!sourceFileId) return null;
@@ -152,6 +227,8 @@ export async function getV2Session(sql: SqlTag, sessionId: string): Promise<Sess
       f.agent_id,
       a.hostname,
       f.provider,
+      f.source_kind,
+      f.current_generation,
       f.source_path,
       f.size_bytes,
       f.mtime_ms,
@@ -266,6 +343,8 @@ export function mapV2SessionRow(row: V2SessionRow): SessionInfo {
   const metadata = jsonRecord(row.metadata);
   const git = jsonRecord(row.git);
   const provider = stringValue(row.provider) ?? "unknown";
+  const sourceKind = stringValue(row.source_kind) ?? "conversation";
+  const sourceGeneration = row.current_generation == null ? null : toNumber(row.current_generation);
   const sourcePath = stringValue(row.source_path) ?? "";
   const projectKey = inferProjectKey(provider, sourcePath, metadata);
 
@@ -273,6 +352,10 @@ export function mapV2SessionRow(row: V2SessionRow): SessionInfo {
     id: v2SessionId(row.id),
     agentId: row.agent_id,
     hostname: row.hostname,
+    sourceProvider: provider,
+    sourceKind,
+    sourceGeneration,
+    sourceId: toId(row.id),
     projectKey,
     projectName: stringValue(metadata.projectName) ?? stringValue(metadata.displayName) ?? defaultProjectName(provider, projectKey),
     sessionId: stringValue(metadata.sessionId) ?? stringValue(metadata.chatId) ?? inferSessionId(sourcePath),
@@ -376,6 +459,10 @@ export function normalizedEventToLegacyRaw(
 
 function v2EventId(eventId: unknown) {
   return `v2e:${toId(eventId)}`;
+}
+
+function postgresBigintArrayLiteral(values: string[]) {
+  return `{${values.join(",")}}`;
 }
 
 function inferProjectKey(provider: string, sourcePath: string, metadata: Record<string, unknown>) {

@@ -76,6 +76,10 @@ export type SessionInfo = {
   id: string;
   agentId: string;
   hostname: string;
+  sourceProvider?: string | null;
+  sourceKind?: string | null;
+  sourceGeneration?: number | null;
+  sourceId?: string | null;
   projectKey: string;
   projectName: string;
   sessionId: string;
@@ -119,6 +123,9 @@ export type SessionPayload = {
 
 export type SyncRequest = {
   cursor?: string;
+  metadataCursor?: string;
+  metadataMode?: "full" | "delta";
+  metadataLimit?: number;
   limitBytes?: number;
   metadataOnly?: boolean;
 };
@@ -127,6 +134,10 @@ export type SyncResponse = {
   cursor: string;
   hasMore: boolean;
   approxBytes: number;
+  metadataCursor?: string;
+  metadataHasMore?: boolean;
+  metadataMode?: "full" | "delta";
+  metadataFull?: boolean;
   hosts: HostInfo[];
   sessions: SessionInfo[];
   events: SessionEvent[];

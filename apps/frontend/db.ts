@@ -116,7 +116,10 @@ export async function loadSessionEvents(sessionDbId: string): Promise<SessionEve
   return events.sort((a, b) => a.lineNo - b.lineNo);
 }
 
-export async function applySync(payload: SyncResponse, options: { replaceShell?: boolean } = {}) {
+export async function applySync(
+  payload: SyncResponse,
+  options: { pruneMissing?: "none" | "full-shell"; replaceShell?: boolean; storeEventCursor?: boolean } = {},
+) {
   const db = await openCacheDb();
   const tx = db.transaction(["meta", "hosts", "sessions", "events"] satisfies StoreName[], "readwrite");
   const hosts = tx.objectStore("hosts");
@@ -135,7 +138,8 @@ export async function applySync(payload: SyncResponse, options: { replaceShell?:
       sessions.put(session);
     }
   }
-  if (options.replaceShell) {
+  const shouldPruneMissing = options.pruneMissing === "full-shell" || options.replaceShell === true;
+  if (shouldPruneMissing) {
     queueDeleteMissingHosts(hosts, liveHostIds);
     const cursorReq = sessions.openCursor();
     cursorReq.onsuccess = () => {
@@ -150,13 +154,14 @@ export async function applySync(payload: SyncResponse, options: { replaceShell?:
     };
   }
   for (const event of payload.events) events.put(event);
-  meta.put({ key: "syncCursor", value: payload.cursor });
+  if (options.storeEventCursor !== false) meta.put({ key: "syncCursor", value: payload.cursor });
+  if (payload.metadataCursor) meta.put({ key: "metadataCursor", value: payload.metadataCursor });
   meta.put({ key: "lastSyncAt", value: new Date().toISOString() });
 
   await transactionDone(tx);
 }
 
-export async function cacheShell(hostsInput: HostInfo[], sessionsInput: SessionInfo[]) {
+export async function cacheShell(hostsInput: HostInfo[], sessionsInput: SessionInfo[], options: { authoritative?: boolean } = {}) {
   const db = await openCacheDb();
   const tx = db.transaction(["hosts", "sessions", "events"] satisfies StoreName[], "readwrite");
   const hosts = tx.objectStore("hosts");
@@ -173,18 +178,20 @@ export async function cacheShell(hostsInput: HostInfo[], sessionsInput: SessionI
       sessions.put(session);
     }
   }
-  queueDeleteMissingHosts(hosts, liveHostIds);
-  const cursorReq = sessions.openCursor();
-  cursorReq.onsuccess = () => {
-    const cursor = cursorReq.result;
-    if (!cursor) return;
-    const session = cursor.value as SessionInfo;
-    if (!liveSessionIds.has(session.id)) {
-      sessions.delete(cursor.primaryKey);
-      queueDeleteEventsForSession(events, session.id);
-    }
-    cursor.continue();
-  };
+  if (options.authoritative !== false) {
+    queueDeleteMissingHosts(hosts, liveHostIds);
+    const cursorReq = sessions.openCursor();
+    cursorReq.onsuccess = () => {
+      const cursor = cursorReq.result;
+      if (!cursor) return;
+      const session = cursor.value as SessionInfo;
+      if (!liveSessionIds.has(session.id)) {
+        sessions.delete(cursor.primaryKey);
+        queueDeleteEventsForSession(events, session.id);
+      }
+      cursor.continue();
+    };
+  }
   await transactionDone(tx);
 }
 

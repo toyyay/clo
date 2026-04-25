@@ -112,6 +112,40 @@ function sameEntityList<T extends object>(current: T[], next: T[], keyOf: (item:
   return true;
 }
 
+function shortId(value: string, size = 8) {
+  return value.length <= size ? value : value.slice(0, size);
+}
+
+function sourceProviderLabel(session: SessionInfo) {
+  const provider = session.sourceProvider || (session.id.startsWith("v2:") ? "v2" : "legacy");
+  if (provider === "claude") return "Claude";
+  if (provider === "codex") return "Codex";
+  if (provider === "gemini") return "Gemini";
+  if (provider === "legacy") return "Legacy";
+  return provider.slice(0, 1).toUpperCase() + provider.slice(1);
+}
+
+function sourceGenerationLabel(session: SessionInfo) {
+  return session.sourceGeneration ? `g${session.sourceGeneration}` : null;
+}
+
+function hostLabel(hostname: string, agentId: string, duplicateHostnames: Set<string>) {
+  return duplicateHostnames.has(hostname) ? `${hostname} · ${shortId(agentId)}` : hostname;
+}
+
+function sessionSourceTitle(session: SessionInfo) {
+  return [
+    `Provider: ${sourceProviderLabel(session)}`,
+    `Host: ${session.hostname}`,
+    `Agent: ${session.agentId}`,
+    session.sourceGeneration ? `Generation: ${session.sourceGeneration}` : null,
+    `Source: ${session.sourcePath}`,
+    session.gitBranch ? `Git: ${session.gitBranch}${session.gitCommit ? ` @ ${shortId(session.gitCommit, 10)}` : ""}` : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 function openRouterStatusLabel(settings: AppSettingsInfo | null) {
   const status = settings?.openRouter.status;
   if (status === "ok") return "ready";
@@ -905,7 +939,8 @@ export function App() {
           }
         },
       });
-      const shouldRefreshCache = !silent || result.events > 0 || result.hasMore || metadataOnly;
+      const shouldRefreshCache =
+        !silent || result.events > 0 || result.hasMore || result.hosts > 0 || result.sessions > 0 || result.metadataFull;
       let refreshedSessions = sessionsRef.current;
       if (shouldRefreshCache) {
         if (metadataOnly) {
@@ -1425,12 +1460,32 @@ export function App() {
     };
   }, [isAuthenticated, syncNow]);
 
+  const duplicateHostnames = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const host of hosts) counts.set(host.hostname, (counts.get(host.hostname) ?? 0) + 1);
+    return new Set([...counts.entries()].filter(([, count]) => count > 1).map(([hostname]) => hostname));
+  }, [hosts]);
+
   const filteredSessions = useMemo(() => {
     const q = query.trim().toLowerCase();
     return sessions.filter((session) => {
       if (activeHost !== "all" && session.agentId !== activeHost) return false;
       if (!q) return true;
-      return [session.hostname, session.projectName, session.title, session.sessionId, session.sourcePath]
+      return [
+        session.hostname,
+        session.agentId,
+        session.projectName,
+        session.projectKey,
+        session.title,
+        session.sessionId,
+        session.sourcePath,
+        session.sourceProvider,
+        session.sourceKind,
+        session.sourceGeneration,
+        session.gitBranch,
+        session.gitCommit,
+        session.gitRemoteUrl,
+      ]
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(q));
     });
@@ -1568,8 +1623,9 @@ export function App() {
                 key={host.agentId}
                 className={`host-chip ${activeHost === host.agentId ? "active" : ""}`}
                 onClick={() => setActiveHost(host.agentId)}
+                title={`${host.hostname}\n${host.agentId}${host.sourceRoot ? `\n${host.sourceRoot}` : ""}`}
               >
-                {host.hostname}
+                {hostLabel(host.hostname, host.agentId, duplicateHostnames)}
                 <span>{host.sessionCount}</span>
               </button>
             ))}
@@ -1595,10 +1651,16 @@ export function App() {
                     key={session.id}
                     className={`session-item ${active?.id === session.id ? "active" : ""}`}
                     onClick={() => selectSession(session)}
+                    title={sessionSourceTitle(session)}
                   >
                     <span className="session-title">{session.title || session.sessionId.slice(0, 8)}</span>
                     <span className="session-meta">
-                      {session.hostname} / {session.eventCount}
+                      {sourceProviderLabel(session)} · {hostLabel(session.hostname, session.agentId, duplicateHostnames)} ·{" "}
+                      {session.eventCount.toLocaleString()}
+                    </span>
+                    <span className="session-source">
+                      {sourceGenerationLabel(session) ? `${sourceGenerationLabel(session)} · ` : ""}
+                      {session.sourcePath}
                     </span>
                   </button>
                 ))}
@@ -1628,7 +1690,12 @@ export function App() {
                 <div>
                   <div className="chat-title">{active.title || active.sessionId}</div>
                   <div className="chat-subtitle">
-                    {active.hostname} / {active.projectName}
+                    {sourceProviderLabel(active)} / {active.projectName} / {hostLabel(active.hostname, active.agentId, duplicateHostnames)}
+                  </div>
+                  <div className="chat-source" title={sessionSourceTitle(active)}>
+                    <span className="source-pill">{active.id.startsWith("v2:") ? "v2" : "legacy"}</span>
+                    {sourceGenerationLabel(active) && <span className="source-pill">{sourceGenerationLabel(active)}</span>}
+                    <span className="chat-source-path">{active.sourcePath}</span>
                   </div>
                 </div>
                 <div className="chat-count">{events.length}</div>

@@ -27,9 +27,11 @@ export type PullResult = {
   events: number;
   batches: number;
   cursor: string;
+  metadataCursor?: string;
   hasMore: boolean;
   hosts: number;
   sessions: number;
+  metadataFull: boolean;
   touchedSessionIds: string[];
 };
 
@@ -61,6 +63,14 @@ const DEFAULT_MAX_BATCHES = 4;
 const DEFAULT_TIMEOUT_MS = 20_000;
 
 let preferredReadApi: "v2" | "legacy" | null = null;
+
+export function metadataModeForCursor(metadataCursor?: string): "full" | "delta" {
+  return metadataCursor ? "delta" : "full";
+}
+
+export function metadataPruneMode(payload: Pick<SyncResponse, "metadataFull" | "metadataMode">, previousMetadataCursor?: string) {
+  return payload.metadataFull === true || (payload.metadataMode !== "delta" && !previousMetadataCursor) ? "full-shell" : "none";
+}
 
 class ReadApiError extends Error {
   status: number;
@@ -101,14 +111,21 @@ function normalizeSessionEventsPayload(
   throw new Error(`${source} session events payload was not recognized`);
 }
 
-async function fetchBatch(cursor: string, limitBytes: number, timeoutMs: number, metadataOnly: boolean): Promise<SyncResponse> {
+async function fetchBatch(
+  cursor: string,
+  limitBytes: number,
+  timeoutMs: number,
+  metadataOnly: boolean,
+  metadataCursor?: string,
+): Promise<SyncResponse> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
+    const metadataMode = metadataOnly ? metadataModeForCursor(metadataCursor) : undefined;
     const response = await fetch(READ_API_ENDPOINTS.sync, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ cursor, limitBytes, metadataOnly }),
+      body: JSON.stringify({ cursor, limitBytes, metadataOnly, metadataCursor, metadataMode }),
       signal: controller.signal,
     });
     if (!response.ok) {
@@ -170,28 +187,40 @@ export async function pullUpdates(options: PullOptions = {}): Promise<PullResult
   const metadataOnly = options.metadataOnly !== false;
   const onProgress = options.onProgress;
   let cursor = (await getMeta<string>("syncCursor")) ?? "0";
+  let metadataCursor = await getMeta<string>("metadataCursor");
   let events = 0;
   let batches = 0;
   let hasMore = false;
   let hosts = 0;
   let sessions = 0;
+  let metadataFull = false;
   const touchedSessionIds = new Set<string>();
 
   while (batches < maxBatches) {
     const previousCursor = cursor;
-    const payload = await fetchBatch(previousCursor, limitBytes, timeoutMs, metadataOnly);
-    if (payload.hasMore && payload.cursor === previousCursor) throw new Error("sync cursor did not advance");
-    cursor = payload.cursor;
-    hasMore = payload.hasMore;
+    const previousMetadataCursor = metadataCursor;
+    const payload = await fetchBatch(previousCursor, limitBytes, timeoutMs, metadataOnly, metadataCursor);
+    const nextHasMore = metadataOnly ? payload.metadataHasMore === true || payload.hasMore === true : payload.hasMore;
+    if (!metadataOnly && payload.hasMore && payload.cursor === previousCursor) throw new Error("sync cursor did not advance");
+    if (metadataOnly && nextHasMore && payload.metadataCursor === previousMetadataCursor) {
+      throw new Error("metadata cursor did not advance");
+    }
+    if (!metadataOnly) cursor = payload.cursor;
+    metadataCursor = payload.metadataCursor ?? metadataCursor;
+    hasMore = nextHasMore;
+    metadataFull = metadataFull || payload.metadataFull === true || (metadataOnly && payload.metadataMode !== "delta" && !previousMetadataCursor);
     hosts += payload.hosts.length;
     sessions += payload.sessions.length;
-    await applySync(payload, { replaceShell: metadataOnly });
+    await applySync(payload, {
+      pruneMissing: metadataOnly ? metadataPruneMode(payload, previousMetadataCursor) : "none",
+      storeEventCursor: !metadataOnly,
+    });
     for (const event of payload.events) touchedSessionIds.add(event.sessionDbId);
     events += payload.events.length;
     batches += 1;
-    onProgress?.({ events, batches, hasMore: payload.hasMore });
-    if (!payload.hasMore || metadataOnly) break;
+    onProgress?.({ events, batches, hasMore });
+    if (!hasMore) break;
   }
 
-  return { events, batches, cursor, hasMore, hosts, sessions, touchedSessionIds: [...touchedSessionIds] };
+  return { events, batches, cursor, metadataCursor, hasMore, hosts, sessions, metadataFull, touchedSessionIds: [...touchedSessionIds] };
 }

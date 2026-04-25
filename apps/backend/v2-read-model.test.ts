@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  getV2SessionsMeta,
   getV2Session,
   listV2EventsForSync,
   mapV2EventRow,
@@ -23,6 +24,8 @@ describe("v2 read model helpers", () => {
       agent_id: "agent-1",
       hostname: "workstation",
       provider: "claude",
+      source_kind: "conversation",
+      current_generation: 3,
       source_path: "my-project/session-a.jsonl",
       size_bytes: 2048n,
       mtime_ms: 1234,
@@ -41,6 +44,10 @@ describe("v2 read model helpers", () => {
       id: "v2:42",
       agentId: "agent-1",
       hostname: "workstation",
+      sourceProvider: "claude",
+      sourceKind: "conversation",
+      sourceGeneration: 3,
+      sourceId: "42",
       projectKey: "my-project",
       projectName: "my-project",
       sessionId: "session-a",
@@ -138,6 +145,17 @@ describe("v2 read model helpers", () => {
     expect(text.indexOf("row_number() over")).toBeLessThan(text.indexOf("where visible.id > ?"));
     expect(text).toContain("and f.source_kind = 'conversation' and f.deleted_at is null");
     expect(calls[0].values).toEqual([10n, 25]);
+  });
+
+  test("v2 metadata lookup can return deleted tombstones for delta sync", async () => {
+    const { calls, sql } = recordingSql();
+
+    await getV2SessionsMeta(sql, ["42"], { includeDeleted: true });
+
+    expect(calls).toHaveLength(1);
+    const text = normalizeSql(calls[0].text);
+    expect(text).toContain("where f.id = any(?::bigint[]) and f.source_kind = 'conversation'");
+    expect(text).not.toContain("and f.deleted_at is null");
   });
 
   test("merges legacy and v2 host counts without dropping host metadata", () => {
