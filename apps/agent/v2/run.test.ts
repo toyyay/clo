@@ -112,10 +112,11 @@ describe("agent-v2 live runner", () => {
 
   test("parses repeated roots and env roots for watch or one-shot commands", () => {
     const options = parseAgentV2RunArgs(
-      ["--root", "claude=/tmp/claude", "--root=codex=/tmp/codex", "--once"],
+      ["--root", "claude=/tmp/claude", "--root=codex=/tmp/codex", "--once", "--log-idle-every-scans", "0"],
       { BACKEND_URL: "http://backend.test", AGENT_TOKEN: "token" },
     );
     expect(options.once).toBe(true);
+    expect(options.logIdleEveryScans).toBe(0);
     expect(options.roots).toEqual([
       { provider: "claude", rootPath: "/tmp/claude" },
       { provider: "codex", rootPath: "/tmp/codex" },

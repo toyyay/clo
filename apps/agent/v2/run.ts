@@ -29,6 +29,7 @@ export type AgentV2RunOptions = {
   readChunkBytes?: number;
   appendPath?: string;
   fetchPolicy?: boolean;
+  logIdleEveryScans?: number;
   once?: boolean;
   env?: EnvSource;
   fetchImpl?: typeof fetch;
@@ -51,15 +52,28 @@ export async function runAgentV2(options: AgentV2RunOptions): Promise<void> {
   if (!options.token) throw new Error("AGENT_TOKEN or --token is required");
   const log = options.log ?? console;
   const pollMs = options.pollMs ?? 2000;
+  const logIdleEveryScans = options.logIdleEveryScans ?? 30;
+  let scanCount = 0;
+
+  log.log(
+    `[agent-v2] starting; backend ${trimSlash(options.backendUrl)}, state ${options.statePath}, poll ${pollMs}ms`,
+  );
 
   do {
     try {
       const summary = await scanAndUploadAgentV2(options);
-      const uploadNote = summary.uploadsEnabled ? `uploaded ${summary.uploadedChunkCount}` : "uploads disabled";
-      log.log(
-        `[agent-v2] scanned ${summary.fileCount} file(s), planned ${summary.plannedChunkCount} chunk(s), ${uploadNote}`,
-      );
-      if (summary.skippedCount) log.log(`[agent-v2] skipped ${summary.skippedCount} item(s)`);
+      scanCount += 1;
+      const hasActivity =
+        summary.uploadedChunkCount > 0 ||
+        summary.plannedChunkCount > 0 ||
+        summary.pendingRecordCount > 0 ||
+        summary.skippedCount > 0 ||
+        !summary.uploadsEnabled;
+      const shouldLogIdle = logIdleEveryScans > 0 && scanCount % logIdleEveryScans === 0;
+      if (options.once || hasActivity || shouldLogIdle) {
+        log.log(formatAgentV2Summary(summary, hasActivity ? "activity" : "idle"));
+        if (summary.skippedCount) log.log(`[agent-v2] skipped ${summary.skippedCount} item(s)`);
+      }
     } catch (error) {
       log.error(`[agent-v2] ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -192,6 +206,7 @@ export function parseAgentV2RunArgs(argv: string[], env: EnvSource = process.env
   let pollMs = envPositiveInteger(env, ["POLL_MS", "CHATVIEW_POLL_MS"], 2000);
   let readChunkBytes = envPositiveInteger(env, ["READ_CHUNK_BYTES", "CHATVIEW_READ_CHUNK_BYTES"], 0) || undefined;
   let appendPath = envValue(env, "APPEND_PATH", "AGENT_APPEND_PATH", "CHATVIEW_AGENT_APPEND_PATH") ?? DEFAULT_APPEND_PATH;
+  let logIdleEveryScans = envNonNegativeInteger(env, ["LOG_IDLE_EVERY_SCANS", "CHATVIEW_LOG_IDLE_EVERY_SCANS"], 30);
   let fetchPolicy = true;
   let once = false;
 
@@ -218,6 +233,8 @@ export function parseAgentV2RunArgs(argv: string[], env: EnvSource = process.env
       readChunkBytes = positiveInteger(argv[++i], readChunkBytes);
     } else if (value === "--append-path") {
       appendPath = argv[++i] ?? appendPath;
+    } else if (value === "--log-idle-every-scans") {
+      logIdleEveryScans = nonNegativeInteger(argv[++i], logIdleEveryScans) ?? logIdleEveryScans;
     } else if (value === "--no-fetch-policy") {
       fetchPolicy = false;
     } else if (value === "--once") {
@@ -233,6 +250,7 @@ export function parseAgentV2RunArgs(argv: string[], env: EnvSource = process.env
     pollMs,
     readChunkBytes,
     appendPath,
+    logIdleEveryScans,
     fetchPolicy,
     once,
     env,
@@ -281,6 +299,18 @@ function countPendingRecords(batches: TailBatch[]) {
   return batches.reduce((sum, batch) => sum + batch.records.length, 0);
 }
 
+function formatAgentV2Summary(summary: AgentV2ScanSummary, mode: "activity" | "idle") {
+  const uploadNote = summary.uploadsEnabled ? `uploaded ${summary.uploadedChunkCount}` : "uploads disabled";
+  return [
+    `[agent-v2] ${mode}`,
+    `files ${summary.fileCount}`,
+    `pending ${summary.pendingRecordCount}`,
+    `planned ${summary.plannedChunkCount}`,
+    uploadNote,
+    `policy ${summary.policySource}`,
+  ].join("; ");
+}
+
 function normalizePath(value: string) {
   return value.startsWith("/") ? value : `/${value}`;
 }
@@ -293,6 +323,20 @@ function positiveInteger(value: string | undefined, fallback: number | undefined
   if (!value) return fallback;
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function envNonNegativeInteger(env: EnvSource, names: string[], fallback: number) {
+  for (const name of names) {
+    const parsed = nonNegativeInteger(envValue(env, name), undefined);
+    if (parsed !== undefined) return parsed;
+  }
+  return fallback;
+}
+
+function nonNegativeInteger(value: string | undefined, fallback: number | undefined) {
+  if (value === undefined || value === "") return fallback;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 function sleep(ms: number) {

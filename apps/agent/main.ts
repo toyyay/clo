@@ -655,6 +655,8 @@ Options:
   --state <path>           Agent state file (v2 default: ~/.chatview-agent/v2-state.json)
   --poll-ms <ms>           Poll interval (default: 2000)
   --append-path <path>     v2 append endpoint path (default: /api/agent/v1/append)
+  --log-idle-every-scans <n>
+                           Idle heartbeat frequency; 0 disables idle logs (default: 30)
 
 Agent v2 dry-run:
   --root <kind=path>       Scan a temp/specific root for claude, codex, or gemini
