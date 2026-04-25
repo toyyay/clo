@@ -131,6 +131,51 @@ export type SyncResponse = {
   events: SessionEvent[];
 };
 
+export type AppLogLevel = "debug" | "info" | "warn" | "error" | "fatal";
+export type AppLogSource = "frontend" | "backend";
+
+export type AppLogInput = {
+  id?: string;
+  source?: AppLogSource;
+  level: AppLogLevel;
+  event: string;
+  message?: string | null;
+  tags?: string[];
+  context?: unknown;
+  client?: unknown;
+  createdAt?: string;
+};
+
+export type AppLogBatchRequest = {
+  logs: AppLogInput[];
+};
+
+export type AppLogBatchResponse = {
+  ok: true;
+  accepted: number;
+};
+
+export type AppLogInfo = {
+  id: string;
+  source: AppLogSource;
+  level: AppLogLevel;
+  event: string;
+  message?: string | null;
+  tags: string[];
+  context: unknown;
+  client: unknown;
+  request: unknown;
+  url?: string | null;
+  userAgent?: string | null;
+  clientLogId?: string | null;
+  clientCreatedAt?: string | null;
+  createdAt: string;
+};
+
+export type AppLogListResponse = {
+  logs: AppLogInfo[];
+};
+
 export type StreamMessage = {
   type: "ingest";
   agentId: string;

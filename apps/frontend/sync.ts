@@ -5,6 +5,7 @@ export type PullResult = {
   events: number;
   batches: number;
   cursor: string;
+  hasMore: boolean;
 };
 
 export type PullProgress = {
@@ -15,6 +16,8 @@ export type PullProgress = {
 
 export type PullOptions = {
   limitBytes?: number;
+  maxBatches?: number;
+  timeoutMs?: number;
   onProgress?: (progress: PullProgress) => void;
 };
 
@@ -27,45 +30,56 @@ export class SyncAuthError extends Error {
   }
 }
 
-const DEFAULT_LIMIT_BYTES = 8 * 1024 * 1024;
+const DEFAULT_LIMIT_BYTES = 2 * 1024 * 1024;
+const DEFAULT_MAX_BATCHES = 4;
+const DEFAULT_TIMEOUT_MS = 20_000;
 
-async function fetchBatch(cursor: string, limitBytes: number): Promise<SyncResponse> {
-  const response = await fetch("/api/sync", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ cursor, limitBytes }),
-  });
-  if (!response.ok) {
-    const body = await response.text();
-    if (response.status === 401 || response.status === 403) throw new SyncAuthError(response.status, body);
-    throw new Error(`sync failed: ${response.status} ${body}`);
+async function fetchBatch(cursor: string, limitBytes: number, timeoutMs: number): Promise<SyncResponse> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch("/api/sync", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cursor, limitBytes }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      if (response.status === 401 || response.status === 403) throw new SyncAuthError(response.status, body);
+      throw new Error(`sync failed: ${response.status} ${body}`);
+    }
+    return (await response.json()) as SyncResponse;
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw new Error("sync timed out");
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
   }
-  return (await response.json()) as SyncResponse;
 }
 
 export async function pullUpdates(options: PullOptions = {}): Promise<PullResult> {
   const limitBytes = options.limitBytes ?? DEFAULT_LIMIT_BYTES;
+  const maxBatches = Math.max(1, options.maxBatches ?? DEFAULT_MAX_BATCHES);
+  const timeoutMs = Math.max(1000, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const onProgress = options.onProgress;
   let cursor = (await getMeta<string>("syncCursor")) ?? "0";
   let events = 0;
   let batches = 0;
+  let hasMore = false;
 
-  let pending: Promise<SyncResponse> = fetchBatch(cursor, limitBytes);
-
-  for (;;) {
-    const payload = await pending;
+  while (batches < maxBatches) {
+    const previousCursor = cursor;
+    const payload = await fetchBatch(previousCursor, limitBytes, timeoutMs);
     cursor = payload.cursor;
-    // Kick off the next network request before we block on IndexedDB so the
-    // two pipelines overlap — server hands over the next batch while the
-    // client persists the current one.
-    const next = payload.hasMore ? fetchBatch(cursor, limitBytes) : null;
+    hasMore = payload.hasMore;
     await applySync(payload);
     events += payload.events.length;
     batches += 1;
     onProgress?.({ events, batches, hasMore: payload.hasMore });
-    if (!next) break;
-    pending = next;
+    if (!payload.hasMore) break;
+    if (payload.cursor === previousCursor) throw new Error("sync cursor did not advance");
   }
 
-  return { events, batches, cursor };
+  return { events, batches, cursor, hasMore };
 }

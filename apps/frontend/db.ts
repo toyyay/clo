@@ -1,9 +1,17 @@
 import type { HostInfo, SessionEvent, SessionInfo, SyncResponse } from "../../packages/shared/types";
 
 const DB_NAME = "chatview-cache";
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 
-type StoreName = "meta" | "hosts" | "sessions" | "events" | "ydocs" | "audioRecordings" | "audioChunks";
+type StoreName =
+  | "meta"
+  | "hosts"
+  | "sessions"
+  | "events"
+  | "ydocs"
+  | "audioRecordings"
+  | "audioChunks"
+  | "clientLogs";
 
 export type CachedYDoc = {
   docId: string;
@@ -49,10 +57,29 @@ export function openCacheDb() {
         const chunks = db.createObjectStore("audioChunks", { keyPath: "id" });
         chunks.createIndex("recordingId", "recordingId");
       }
+      if (!db.objectStoreNames.contains("clientLogs")) {
+        const logs = db.createObjectStore("clientLogs", { keyPath: "id" });
+        logs.createIndex("createdAt", "createdAt");
+        logs.createIndex("level", "level");
+      }
     };
 
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve(request.result);
+    request.onblocked = () => {
+      dbPromise = null;
+      reject(new Error("IndexedDB upgrade is blocked by another open tab"));
+    };
+    request.onerror = () => {
+      dbPromise = null;
+      reject(request.error);
+    };
+    request.onsuccess = () => {
+      const db = request.result;
+      db.onversionchange = () => {
+        db.close();
+        dbPromise = null;
+      };
+      resolve(db);
+    };
   });
   return dbPromise;
 }
@@ -134,7 +161,16 @@ export async function saveYDocUpdate(docId: string, update: string) {
 
 export async function loadCacheStats(): Promise<CacheStats> {
   const db = await openCacheDb();
-  const storeNames: StoreName[] = ["meta", "hosts", "sessions", "events", "ydocs", "audioRecordings", "audioChunks"];
+  const storeNames: StoreName[] = [
+    "meta",
+    "hosts",
+    "sessions",
+    "events",
+    "ydocs",
+    "audioRecordings",
+    "audioChunks",
+    "clientLogs",
+  ];
   const indexedDb = Object.fromEntries(
     await Promise.all(
       storeNames.map(async (name) => [name, await request<number>(db.transaction(name).objectStore(name).count())] as const),

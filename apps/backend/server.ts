@@ -7,6 +7,7 @@ import * as Y from "yjs";
 import type { ServerWebSocket } from "bun";
 import type {
   AppSettingsInfo,
+  AppLogBatchRequest,
   AudioTranscriptPayload,
   AudioTranscriptionInfo,
   HostInfo,
@@ -30,6 +31,7 @@ import {
   type OpenRouterReasoningEffort,
 } from "../../packages/shared/types";
 import { downloadAgentArchiveResponse } from "./agent-download";
+import { handleClientLogRequest, listAppLogs, logBackendEvent } from "./app-logs";
 import { envFlag, envPositiveInteger, envValue } from "../../packages/shared/env";
 import { prepareDatabase, sql, toId, toNumber } from "./db";
 import { detectMedia, fileExtension, filenameFromContentDisposition } from "./media-detect";
@@ -86,6 +88,30 @@ if (!webToken) {
   console.warn("WEB_TOKEN is not set; web UI login is disabled and protected browser APIs return 401");
 }
 
+process.on("unhandledRejection", (reason) => {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  console.error("unhandled rejection", message);
+  void logBackendEvent({
+    level: "error",
+    event: "backend.unhandled_rejection",
+    message,
+    tags: ["backend", "process"],
+    context: errorToLogContext(reason),
+  });
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("uncaught exception", error);
+  void logBackendEvent({
+    level: "fatal",
+    event: "backend.uncaught_exception",
+    message: error.message,
+    tags: ["backend", "process"],
+    context: errorToLogContext(error),
+  }).finally(() => process.exit(1));
+  setTimeout(() => process.exit(1), 1000).unref?.();
+});
+
 await prepareDatabase();
 void refreshOpenRouterStatus("startup").catch((error) => {
   console.error("OpenRouter startup check failed", error instanceof Error ? error.message : String(error));
@@ -137,8 +163,53 @@ Bun.serve<{ docIds: Set<string> }>({
       const auth = requireWebAuth(req);
       if (auth) return auth;
       if (req.method !== "POST") return text("method not allowed", 405);
+      const started = performance.now();
       const body = (await req.json().catch(() => ({}))) as SyncRequest;
-      return json(await sync(body));
+      try {
+        const result = await sync(body);
+        const durationMs = Math.round(performance.now() - started);
+        if (result.hasMore || durationMs > 1000) {
+          void logBackendEvent({
+            level: "info",
+            event: "sync.batch",
+            message: "served sync batch",
+            tags: ["sync"],
+            context: {
+              durationMs,
+              cursor: body.cursor ?? null,
+              nextCursor: result.cursor,
+              limitBytes: body.limitBytes ?? null,
+              hosts: result.hosts.length,
+              sessions: result.sessions.length,
+              events: result.events.length,
+              approxBytes: result.approxBytes,
+              hasMore: result.hasMore,
+            },
+          });
+        }
+        return json(result);
+      } catch (error) {
+        void logBackendEvent({
+          level: "error",
+          event: "sync.failed",
+          message: error instanceof Error ? error.message : String(error),
+          tags: ["sync"],
+          context: {
+            body,
+            durationMs: Math.round(performance.now() - started),
+            error: errorToLogContext(error),
+          },
+        });
+        return text(error instanceof Error ? error.message : "sync failed", 500);
+      }
+    },
+    "/api/app/logs": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      if (req.method === "GET") return json(await listAppLogs(req));
+      if (req.method !== "POST") return text("method not allowed", 405);
+      const body = (await req.json().catch(() => ({}))) as AppLogBatchRequest;
+      return json(await handleClientLogRequest(req, body));
     },
     "/api/yjs/sync": async (req: Request) => {
       const auth = requireWebAuth(req);
@@ -278,6 +349,17 @@ function json(value: unknown, status = 200, headers?: HeadersInit) {
 
 function text(value: string, status = 200) {
   return new Response(value, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
+}
+
+function errorToLogContext(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+  return { value: String(error) };
 }
 
 function isAuthorized(req: Request) {
@@ -631,6 +713,13 @@ async function handleAuthenticatedAudioUpload(req: Request) {
     return finishImportResponse(requestId, { ok: true, requestId, ...result }, 200);
   } catch (error) {
     const message = error instanceof Error ? error.message : "audio upload failed";
+    void logBackendEvent({
+      level: "error",
+      event: "audio.upload_failed",
+      message,
+      tags: ["audio", "upload"],
+      context: { requestId: toId(requestId), error: errorToLogContext(error) },
+    });
     return finishImportResponse(requestId, { ok: false, requestId, error: message }, 500);
   }
 }
@@ -814,6 +903,19 @@ async function processAudioTranscription(transcriptionId: string) {
           updated_at = now()
       where id = ${transcriptionId}
     `;
+    void logBackendEvent({
+      level: "error",
+      event: "audio.transcription_failed",
+      message,
+      tags: ["audio", "transcription"],
+      context: {
+        transcriptionId,
+        mediaId: toId(row.media_id),
+        model: row.model,
+        reasoningEffort: row.reasoning_effort,
+        error: errorToLogContext(error),
+      },
+    });
   }
 }
 
@@ -1125,6 +1227,13 @@ async function handleImportMedia(req: Request) {
     return finishImportResponse(requestId, { ok: true, requestId, ...result }, 200);
   } catch (error) {
     const message = error instanceof Error ? error.message : "import ingest failed";
+    void logBackendEvent({
+      level: "error",
+      event: "import.ingest_failed",
+      message,
+      tags: ["import"],
+      context: { requestId: toId(requestId), error: errorToLogContext(error) },
+    });
     return finishImportResponse(requestId, { ok: false, requestId, error: message }, 500);
   }
 }
@@ -1719,9 +1828,44 @@ async function getSessionMeta(id: string): Promise<SessionInfo | null> {
 }
 
 async function getSessionsMeta(ids: string[]): Promise<SessionInfo[]> {
-  if (!ids.length) return [];
-  const results = await Promise.all(ids.map((id) => getSessionMeta(id)));
-  return results.filter((s): s is SessionInfo => s !== null);
+  const uniqueIds = [...new Set(ids.map(String).filter((id) => /^\d+$/.test(id)))];
+  if (!uniqueIds.length) return [];
+  const rows = await sql`
+    select
+      s.id,
+      s.agent_id,
+      a.hostname,
+      p.project_key,
+      p.display_name as project_name,
+      s.session_id,
+      s.title,
+      s.source_path,
+      s.size_bytes,
+      s.mtime_ms,
+      s.first_seen_at,
+      s.last_seen_at,
+      s.content_sha256,
+      s.mime_type,
+      s.encoding,
+      s.line_count,
+      s.mode,
+      s.symlink_target,
+      s.git_repo_root,
+      s.git_branch,
+      s.git_commit,
+      s.git_dirty,
+      s.git_remote_url,
+      s.deleted_at,
+      count(e.id) as event_count
+    from chat_sessions s
+    join agents a on a.id = s.agent_id
+    join projects p on p.id = s.project_id
+    left join session_events e on e.session_db_id = s.id
+    where s.id = any(${uniqueIds}::bigint[])
+    group by s.id, a.hostname, p.project_key, p.display_name
+  `;
+  const byId = new Map(rows.map((row: any) => [toId(row.id), mapSession(row)] as const));
+  return uniqueIds.map((id) => byId.get(id)).filter((session): session is SessionInfo => Boolean(session));
 }
 
 async function getSession(id: string): Promise<SessionPayload | null> {

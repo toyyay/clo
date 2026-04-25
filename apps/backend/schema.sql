@@ -228,3 +228,32 @@ create index if not exists idx_openrouter_call_logs_media
 
 create index if not exists idx_openrouter_call_logs_transcription
   on openrouter_call_logs (transcription_id, created_at desc);
+
+create table if not exists app_logs (
+  id bigserial primary key,
+  source text not null,
+  level text not null,
+  event text not null,
+  message text,
+  tags text[] not null default '{}'::text[],
+  context jsonb not null default '{}'::jsonb,
+  client jsonb not null default '{}'::jsonb,
+  request jsonb not null default '{}'::jsonb,
+  url text,
+  user_agent text,
+  client_log_id text,
+  client_created_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_app_logs_created
+  on app_logs (created_at desc);
+
+create index if not exists idx_app_logs_source_level
+  on app_logs (source, level, created_at desc);
+
+create index if not exists idx_app_logs_event
+  on app_logs (event, created_at desc);
+
+create index if not exists idx_app_logs_tags
+  on app_logs using gin (tags);
