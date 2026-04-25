@@ -160,6 +160,18 @@ export function normalizeCodexRecord(raw: unknown, options: NormalizeOptions = {
   const timestamp = extractTimestamp(object, item, message);
   const lowerType = (rawType ?? "").toLowerCase();
   const lowerKind = rawKind.toLowerCase();
+  const payload = asObject(object?.payload);
+
+  if (payload) {
+    const payloadKind = stringValue(payload.type) ?? rawKind;
+    const payloadEvent = normalizeCodexPayloadEnvelope(raw, payload, {
+      source: sourceMetadata(raw, { ...options, provider: "codex", rawType, rawKind: payloadKind }),
+      timestamp,
+      rawKind: payloadKind,
+      envelopeType: lowerType,
+    });
+    if (payloadEvent) return payloadEvent;
+  }
 
   if (isSessionLike(lowerType, lowerKind)) {
     return {
@@ -304,6 +316,80 @@ export function normalizeUnknownRecord(raw: unknown, options: NormalizeOptions =
   };
 }
 
+function normalizeCodexPayloadEnvelope(
+  raw: unknown,
+  payload: JsonObject,
+  context: { source: TranscriptSourceMetadata; timestamp?: string; rawKind: string; envelopeType: string },
+): TranscriptEvent | null {
+  const payloadType = stringValue(payload.type)?.toLowerCase() ?? context.rawKind.toLowerCase();
+
+  if (context.envelopeType === "response_item") return normalizeCodexItem(raw, payload, context);
+
+  if (context.envelopeType === "event_msg") {
+    if (payloadType === "user_message") {
+      return {
+        kind: "event",
+        role: "system",
+        parts: [{ kind: "event", name: context.rawKind, data: compactEventData(payload) }],
+        timestamp: context.timestamp,
+        display: false,
+        source: context.source,
+        raw,
+      };
+    }
+
+    if (payloadType === "agent_message") {
+      return {
+        kind: "event",
+        role: "system",
+        parts: [{ kind: "event", name: context.rawKind, data: compactEventData(payload) }],
+        timestamp: context.timestamp,
+        display: false,
+        source: context.source,
+        raw,
+      };
+    }
+
+    if (payloadType === "exec_command_begin") {
+      return {
+        kind: "tool_call",
+        role: "tool",
+        parts: [codexToolCallPart(payload, context.rawKind)],
+        timestamp: context.timestamp,
+        display: true,
+        source: context.source,
+        raw,
+      };
+    }
+
+    if (payloadType === "exec_command_end") {
+      return {
+        kind: "tool_result",
+        role: "tool",
+        parts: [codexToolResultPart(payload)],
+        timestamp: context.timestamp,
+        display: true,
+        source: context.source,
+        raw,
+      };
+    }
+  }
+
+  if (context.envelopeType === "session_meta" || context.envelopeType === "turn_context" || context.envelopeType === "compacted") {
+    return {
+      kind: context.envelopeType === "turn_context" ? "turn" : context.envelopeType.includes("meta") ? "meta" : "session",
+      role: "system",
+      parts: [{ kind: "event", name: context.rawKind, data: payload }],
+      timestamp: context.timestamp,
+      display: false,
+      source: context.source,
+      raw,
+    };
+  }
+
+  return null;
+}
+
 function normalizeCodexItem(
   raw: unknown,
   item: JsonObject,
@@ -319,13 +405,13 @@ function normalizeCodexItem(
       role,
       parts,
       timestamp: context.timestamp,
-      display: parts.length > 0,
+      display: (role === "user" || role === "assistant") && parts.length > 0,
       source: context.source,
       raw,
     };
   }
 
-  if (itemType === "function_call" || itemType === "tool_call") {
+  if (itemType === "function_call" || itemType === "tool_call" || itemType === "custom_tool_call" || itemType === "tool_search_call") {
     return {
       kind: "tool_call",
       role: "tool",
@@ -337,7 +423,12 @@ function normalizeCodexItem(
     };
   }
 
-  if (itemType === "function_call_output" || itemType === "tool_result") {
+  if (
+    itemType === "function_call_output" ||
+    itemType === "tool_result" ||
+    itemType === "custom_tool_call_output" ||
+    itemType === "tool_search_output"
+  ) {
     return {
       kind: "tool_result",
       role: "tool",
@@ -379,8 +470,12 @@ function normalizeCodexOutputItem(entry: unknown): TranscriptPart[] {
 
   const type = stringValue(object.type)?.toLowerCase();
   if (type === "message") return normalizeContentParts(object.content, "codex");
-  if (type === "function_call" || type === "tool_call") return [codexToolCallPart(object, type)];
-  if (type === "function_call_output" || type === "tool_result") return [codexToolResultPart(object)];
+  if (type === "function_call" || type === "tool_call" || type === "custom_tool_call" || type === "tool_search_call") {
+    return [codexToolCallPart(object, type)];
+  }
+  if (type === "function_call_output" || type === "tool_result" || type === "custom_tool_call_output" || type === "tool_search_output") {
+    return [codexToolResultPart(object)];
+  }
   if (type === "reasoning") {
     return normalizeContentParts(object.summary ?? object.content ?? object.text, "codex").map((part) =>
       part.kind === "text" ? ({ kind: "thinking", text: part.text } as const) : part,
@@ -473,7 +568,7 @@ function codexToolCallPart(object: JsonObject, rawKind: string): TranscriptPart 
   const command = object.command ?? object.cmd;
   const input =
     command !== undefined
-      ? { command }
+      ? { command, ...(typeof object.cwd === "string" ? { cwd: object.cwd } : {}) }
       : parseArguments(object.input ?? object.arguments ?? object.parameters ?? object.tool_input ?? object);
   return {
     kind: "tool_call",
@@ -487,8 +582,13 @@ function codexToolResultPart(object: JsonObject): TranscriptPart {
   return {
     kind: "tool_result",
     id: stringValue(object.call_id) ?? stringValue(object.tool_call_id) ?? stringValue(object.id),
-    content: object.output ?? object.content ?? object.result ?? object.message ?? "",
-    isError: booleanValue(object.is_error) ?? booleanValue(object.isError) ?? booleanValue(object.error) ?? stringValue(object.status) === "failed",
+    content: object.output ?? object.formatted_output ?? object.aggregated_output ?? object.stdout ?? object.content ?? object.result ?? object.message ?? "",
+    isError:
+      booleanValue(object.is_error) ??
+      booleanValue(object.isError) ??
+      booleanValue(object.error) ??
+      (stringValue(object.status) === "failed" ? true : undefined) ??
+      (typeof object.exit_code === "number" ? object.exit_code !== 0 : undefined),
   };
 }
 
@@ -608,6 +708,8 @@ function isCodexToolCall(type: string, kind: string) {
     kind.includes("tool_call") ||
     type.includes("function_call") ||
     kind.includes("function_call") ||
+    type.includes("tool_search_call") ||
+    kind.includes("tool_search_call") ||
     type.includes("exec_command_begin") ||
     kind.includes("exec_command_begin")
   );
@@ -619,6 +721,8 @@ function isCodexToolResult(type: string, kind: string) {
     kind.includes("tool_result") ||
     type.includes("function_call_output") ||
     kind.includes("function_call_output") ||
+    type.includes("tool_search_output") ||
+    kind.includes("tool_search_output") ||
     type.includes("tool_output") ||
     kind.includes("tool_output") ||
     type.includes("exec_command_output") ||

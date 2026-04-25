@@ -159,6 +159,72 @@ describe("transcript normalizers", () => {
     });
   });
 
+  test("normalizes current Codex payload envelopes", () => {
+    const assistant = normalizeTranscriptRecord(
+      {
+        type: "response_item",
+        timestamp: "2026-04-25T12:00:00.000Z",
+        payload: {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "**done**" }],
+        },
+      },
+      { provider: "codex" },
+    );
+
+    expect(assistant).toMatchObject({
+      kind: "message",
+      role: "assistant",
+      display: true,
+      source: { provider: "codex", rawType: "response_item", rawKind: "message" },
+      parts: [{ kind: "text", text: "**done**" }],
+    });
+
+    const command = normalizeTranscriptRecord(
+      {
+        type: "event_msg",
+        payload: {
+          type: "exec_command_end",
+          call_id: "call_2",
+          command: "pwd",
+          cwd: "/repo",
+          exit_code: 0,
+          formatted_output: "/repo",
+        },
+      },
+      { provider: "codex" },
+    );
+
+    expect(command).toMatchObject({
+      kind: "tool_result",
+      role: "tool",
+      display: true,
+      source: { rawType: "event_msg", rawKind: "exec_command_end" },
+      parts: [{ kind: "tool_result", id: "call_2", content: "/repo", isError: false }],
+    });
+
+    const meta = normalizeTranscriptRecord(
+      {
+        type: "session_meta",
+        payload: {
+          id: "thread-1",
+          cwd: "/Users/example/project",
+          thread_name: "Investigate parser",
+        },
+      },
+      { provider: "codex" },
+    );
+
+    expect(meta).toMatchObject({
+      kind: "meta",
+      role: "system",
+      display: false,
+      source: { rawType: "session_meta", rawKind: "session_meta" },
+      parts: [{ kind: "event", name: "session_meta", data: { cwd: "/Users/example/project" } }],
+    });
+  });
+
   test("keeps Codex session and unknown records non-display without throwing", () => {
     const session = normalizeTranscriptRecord(
       {

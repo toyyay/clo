@@ -81,6 +81,8 @@ export type UploadChunk = {
   sourcePath: string;
   relativePath: string;
   logicalId: string;
+  sessionId?: string;
+  projectKey?: string;
   sizeBytes: number;
   mtimeMs: number;
   startOffset: number;

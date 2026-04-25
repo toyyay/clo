@@ -29,6 +29,7 @@ describe("agent-v2 upload adapter", () => {
       byteLength: 16,
       rawText: "{\"type\":\"user\"}\n",
       records: [{ lineNo: 1, offset: 0, byteLength: 16, rawLine: "{\"type\":\"user\"}" }],
+      sessionId: "session",
     };
 
     const request = buildAgentV1AppendRequest(agent, chunk);
@@ -36,6 +37,7 @@ describe("agent-v2 upload adapter", () => {
 
     expect(request.source.sourcePath).toBe("codex:2026/04/25/session.jsonl");
     expect(request.files[0].metadata.generation).toBe(1);
+    expect(request.files[0].metadata.sessionId).toBe("session");
     expect(request.chunks[0].rawText).toBe("{\"type\":\"user\"}\n");
     expect(request.chunks[0].rawBytes).toBe(16);
     expect(validated.source.sourcePath).toBe("2026/04/25/session.jsonl");
@@ -45,5 +47,41 @@ describe("agent-v2 upload adapter", () => {
     expect(validated.chunks[0].rawBytes).toBe(16);
     expect(validated.chunks[0].events[0].eventUid).toBe("codex:2026/04/25/session.jsonl:g1:1:0");
     expect(validated.chunks[0].events[0].sourceLineNo).toBe(1);
+  });
+
+  test("extracts Codex project metadata from session_meta payloads", () => {
+    const rawLine = JSON.stringify({
+      type: "session_meta",
+      payload: {
+        id: "thread-1",
+        cwd: "/Users/example/p/chatview",
+      },
+    });
+    const chunk: UploadChunk = {
+      chunkId: "chunk-1",
+      generation: 1,
+      provider: "codex",
+      sourcePath: "/Users/example/.codex/sessions/2026/04/25/session.jsonl",
+      relativePath: "2026/04/25/session.jsonl",
+      logicalId: "codex:2026/04/25/session.jsonl",
+      sizeBytes: rawLine.length + 1,
+      mtimeMs: 1,
+      startOffset: 0,
+      endOffset: rawLine.length + 1,
+      startLine: 1,
+      endLine: 1,
+      byteLength: rawLine.length + 1,
+      rawText: `${rawLine}\n`,
+      records: [{ lineNo: 1, offset: 0, byteLength: rawLine.length + 1, rawLine }],
+    };
+
+    const request = buildAgentV1AppendRequest(agent, chunk);
+
+    expect(request.source.metadata).toMatchObject({
+      generation: 1,
+      projectKey: "-Users-example-p-chatview",
+      projectName: "chatview",
+      sessionId: "thread-1",
+    });
   });
 });

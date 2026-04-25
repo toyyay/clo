@@ -94,6 +94,8 @@ function toChunk(file: InventoryFile, records: TailRecord[], batch: TailBatch): 
     sourcePath: file.sourcePath,
     relativePath: file.relativePath,
     logicalId: file.logicalId,
+    sessionId: file.sessionId,
+    projectKey: file.projectKey,
     sizeBytes: file.sizeBytes,
     mtimeMs: file.mtimeMs,
     startOffset: first.offset,

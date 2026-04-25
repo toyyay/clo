@@ -61,6 +61,32 @@ describe("v2 read model helpers", () => {
     });
   });
 
+  test("maps Codex cwd metadata into project grouping", () => {
+    const session = mapV2SessionRow({
+      id: 7,
+      agent_id: "agent-1",
+      hostname: "workstation",
+      provider: "codex",
+      source_kind: "conversation",
+      current_generation: 1,
+      source_path: "2026/04/25/rollout.jsonl",
+      size_bytes: 100n,
+      mtime_ms: 1,
+      git: {},
+      metadata: { cwd: "/Users/example/p/chatview", sessionId: "thread-1" },
+      first_seen_at: "2026-04-25T10:00:00.000Z",
+      last_seen_at: "2026-04-25T10:05:00.000Z",
+      event_count: 3n,
+    });
+
+    expect(session).toMatchObject({
+      sourceProvider: "codex",
+      projectKey: "-Users-example-p-chatview",
+      projectName: "chatview",
+      sessionId: "thread-1",
+    });
+  });
+
   test("maps normalized event parts into renderable legacy raw payloads", () => {
     const event = mapV2EventRow({
       id: 99,
@@ -121,6 +147,36 @@ describe("v2 read model helpers", () => {
         role: "system",
         display: false,
         parts: [{ kind: "event", name: "session_configured" }],
+      },
+    });
+  });
+
+  test("repairs old Codex payload events when reading v2 transcripts", () => {
+    const raw = normalizedEventToLegacyRaw({
+      kind: "event",
+      role: "system",
+      display: false,
+      source: { provider: "codex", rawType: "response_item", rawKind: "response_item" },
+      parts: [
+        {
+          kind: "event",
+          name: "response_item",
+          data: {
+            payload: {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "visible now" }],
+            },
+          },
+        },
+      ],
+    });
+
+    expect(raw).toMatchObject({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "visible now" }],
       },
     });
   });

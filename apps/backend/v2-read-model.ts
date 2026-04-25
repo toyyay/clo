@@ -1,4 +1,5 @@
 import type { HostInfo, SessionEvent, SessionInfo, SessionPayload } from "../../packages/shared/types";
+import { normalizeTranscriptRecord } from "../../packages/parsers";
 
 export const V2_SESSION_ID_PREFIX = "v2:";
 
@@ -97,20 +98,35 @@ export async function listV2Sessions(sql: SqlTag, agentId?: string): Promise<Ses
           f.encoding,
           f.line_count,
           f.git,
-          f.metadata,
+          f.metadata || coalesce(source_meta.metadata, '{}'::jsonb) as metadata,
           f.first_seen_at,
           f.last_seen_at,
           f.deleted_at,
           count(e.id) as event_count
         from agent_source_files f
         join agents a on a.id = f.agent_id
+        left join lateral (
+          select jsonb_strip_nulls(jsonb_build_object(
+            'cwd', coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}'),
+            'sessionId', coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}'),
+            'title', coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}')
+          )) as metadata
+          from agent_normalized_events e
+          where e.source_file_id = f.id
+            and e.source_generation = f.current_generation
+            and e.event_type in ('meta', 'session', 'event')
+          order by coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is null,
+            e.source_line_no asc nulls last,
+            e.id asc
+          limit 1
+        ) source_meta on true
         left join agent_normalized_events e
           on e.source_file_id = f.id
           and e.source_generation = f.current_generation
         where f.agent_id = ${agentId}
           and f.source_kind = 'conversation'
           and f.deleted_at is null
-        group by f.id, a.hostname
+        group by f.id, a.hostname, source_meta.metadata
         order by f.last_seen_at desc, max(e.id) desc nulls last
       `
     : await sql`
@@ -129,19 +145,34 @@ export async function listV2Sessions(sql: SqlTag, agentId?: string): Promise<Ses
           f.encoding,
           f.line_count,
           f.git,
-          f.metadata,
+          f.metadata || coalesce(source_meta.metadata, '{}'::jsonb) as metadata,
           f.first_seen_at,
           f.last_seen_at,
           f.deleted_at,
           count(e.id) as event_count
         from agent_source_files f
         join agents a on a.id = f.agent_id
+        left join lateral (
+          select jsonb_strip_nulls(jsonb_build_object(
+            'cwd', coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}'),
+            'sessionId', coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}'),
+            'title', coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}')
+          )) as metadata
+          from agent_normalized_events e
+          where e.source_file_id = f.id
+            and e.source_generation = f.current_generation
+            and e.event_type in ('meta', 'session', 'event')
+          order by coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is null,
+            e.source_line_no asc nulls last,
+            e.id asc
+          limit 1
+        ) source_meta on true
         left join agent_normalized_events e
           on e.source_file_id = f.id
           and e.source_generation = f.current_generation
         where f.source_kind = 'conversation'
           and f.deleted_at is null
-        group by f.id, a.hostname
+        group by f.id, a.hostname, source_meta.metadata
         order by f.last_seen_at desc, max(e.id) desc nulls last
       `;
 
@@ -168,19 +199,34 @@ export async function getV2SessionsMeta(sql: SqlTag, sourceFileIds: string[], op
           f.encoding,
           f.line_count,
           f.git,
-          f.metadata,
+          f.metadata || coalesce(source_meta.metadata, '{}'::jsonb) as metadata,
           f.first_seen_at,
           f.last_seen_at,
           f.deleted_at,
           count(e.id) as event_count
         from agent_source_files f
         join agents a on a.id = f.agent_id
+        left join lateral (
+          select jsonb_strip_nulls(jsonb_build_object(
+            'cwd', coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}'),
+            'sessionId', coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}'),
+            'title', coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}')
+          )) as metadata
+          from agent_normalized_events e
+          where e.source_file_id = f.id
+            and e.source_generation = f.current_generation
+            and e.event_type in ('meta', 'session', 'event')
+          order by coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is null,
+            e.source_line_no asc nulls last,
+            e.id asc
+          limit 1
+        ) source_meta on true
         left join agent_normalized_events e
           on e.source_file_id = f.id
           and e.source_generation = f.current_generation
         where f.id = any(${postgresBigintArrayLiteral(ids)}::bigint[])
           and f.source_kind = 'conversation'
-        group by f.id, a.hostname
+        group by f.id, a.hostname, source_meta.metadata
       `
     : await sql`
         select
@@ -198,20 +244,35 @@ export async function getV2SessionsMeta(sql: SqlTag, sourceFileIds: string[], op
           f.encoding,
           f.line_count,
           f.git,
-          f.metadata,
+          f.metadata || coalesce(source_meta.metadata, '{}'::jsonb) as metadata,
           f.first_seen_at,
           f.last_seen_at,
           f.deleted_at,
           count(e.id) as event_count
         from agent_source_files f
         join agents a on a.id = f.agent_id
+        left join lateral (
+          select jsonb_strip_nulls(jsonb_build_object(
+            'cwd', coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}'),
+            'sessionId', coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}'),
+            'title', coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}')
+          )) as metadata
+          from agent_normalized_events e
+          where e.source_file_id = f.id
+            and e.source_generation = f.current_generation
+            and e.event_type in ('meta', 'session', 'event')
+          order by coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is null,
+            e.source_line_no asc nulls last,
+            e.id asc
+          limit 1
+        ) source_meta on true
         left join agent_normalized_events e
           on e.source_file_id = f.id
           and e.source_generation = f.current_generation
         where f.id = any(${postgresBigintArrayLiteral(ids)}::bigint[])
           and f.source_kind = 'conversation'
           and f.deleted_at is null
-        group by f.id, a.hostname
+        group by f.id, a.hostname, source_meta.metadata
       `;
   const byId = new Map(rows.map((row: any) => [toId(row.id), mapV2SessionRow(row)] as const));
   return ids.map((id) => byId.get(id)).filter((session): session is SessionInfo => Boolean(session));
@@ -237,20 +298,35 @@ export async function getV2Session(sql: SqlTag, sessionId: string): Promise<Sess
       f.encoding,
       f.line_count,
       f.git,
-      f.metadata,
+      f.metadata || coalesce(source_meta.metadata, '{}'::jsonb) as metadata,
       f.first_seen_at,
       f.last_seen_at,
       f.deleted_at,
       count(e.id) as event_count
     from agent_source_files f
     join agents a on a.id = f.agent_id
+    left join lateral (
+      select jsonb_strip_nulls(jsonb_build_object(
+        'cwd', coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}'),
+        'sessionId', coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}'),
+        'title', coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}')
+      )) as metadata
+      from agent_normalized_events e
+      where e.source_file_id = f.id
+        and e.source_generation = f.current_generation
+        and e.event_type in ('meta', 'session', 'event')
+      order by coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is null,
+        e.source_line_no asc nulls last,
+        e.id asc
+      limit 1
+    ) source_meta on true
     left join agent_normalized_events e
       on e.source_file_id = f.id
       and e.source_generation = f.current_generation
     where f.id = ${sourceFileId}
       and f.source_kind = 'conversation'
       and f.deleted_at is null
-    group by f.id, a.hostname
+    group by f.id, a.hostname, source_meta.metadata
   `;
 
   if (!sessionRows.length) return null;
@@ -347,6 +423,7 @@ export function mapV2SessionRow(row: V2SessionRow): SessionInfo {
   const sourceGeneration = row.current_generation == null ? null : toNumber(row.current_generation);
   const sourcePath = stringValue(row.source_path) ?? "";
   const projectKey = inferProjectKey(provider, sourcePath, metadata);
+  const cwd = stringValue(metadata.cwd);
 
   return {
     id: v2SessionId(row.id),
@@ -357,7 +434,7 @@ export function mapV2SessionRow(row: V2SessionRow): SessionInfo {
     sourceGeneration,
     sourceId: toId(row.id),
     projectKey,
-    projectName: stringValue(metadata.projectName) ?? stringValue(metadata.displayName) ?? defaultProjectName(provider, projectKey),
+    projectName: stringValue(metadata.projectName) ?? stringValue(metadata.displayName) ?? (cwd ? basenameFromPath(cwd) : undefined) ?? defaultProjectName(provider, projectKey),
     sessionId: stringValue(metadata.sessionId) ?? stringValue(metadata.chatId) ?? inferSessionId(sourcePath),
     title: stringValue(metadata.title) ?? null,
     sourcePath,
@@ -433,7 +510,7 @@ export function normalizedEventToLegacyRaw(
   normalizedInput: unknown,
   fallback: { eventType?: unknown; role?: unknown; occurredAt?: unknown } = {},
 ): unknown {
-  const normalized = jsonRecord(normalizedInput);
+  const normalized = repairLegacyCodexPayloadEvent(jsonRecord(normalizedInput)) ?? jsonRecord(normalizedInput);
   if (isLegacyRenderableRaw(normalized)) return normalized;
 
   const parts = legacyContentParts(normalized.parts);
@@ -457,6 +534,29 @@ export function normalizedEventToLegacyRaw(
   };
 }
 
+function repairLegacyCodexPayloadEvent(normalized: Record<string, unknown>) {
+  const source = jsonRecord(normalized.source);
+  if (source.provider !== "codex") return null;
+  if (normalized.kind !== "event" || normalized.display !== false) return null;
+  const rawType = stringValue(source.rawType);
+  if (rawType !== "response_item" && rawType !== "event_msg" && rawType !== "session_meta" && rawType !== "turn_context") return null;
+
+  const firstPart = Array.isArray(normalized.parts) ? jsonRecord(normalized.parts[0]) : {};
+  const data = jsonRecord(firstPart.data);
+  const raw = {
+    type: rawType,
+    timestamp: stringValue(normalized.timestamp) ?? stringValue(normalized.occurredAt),
+    ...data,
+  };
+  const repaired = normalizeTranscriptRecord(raw, {
+    provider: "codex",
+    sourcePath: stringValue(source.sourcePath),
+    lineNo: numberValue(source.lineNo),
+    byteOffset: numberValue(source.byteOffset),
+  });
+  return repaired as unknown as Record<string, unknown>;
+}
+
 function v2EventId(eventId: unknown) {
   return `v2e:${toId(eventId)}`;
 }
@@ -468,6 +568,8 @@ function postgresBigintArrayLiteral(values: string[]) {
 function inferProjectKey(provider: string, sourcePath: string, metadata: Record<string, unknown>) {
   const metadataKey = stringValue(metadata.projectKey) ?? stringValue(metadata.project);
   if (metadataKey) return metadataKey;
+  const cwd = stringValue(metadata.cwd);
+  if (provider === "codex" && cwd) return codexProjectKey(cwd);
 
   const cleanPath = stripProviderPrefix(sourcePath, provider);
   const parts = cleanPath.split(/[\\/]/).filter(Boolean);
@@ -582,6 +684,11 @@ function toNumber(value: unknown) {
   return Number(value ?? 0);
 }
 
+function numberValue(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return value;
+}
+
 function stringValue(value: unknown) {
   return typeof value === "string" && value.length ? value : undefined;
 }
@@ -599,6 +706,15 @@ function titleCase(value: string) {
 
 function shortProject(raw: string) {
   return raw.replace(/^-Users-[^-]+-/, "").replace(/^p-?/, (match) => (match === "p" ? "p" : "")) || raw;
+}
+
+function codexProjectKey(cwd: string) {
+  return cwd.replace(/[\\/]+/g, "-").replace(/^-?/, "-");
+}
+
+function basenameFromPath(path: string) {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts.at(-1) ?? path;
 }
 
 function earlierTimestamp(left: string, right: string) {

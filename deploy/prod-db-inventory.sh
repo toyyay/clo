@@ -165,6 +165,36 @@ group by event_type, role
 order by rows desc, event_type, role;
 
 select
+  f.provider,
+  f.source_kind,
+  count(*)::bigint as source_files,
+  count(*) filter (where f.deleted_at is null)::bigint as live_source_files,
+  coalesce(sum(ev.events), 0)::bigint as normalized_events,
+  min(f.first_seen_at) as first_seen_at,
+  max(f.last_seen_at) as last_seen_at
+from agent_source_files f
+left join lateral (
+  select count(*)::bigint as events
+  from agent_normalized_events e
+  where e.source_file_id = f.id
+    and e.source_generation = f.current_generation
+) ev on true
+group by f.provider, f.source_kind
+order by source_files desc, f.provider, f.source_kind;
+
+select
+  provider,
+  event_type,
+  role,
+  coalesce(normalized ->> 'display', '(missing)') as display,
+  count(*)::bigint as rows,
+  min(created_at) as first_created_at,
+  max(created_at) as last_created_at
+from agent_normalized_events
+group by provider, event_type, role, coalesce(normalized ->> 'display', '(missing)')
+order by rows desc, provider, event_type, role, display;
+
+select
   method,
   path,
   response_status,

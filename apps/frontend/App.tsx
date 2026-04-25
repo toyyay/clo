@@ -1,4 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactElement,
+  type UIEvent,
+} from "react";
 import * as Y from "yjs";
 import type {
   AppSettingsInfo,
@@ -67,6 +79,13 @@ type EventState = { sessionId: string | null; events: SessionEvent[] };
 type SyncNowOptions = { silent?: boolean; metadataOnly?: boolean };
 
 const SIDEBAR_SESSION_PAGE_SIZE = 80;
+const DEFAULT_SIDEBAR_WIDTH = 320;
+const MIN_SIDEBAR_WIDTH = 240;
+const MAX_SIDEBAR_WIDTH = 680;
+const SIDEBAR_WIDTH_STORAGE_KEY = "chatview:sidebar-width";
+const GROUP_BY_PROJECT_STORAGE_KEY = "chatview:group-by-project";
+const PROVIDER_FILTER_STORAGE_KEY = "chatview:provider-filter";
+const DEVICE_FILTER_STORAGE_KEY = "chatview:device-filter";
 
 function formatBytes(value?: number | null) {
   if (!value) return "0 B";
@@ -93,6 +112,44 @@ function formatLimit(value?: number | null) {
   return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : "unlimited";
 }
 
+function readLocalStorageString(key: string, fallback: string) {
+  try {
+    return localStorage.getItem(key) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeLocalStorageValue(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    return;
+  }
+}
+
+function readLocalStorageBoolean(key: string, fallback: boolean) {
+  const value = readLocalStorageString(key, fallback ? "true" : "false");
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return fallback;
+}
+
+function sidebarWidthLimit() {
+  const viewportLimit = typeof window === "undefined" ? MAX_SIDEBAR_WIDTH : Math.max(MIN_SIDEBAR_WIDTH, window.innerWidth - 28);
+  return Math.min(MAX_SIDEBAR_WIDTH, viewportLimit);
+}
+
+function clampSidebarWidth(value: number) {
+  if (!Number.isFinite(value)) return DEFAULT_SIDEBAR_WIDTH;
+  return Math.round(Math.min(sidebarWidthLimit(), Math.max(MIN_SIDEBAR_WIDTH, value)));
+}
+
+function readSidebarWidth() {
+  const value = Number(readLocalStorageString(SIDEBAR_WIDTH_STORAGE_KEY, String(DEFAULT_SIDEBAR_WIDTH)));
+  return clampSidebarWidth(value);
+}
+
 function shallowEqualObject(a: object, b: object) {
   const aKeys = Object.keys(a);
   const bKeys = Object.keys(b);
@@ -117,11 +174,21 @@ function shortId(value: string, size = 8) {
 }
 
 function sourceProviderLabel(session: SessionInfo) {
-  const provider = session.sourceProvider || (session.id.startsWith("v2:") ? "v2" : "legacy");
+  const provider = providerFilterValue(session);
+  return providerLabel(provider);
+}
+
+function providerFilterValue(session: SessionInfo) {
+  return session.sourceProvider || (session.id.startsWith("v2:") ? "v2" : "legacy");
+}
+
+function providerLabel(provider: string) {
   if (provider === "claude") return "Claude";
   if (provider === "codex") return "Codex";
   if (provider === "gemini") return "Gemini";
   if (provider === "legacy") return "Legacy";
+  if (provider === "v2") return "V2";
+  if (provider === "unknown") return "Unknown";
   return provider.slice(0, 1).toUpperCase() + provider.slice(1);
 }
 
@@ -213,6 +280,10 @@ function SettingsModal({
   onResetIndexedDb,
   onClearCaches,
   onUnregisterServiceWorkers,
+  groupByProject,
+  sidebarWidth,
+  onGroupByProjectChange,
+  onResetSidebarWidth,
 }: {
   settings: AppSettingsInfo | null;
   cacheStats: CacheStats | null;
@@ -226,6 +297,10 @@ function SettingsModal({
   onResetIndexedDb: () => void;
   onClearCaches: () => void;
   onUnregisterServiceWorkers: () => void;
+  groupByProject: boolean;
+  sidebarWidth: number;
+  onGroupByProjectChange: (value: boolean) => void;
+  onResetSidebarWidth: () => void;
 }) {
   const openRouter = settings?.openRouter;
   const openRouterReady = openRouter?.status === "ok";
@@ -294,6 +369,25 @@ function SettingsModal({
         </div>
 
         <div className="settings-section">
+          <div className="section-title">Interface</div>
+          <label className="toggle-row">
+            <input type="checkbox" checked={groupByProject} onChange={(event) => onGroupByProjectChange(event.target.checked)} />
+            <span>
+              <b>Group chats by project</b>
+            </span>
+          </label>
+          <div className="kv-grid">
+            <span>Sidebar width</span>
+            <b>{sidebarWidth}px</b>
+          </div>
+          <div className="settings-actions">
+            <button className="icon-button" onClick={onResetSidebarWidth}>
+              Reset sidebar width
+            </button>
+          </div>
+        </div>
+
+        <div className="settings-section">
           <div className="section-title">Cache</div>
           <div className="kv-grid">
             <span>Storage</span>
@@ -338,7 +432,8 @@ export function App() {
   const [authBusy, setAuthBusy] = useState(false);
   const [hosts, setHosts] = useState<HostInfo[]>([]);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
-  const [activeHost, setActiveHost] = useState("all");
+  const [activeHost, setActiveHost] = useState(() => readLocalStorageString(DEVICE_FILTER_STORAGE_KEY, "all"));
+  const [activeProvider, setActiveProvider] = useState(() => readLocalStorageString(PROVIDER_FILTER_STORAGE_KEY, "all"));
   const [active, setActive] = useState<SessionInfo | null>(null);
   const [eventState, setEventState] = useState<EventState>({ sessionId: null, events: [] });
   const [query, setQuery] = useState("");
@@ -347,6 +442,8 @@ export function App() {
   const [statusText, setStatusText] = useState("Loading cache");
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [sidebarOpen, setSidebarOpen] = useState(() => !window.matchMedia("(max-width: 780px)").matches);
+  const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth);
+  const [groupByProject, setGroupByProject] = useState(() => readLocalStorageBoolean(GROUP_BY_PROJECT_STORAGE_KEY, true));
   const [draft, setDraft] = useState("");
   const [settings, setSettings] = useState<AppSettingsInfo | null>(null);
   const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
@@ -369,6 +466,7 @@ export function App() {
   const syncing = useRef(false);
   const cachedAudioUploadRunning = useRef(false);
   const cachedAudioRecoveryStarted = useRef(false);
+  const sidebarRef = useRef<HTMLElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const recordingIdRef = useRef<string | null>(null);
@@ -399,6 +497,63 @@ export function App() {
   const closePanel = useCallback(() => {
     navigateRoute({ chatId: route.chatId ?? activeId ?? undefined }, { replace: true });
   }, [activeId, navigateRoute, route.chatId]);
+
+  const resizeSidebarBy = useCallback((delta: number) => {
+    setSidebarWidth((current) => clampSidebarWidth(current + delta));
+  }, []);
+
+  const resetSidebarWidth = useCallback(() => {
+    setSidebarWidth(clampSidebarWidth(DEFAULT_SIDEBAR_WIDTH));
+  }, []);
+
+  const beginSidebarResize = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      const startX = event.clientX;
+      const startWidth = sidebarRef.current?.getBoundingClientRect().width ?? sidebarWidth;
+
+      const onPointerMove = (moveEvent: PointerEvent) => {
+        setSidebarWidth(clampSidebarWidth(startWidth + moveEvent.clientX - startX));
+      };
+      const onPointerUp = () => {
+        document.body.classList.remove("resizing-sidebar");
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerUp);
+      };
+
+      document.body.classList.add("resizing-sidebar");
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", onPointerUp);
+      window.addEventListener("pointercancel", onPointerUp);
+    },
+    [sidebarWidth],
+  );
+
+  const handleSidebarResizeKey = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        resizeSidebarBy(-16);
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        resizeSidebarBy(16);
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        setSidebarWidth(MIN_SIDEBAR_WIDTH);
+      } else if (event.key === "End") {
+        event.preventDefault();
+        setSidebarWidth(sidebarWidthLimit());
+      }
+    },
+    [resizeSidebarBy],
+  );
+
+  const appShellStyle = useMemo(
+    () => ({ "--sidebar-width": `${sidebarWidth}px` }) as CSSProperties,
+    [sidebarWidth],
+  );
 
   const setActiveSession = useCallback((next: SessionInfo | null) => {
     setActive((current) => {
@@ -1300,6 +1455,28 @@ export function App() {
   }, [theme]);
 
   useEffect(() => {
+    writeLocalStorageValue(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth));
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    writeLocalStorageValue(GROUP_BY_PROJECT_STORAGE_KEY, groupByProject ? "true" : "false");
+  }, [groupByProject]);
+
+  useEffect(() => {
+    writeLocalStorageValue(PROVIDER_FILTER_STORAGE_KEY, activeProvider);
+  }, [activeProvider]);
+
+  useEffect(() => {
+    writeLocalStorageValue(DEVICE_FILTER_STORAGE_KEY, activeHost);
+  }, [activeHost]);
+
+  useEffect(() => {
+    const onResize = () => setSidebarWidth((current) => clampSidebarWidth(current));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  useEffect(() => {
     if (!isAuthenticated) return;
     if (!activeId) {
       setSessionEvents(null, []);
@@ -1466,10 +1643,54 @@ export function App() {
     return new Set([...counts.entries()].filter(([, count]) => count > 1).map(([hostname]) => hostname));
   }, [hosts]);
 
+  const providerOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const session of sessions) {
+      const provider = providerFilterValue(session);
+      counts.set(provider, (counts.get(provider) ?? 0) + 1);
+    }
+    const preferredOrder = ["claude", "codex", "gemini", "legacy", "v2", "unknown"];
+    const values = [...counts.keys()].sort((a, b) => {
+      const ai = preferredOrder.indexOf(a);
+      const bi = preferredOrder.indexOf(b);
+      if (ai !== -1 || bi !== -1) return (ai === -1 ? preferredOrder.length : ai) - (bi === -1 ? preferredOrder.length : bi);
+      return providerLabel(a).localeCompare(providerLabel(b));
+    });
+    return [
+      { value: "all", label: "All", count: sessions.length },
+      ...values.map((value) => ({ value, label: providerLabel(value), count: counts.get(value) ?? 0 })),
+    ];
+  }, [sessions]);
+
+  const deviceOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const session of sessions) counts.set(session.agentId, (counts.get(session.agentId) ?? 0) + 1);
+    return [
+      { value: "all", label: "All devices", count: sessions.length, title: "All devices" },
+      ...hosts.map((host) => ({
+        value: host.agentId,
+        label: hostLabel(host.hostname, host.agentId, duplicateHostnames),
+        count: counts.get(host.agentId) ?? host.sessionCount,
+        title: `${host.hostname}\n${host.agentId}${host.sourceRoot ? `\n${host.sourceRoot}` : ""}`,
+      })),
+    ];
+  }, [duplicateHostnames, hosts, sessions]);
+
+  useEffect(() => {
+    if (activeProvider === "all") return;
+    if (!providerOptions.some((option) => option.value === activeProvider)) setActiveProvider("all");
+  }, [activeProvider, providerOptions]);
+
+  useEffect(() => {
+    if (activeHost === "all") return;
+    if (!hosts.some((host) => host.agentId === activeHost)) setActiveHost("all");
+  }, [activeHost, hosts]);
+
   const filteredSessions = useMemo(() => {
     const q = query.trim().toLowerCase();
     return sessions.filter((session) => {
       if (activeHost !== "all" && session.agentId !== activeHost) return false;
+      if (activeProvider !== "all" && providerFilterValue(session) !== activeProvider) return false;
       if (!q) return true;
       return [
         session.hostname,
@@ -1489,11 +1710,11 @@ export function App() {
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(q));
     });
-  }, [activeHost, query, sessions]);
+  }, [activeHost, activeProvider, query, sessions]);
 
   useEffect(() => {
     setVisibleSessionLimit(SIDEBAR_SESSION_PAGE_SIZE);
-  }, [activeHost, query]);
+  }, [activeHost, activeProvider, groupByProject, query]);
 
   const visibleSessions = useMemo(() => {
     const visible = filteredSessions.slice(0, visibleSessionLimit);
@@ -1506,23 +1727,44 @@ export function App() {
   const items = useMemo(() => groupItems(flatten(events)), [events]);
   const yDocIdsToKeepWarm = useMemo(() => sessions.slice(0, 20).map((session) => docIdForSession(session.id)), [sessions]);
   const groupedSessions = useMemo(() => {
-    const grouped = new Map<string, SessionInfo[]>();
+    if (!groupByProject) {
+      return [{ key: "recent", title: "Recent", sessions: visibleSessions, total: filteredSessions.length }];
+    }
+    const grouped = new Map<string, { title: string; sessions: SessionInfo[]; total: number }>();
+    const totals = new Map<string, number>();
+    for (const session of filteredSessions) {
+      const key = session.projectName || session.projectKey || "unknown";
+      totals.set(key, (totals.get(key) ?? 0) + 1);
+    }
     for (const session of visibleSessions) {
       const key = session.projectName || session.projectKey || "unknown";
-      const list = grouped.get(key) ?? [];
-      list.push(session);
-      grouped.set(key, list);
+      const group = grouped.get(key) ?? { title: key, sessions: [], total: totals.get(key) ?? 0 };
+      group.sessions.push(session);
+      grouped.set(key, group);
     }
     const lastSeen = (list: SessionInfo[]) =>
       list.reduce((acc, s) => (s.lastSeenAt > acc ? s.lastSeenAt : acc), "");
-    return [...grouped.entries()].sort(([, a], [, b]) => lastSeen(b).localeCompare(lastSeen(a)));
-  }, [visibleSessions]);
+    return [...grouped.entries()]
+      .map(([key, group]) => ({ key, ...group }))
+      .sort((a, b) => lastSeen(b.sessions).localeCompare(lastSeen(a.sessions)));
+  }, [filteredSessions, groupByProject, visibleSessions]);
 
   const selectSession = useCallback((session: SessionInfo) => {
     setActiveSession(session);
     navigateRoute({ chatId: session.id });
     if (window.matchMedia("(max-width: 780px)").matches) setSidebarOpen(false);
   }, [navigateRoute, setActiveSession]);
+
+  const handleSessionListScroll = useCallback(
+    (event: UIEvent<HTMLDivElement>) => {
+      if (hiddenSessionCount <= 0) return;
+      const target = event.currentTarget;
+      const remaining = target.scrollHeight - target.scrollTop - target.clientHeight;
+      if (remaining > 260) return;
+      setVisibleSessionLimit((limit) => Math.min(filteredSessions.length, limit + SIDEBAR_SESSION_PAGE_SIZE));
+    },
+    [filteredSessions.length, hiddenSessionCount],
+  );
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -1565,7 +1807,7 @@ export function App() {
   }
 
   return (
-    <div className={`app-shell ${sidebarOpen ? "" : "sidebar-closed"}`}>
+    <div className={`app-shell ${sidebarOpen ? "" : "sidebar-closed"}`} style={appShellStyle}>
       <header className="topbar">
         <div className="top-left">
           <button className="icon-button menu-button" onClick={() => setSidebarOpen((open) => !open)} title="Toggle chats">
@@ -1612,41 +1854,85 @@ export function App() {
 
       <div className="layout">
         {sidebarOpen && <button className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} aria-label="Close chats" />}
-        <aside className="sidebar">
-          <div className="host-strip">
-            <button className={`host-chip ${activeHost === "all" ? "active" : ""}`} onClick={() => setActiveHost("all")}>
-              All
-              <span>{sessions.length}</span>
-            </button>
-            {hosts.map((host) => (
+        <aside className="sidebar" ref={sidebarRef}>
+          <div
+            className="sidebar-resize-handle"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize sidebar"
+            tabIndex={0}
+            onPointerDown={beginSidebarResize}
+            onKeyDown={handleSidebarResizeKey}
+          />
+
+          <div className="filter-panel">
+            <input
+              className="search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search chats"
+              autoCapitalize="none"
+            />
+
+            <div className="filter-section">
+              <div className="filter-label">
+                <span>Source</span>
+                <span>{filteredSessions.length.toLocaleString()}</span>
+              </div>
+              <div className="filter-grid">
+                {providerOptions.map((option) => (
+                  <button
+                    key={option.value}
+                    className={`filter-chip ${activeProvider === option.value ? "active" : ""}`}
+                    onClick={() => setActiveProvider(option.value)}
+                  >
+                    <span>{option.label}</span>
+                    <b>{option.count.toLocaleString()}</b>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <label className="filter-section">
+              <div className="filter-label">
+                <span>Device</span>
+                <span>{activeHost === "all" ? "all" : shortId(activeHost)}</span>
+              </div>
+              <select className="filter-select" value={activeHost} onChange={(event) => setActiveHost(event.target.value)}>
+                {deviceOptions.map((option) => (
+                  <option key={option.value} value={option.value} title={option.title}>
+                    {option.label} ({option.count.toLocaleString()})
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <div className="device-strip">
+            {deviceOptions.map((option) => (
               <button
-                key={host.agentId}
-                className={`host-chip ${activeHost === host.agentId ? "active" : ""}`}
-                onClick={() => setActiveHost(host.agentId)}
-                title={`${host.hostname}\n${host.agentId}${host.sourceRoot ? `\n${host.sourceRoot}` : ""}`}
+                key={option.value}
+                className={`host-chip ${activeHost === option.value ? "active" : ""}`}
+                onClick={() => setActiveHost(option.value)}
+                title={option.title}
               >
-                {hostLabel(host.hostname, host.agentId, duplicateHostnames)}
-                <span>{host.sessionCount}</span>
+                {option.label}
+                <span>{option.count.toLocaleString()}</span>
               </button>
             ))}
           </div>
 
-          <input
-            className="search"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search chats"
-            autoCapitalize="none"
-          />
-
-          <div className="session-list">
-            {groupedSessions.map(([project, projectSessions]) => (
-              <div key={project} className="session-group">
+          <div className="session-list" onScroll={handleSessionListScroll}>
+            {groupedSessions.map((group) => (
+              <div key={group.key} className="session-group">
                 <div className="session-group-head">
-                  <span>{project}</span>
-                  <span>{projectSessions.length}</span>
+                  <span>{group.title}</span>
+                  <span>
+                    {group.sessions.length}
+                    {group.total > group.sessions.length ? `/${group.total}` : ""}
+                  </span>
                 </div>
-                {projectSessions.map((session) => (
+                {group.sessions.map((session) => (
                   <button
                     key={session.id}
                     className={`session-item ${active?.id === session.id ? "active" : ""}`}
@@ -1737,6 +2023,10 @@ export function App() {
           onResetIndexedDb={resetIndexedDb}
           onClearCaches={clearCaches}
           onUnregisterServiceWorkers={resetServiceWorkers}
+          groupByProject={groupByProject}
+          sidebarWidth={sidebarWidth}
+          onGroupByProjectChange={setGroupByProject}
+          onResetSidebarWidth={resetSidebarWidth}
         />
       )}
       {audioOpen && (
