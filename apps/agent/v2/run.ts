@@ -66,8 +66,6 @@ export async function runAgentV2(options: AgentV2RunOptions): Promise<void> {
       const hasActivity =
         summary.uploadedChunkCount > 0 ||
         summary.plannedChunkCount > 0 ||
-        summary.pendingRecordCount > 0 ||
-        summary.skippedCount > 0 ||
         !summary.uploadsEnabled;
       const shouldLogIdle = logIdleEveryScans > 0 && scanCount % logIdleEveryScans === 0;
       if (options.once || hasActivity || shouldLogIdle) {
