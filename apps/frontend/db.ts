@@ -123,6 +123,7 @@ export async function applySync(payload: SyncResponse, options: { replaceShell?:
   const sessions = tx.objectStore("sessions");
   const events = tx.objectStore("events");
   const meta = tx.objectStore("meta");
+  const liveHostIds = new Set(payload.hosts.map((host) => host.agentId));
   const liveSessionIds = new Set(payload.sessions.filter((session) => !session.deletedAt).map((session) => session.id));
 
   for (const host of payload.hosts) hosts.put(host);
@@ -135,6 +136,7 @@ export async function applySync(payload: SyncResponse, options: { replaceShell?:
     }
   }
   if (options.replaceShell) {
+    queueDeleteMissingHosts(hosts, liveHostIds);
     const cursorReq = sessions.openCursor();
     cursorReq.onsuccess = () => {
       const cursor = cursorReq.result;
@@ -160,6 +162,7 @@ export async function cacheShell(hostsInput: HostInfo[], sessionsInput: SessionI
   const hosts = tx.objectStore("hosts");
   const sessions = tx.objectStore("sessions");
   const events = tx.objectStore("events");
+  const liveHostIds = new Set(hostsInput.map((host) => host.agentId));
   const liveSessionIds = new Set(sessionsInput.filter((session) => !session.deletedAt).map((session) => session.id));
   for (const host of hostsInput) hosts.put(host);
   for (const session of sessionsInput) {
@@ -170,6 +173,7 @@ export async function cacheShell(hostsInput: HostInfo[], sessionsInput: SessionI
       sessions.put(session);
     }
   }
+  queueDeleteMissingHosts(hosts, liveHostIds);
   const cursorReq = sessions.openCursor();
   cursorReq.onsuccess = () => {
     const cursor = cursorReq.result;
@@ -182,6 +186,17 @@ export async function cacheShell(hostsInput: HostInfo[], sessionsInput: SessionI
     cursor.continue();
   };
   await transactionDone(tx);
+}
+
+function queueDeleteMissingHosts(hosts: IDBObjectStore, liveHostIds: Set<string>) {
+  const cursorReq = hosts.openCursor();
+  cursorReq.onsuccess = () => {
+    const cursor = cursorReq.result;
+    if (!cursor) return;
+    const host = cursor.value as HostInfo;
+    if (!liveHostIds.has(host.agentId)) hosts.delete(cursor.primaryKey);
+    cursor.continue();
+  };
 }
 
 export async function cacheSessionPayload(payload: SessionPayload) {
