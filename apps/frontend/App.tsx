@@ -547,6 +547,7 @@ export function App() {
         }
       }
       const durationMs = Math.round(performance.now() - started);
+      const metadataChanged = metadataOnly && (result.hosts > 0 || result.sessions > 0 || result.metadataFull);
       if (result.events || result.hasMore || durationMs > 1000) {
         void logClientEvent(
           "info",
@@ -566,13 +567,15 @@ export function App() {
           ["sync"],
         ).catch(() => {});
       }
-      if (!silent || result.events || result.hasMore || activeRemoved) {
+      if (!silent || result.events || result.hasMore || activeRemoved || metadataChanged) {
         setSyncState("idle");
         setStatusText(
           activeRemoved
             ? "Active chat was removed"
             : result.hasMore
               ? `Synced ${result.events.toLocaleString()} events, more pending`
+              : metadataChanged
+                ? `Loaded ${refreshedSessions.length.toLocaleString()} chats`
               : metadataOnly
                 ? "Metadata refreshed"
               : result.events
