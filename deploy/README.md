@@ -13,6 +13,7 @@ Production files live in `/root/clo`:
 
 - `docker-compose.yml`
 - `.env`
+- `data/`
 - `pgdata/`
 
 Required deploy environment:
@@ -24,5 +25,7 @@ Required deploy environment:
 - `TUNNEL_TOKEN`
 
 The production app enables startup migrations with `AUTO_MIGRATION=true` in Docker Compose. The backend SQL pool is capped with `DB_POOL_MAX=5`. PostgreSQL is pinned to `postgres:18.3`, with `PGDATA=/var/lib/postgresql/18/docker` and the host bind mounted at `/var/lib/postgresql`, matching the PostgreSQL 18 image layout.
+
+The app container mounts `/root/clo/data` at `/data` and sets `DATA_DIR=/data`. Large import media blobs are stored there with Postgres keeping metadata, hashes, and storage keys.
 
 The smoke check endpoint is `https://clo.vf.lc/status-9c8e0f3a2b71` and returns the image build `commit_sha`.

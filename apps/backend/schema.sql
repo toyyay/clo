@@ -133,7 +133,8 @@ create table if not exists import_media_blobs (
   id bigserial primary key,
   media_kind text not null default 'audio',
   sha256 text not null unique,
-  bytes bytea not null,
+  bytes bytea,
+  storage_key text,
   size_bytes bigint not null,
   content_type text,
   filename text,
@@ -146,6 +147,10 @@ create table if not exists import_media_blobs (
 
 create index if not exists idx_import_media_blobs_seen
   on import_media_blobs (last_seen_at desc);
+
+create unique index if not exists idx_import_media_blobs_storage_key
+  on import_media_blobs (storage_key)
+  where storage_key is not null;
 
 create table if not exists import_request_media (
   id bigserial primary key,

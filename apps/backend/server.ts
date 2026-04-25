@@ -1,8 +1,8 @@
 import index from "../../index.html";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, normalize } from "node:path";
 import * as Y from "yjs";
 import type { ServerWebSocket } from "bun";
 import type {
@@ -60,6 +60,7 @@ const openRouterReasoningEffort = normalizeReasoningEffort(envValue(process.env,
 const openRouterEndpoint = envValue(process.env, "OPENROUTER_ENDPOINT") ?? "https://openrouter.ai/api/v1/chat/completions";
 const openRouterKeyEndpoint = envValue(process.env, "OPENROUTER_KEY_ENDPOINT") ?? "https://openrouter.ai/api/v1/key";
 const ffmpegBin = envValue(process.env, "FFMPEG_BIN") ?? "ffmpeg";
+const dataDir = envValue(process.env, "DATA_DIR", "CHATVIEW_DATA_DIR") ?? "";
 const transcriptionConcurrency = envPositiveInteger(process.env, ["TRANSCRIPTION_CONCURRENCY"], 2);
 const webAuthCookie = "chatview_token";
 const webAuthCookieMaxAge = 60 * 60 * 24 * 30;
@@ -119,8 +120,12 @@ process.on("uncaughtException", (error) => {
 });
 
 await prepareDatabase();
+await prepareDataDir();
 void refreshOpenRouterStatus("startup").catch((error) => {
   console.error("OpenRouter startup check failed", error instanceof Error ? error.message : String(error));
+});
+void backfillMediaBlobStorage().catch((error) => {
+  console.error("failed to backfill media blob storage", error instanceof Error ? error.message : String(error));
 });
 void resumeQueuedTranscriptionJobs().catch((error) => {
   console.error("failed to resume queued transcriptions", error);
@@ -709,7 +714,7 @@ async function getImportedMediaFile(req: Request) {
   if (!id) return text("missing id", 400);
 
   const rows = await sql`
-    select bytes, content_type, filename
+    select bytes, storage_key, content_type, filename
     from import_media_blobs
     where id = ${id}
       and media_kind = 'audio'
@@ -717,12 +722,13 @@ async function getImportedMediaFile(req: Request) {
   if (!rows.length) return text("media not found", 404);
 
   const row = rows[0];
+  const bytes = await loadStoredBlob(row);
   const headers = new Headers({
     "content-type": row.content_type || "application/octet-stream",
     "cache-control": "private, max-age=3600",
   });
   if (row.filename) headers.set("content-disposition", `inline; filename="${String(row.filename).replace(/"/g, "")}"`);
-  return new Response(Buffer.from(toBytes(row.bytes)), { headers });
+  return new Response(bytes, { headers });
 }
 
 async function handleAuthenticatedAudioUpload(req: Request) {
@@ -759,9 +765,10 @@ async function deleteImportedAudio(req: Request) {
     delete from import_media_blobs
     where id = ${String(mediaId)}
       and media_kind = 'audio'
-    returning id
+    returning id, storage_key
   `;
   if (!rows.length) return text("audio media not found", 404);
+  if (rows[0].storage_key) void deleteStoredBlob(rows[0].storage_key).catch((error) => console.error(error));
   return json({ ok: true, mediaId: toId(rows[0].id) });
 }
 
@@ -869,6 +876,7 @@ async function processAudioTranscription(transcriptionId: string) {
       t.model,
       t.reasoning_effort,
       m.bytes,
+      m.storage_key,
       m.content_type,
       m.filename,
       m.detected_format
@@ -892,7 +900,7 @@ async function processAudioTranscription(transcriptionId: string) {
   try {
     if (!openRouterApiKey) throw new Error("OPENROUTER_API_KEY is not configured");
 
-    const originalBytes = Buffer.from(toBytes(row.bytes));
+    const originalBytes = await loadStoredBlob(row);
     const mp3 = await convertAudioToMp3(originalBytes, row.filename, row.detected_format);
     const transcript = await transcribeWithOpenRouter({
       mediaId: toId(row.media_id),
@@ -1335,11 +1343,14 @@ async function ingestImportMedia(req: Request, rawBody: Buffer, requestId: unkno
       ...candidate.metadata,
       ...detection.metadata,
     };
+    const mediaSha256 = sha256Hex(candidate.bytes);
+    const storage = await storeBlob("import-media", mediaSha256, candidate.bytes);
     const mediaRows = await sql`
       insert into import_media_blobs (
         media_kind,
         sha256,
         bytes,
+        storage_key,
         size_bytes,
         content_type,
         filename,
@@ -1350,8 +1361,9 @@ async function ingestImportMedia(req: Request, rawBody: Buffer, requestId: unkno
       )
       values (
         ${detection.kind},
-        ${sha256Hex(candidate.bytes)},
-        ${candidate.bytes},
+        ${mediaSha256},
+        ${storage.dbBytes},
+        ${storage.storageKey},
         ${candidate.bytes.length},
         ${candidate.contentType ?? null},
         ${candidate.filename ?? null},
@@ -1362,6 +1374,8 @@ async function ingestImportMedia(req: Request, rawBody: Buffer, requestId: unkno
       )
       on conflict (sha256) do update set
         last_seen_at = now(),
+        bytes = coalesce(import_media_blobs.bytes, excluded.bytes),
+        storage_key = coalesce(import_media_blobs.storage_key, excluded.storage_key),
         content_type = coalesce(import_media_blobs.content_type, excluded.content_type),
         filename = coalesce(import_media_blobs.filename, excluded.filename),
         extension = coalesce(import_media_blobs.extension, excluded.extension),
@@ -2372,6 +2386,85 @@ function toBase64(update: Uint8Array) {
 
 function fromBase64(value: string) {
   return new Uint8Array(Buffer.from(value, "base64"));
+}
+
+async function prepareDataDir() {
+  if (!dataDir) return;
+  await mkdir(blobPath("healthcheck"), { recursive: true });
+}
+
+async function storeBlob(namespace: string, sha256: string, bytes: Buffer) {
+  if (!dataDir) return { storageKey: null as string | null, dbBytes: bytes };
+
+  const storageKey = blobStorageKey(namespace, sha256);
+  const path = dataPath(storageKey);
+  await mkdir(join(dataDir, "blobs", namespace, sha256.slice(0, 2)), { recursive: true });
+  await writeFile(path, bytes);
+  return { storageKey, dbBytes: null as Buffer | null };
+}
+
+async function loadStoredBlob(row: { bytes?: unknown; storage_key?: string | null }) {
+  if (row.storage_key) {
+    try {
+      return await readFile(dataPath(row.storage_key));
+    } catch (error) {
+      if (row.bytes == null) throw error;
+    }
+  }
+  if (row.bytes == null) throw new Error("stored blob is missing bytes and storage_key");
+  return Buffer.from(toBytes(row.bytes));
+}
+
+async function deleteStoredBlob(storageKey: string) {
+  if (!dataDir) return;
+  await unlink(dataPath(storageKey)).catch((error) => {
+    if ((error as { code?: string }).code !== "ENOENT") throw error;
+  });
+}
+
+async function backfillMediaBlobStorage() {
+  if (!dataDir) return;
+  const rows = await sql`
+    select id, media_kind, sha256, bytes
+    from import_media_blobs
+    where storage_key is null
+      and bytes is not null
+    order by id
+    limit 500
+  `;
+  let moved = 0;
+  for (const row of rows) {
+    const bytes = Buffer.from(toBytes(row.bytes));
+    const storage = await storeBlob(`import-${row.media_kind || "media"}`, row.sha256, bytes);
+    await sql`
+      update import_media_blobs
+      set storage_key = ${storage.storageKey},
+          bytes = null
+      where id = ${row.id}
+        and storage_key is null
+    `;
+    moved++;
+  }
+  if (moved) console.log(`moved ${moved} media blob(s) to DATA_DIR`);
+}
+
+function blobStorageKey(namespace: string, sha256: string) {
+  return `blobs/${safePathPart(namespace)}/${sha256.slice(0, 2)}/${sha256}`;
+}
+
+function blobPath(namespace: string) {
+  return join(dataDir, "blobs", safePathPart(namespace));
+}
+
+function dataPath(storageKey: string) {
+  if (!dataDir) throw new Error("DATA_DIR is not configured");
+  const normalized = normalize(storageKey).replace(/^(\.\.(\/|\\|$))+/, "");
+  if (normalized.startsWith("/") || normalized.includes("..")) throw new Error("invalid storage key");
+  return join(dataDir, normalized);
+}
+
+function safePathPart(value: string) {
+  return value.replace(/[^a-zA-Z0-9_.-]/g, "-") || "blob";
 }
 
 function toBytes(value: unknown): Uint8Array {

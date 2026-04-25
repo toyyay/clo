@@ -32,7 +32,10 @@ services:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-3-flash-preview}
       OPENROUTER_REASONING_EFFORT: ${OPENROUTER_REASONING_EFFORT:-medium}
+      DATA_DIR: /data
       PORT: "3737"
+    volumes:
+      - ./data:/data
     ports:
       - "127.0.0.1:3737:3737"
     healthcheck:

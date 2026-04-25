@@ -460,6 +460,21 @@ create index if not exists idx_agent_normalized_events_created
   on agent_normalized_events (created_at desc);
 `.trim(),
   },
+  {
+    id: "0008",
+    name: "filesystem_media_storage",
+    sql: `
+alter table import_media_blobs
+  add column if not exists storage_key text;
+
+alter table import_media_blobs
+  alter column bytes drop not null;
+
+create unique index if not exists idx_import_media_blobs_storage_key
+  on import_media_blobs (storage_key)
+  where storage_key is not null;
+`.trim(),
+  },
 ];
 
 export function migrationsEnabled(env = process.env) {
