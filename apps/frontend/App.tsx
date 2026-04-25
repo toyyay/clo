@@ -8,15 +8,12 @@ import {
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
-  type ReactElement,
   type UIEvent,
 } from "react";
 import * as Y from "yjs";
 import type {
   AppSettingsInfo,
-  AudioTranscriptionInfo,
   HostInfo,
-  ImportedAudioInfo,
   SessionEvent,
   SessionInfo,
 } from "../../packages/shared/types";
@@ -34,31 +31,33 @@ import {
   unregisterServiceWorkers,
   type CacheStats,
 } from "./db";
-import {
-  appendCachedAudioChunk,
-  createCachedAudioRecording,
-  deleteCachedAudioRecording,
-  finalizeCachedAudioRecording,
-  loadCachedAudioBlob,
-  loadCachedAudioRecordings,
-  markCachedAudioRecordingStatus,
-  type CachedAudioRecording,
-} from "./audio-cache";
-import {
-  AudioModal,
-  FALLBACK_REASONING_EFFORTS,
-  FALLBACK_TRANSCRIPTION_MODELS,
-  chooseRecorderMimeType,
-  extensionForMime,
-  isAudioLikeFile,
-  type AudioRetryOptions,
-  type RecordingUiState,
-  type TranscriptLanguage,
-} from "./audio-panel";
-import { flatten, groupItems, VirtualChat } from "./chat-transcript";
+import { AudioModal, FALLBACK_REASONING_EFFORTS, FALLBACK_TRANSCRIPTION_MODELS } from "./audio-panel";
+import { fetchJson, sameEntityList, shallowEqualObject, withTimeout } from "./app-utils";
+import { AuthPage } from "./auth-page";
+import type { AuthState, EventState, SyncNowOptions, SyncState } from "./app-types";
+import { flatten, groupItems } from "./chat-transcript";
 import { flushClientLogs, installClientLogHandlers, logClientEvent } from "./client-logs";
+import { MainChat } from "./main-chat";
 import { parseRoute, useRoute, type RoutePanel } from "./router";
+import { hostLabel, providerFilterValue, providerLabel } from "./session-utils";
+import { SessionSidebar } from "./session-sidebar";
+import { SettingsModal } from "./settings-modal";
+import {
+  clampSidebarWidth,
+  DEFAULT_SIDEBAR_WIDTH,
+  DEVICE_FILTER_STORAGE_KEY,
+  GROUP_BY_PROJECT_STORAGE_KEY,
+  MIN_SIDEBAR_WIDTH,
+  PROVIDER_FILTER_STORAGE_KEY,
+  readLocalStorageBoolean,
+  readLocalStorageString,
+  readSidebarWidth,
+  SIDEBAR_WIDTH_STORAGE_KEY,
+  sidebarWidthLimit,
+  writeLocalStorageValue,
+} from "./storage-prefs";
 import { fetchSessionEvents, fetchSessionMetadata, pullUpdates, SyncAuthError } from "./sync";
+import { useAudioImports } from "./use-audio-imports";
 import {
   docIdForSession,
   getDraft,
@@ -72,356 +71,9 @@ import {
   syncCachedDraftDocs,
   syncDraftDoc,
 } from "./yjs";
-
-type SyncState = "loading" | "syncing" | "idle" | "offline" | "error";
-type AuthState = "checking" | "authenticated" | "anonymous";
-type EventState = { sessionId: string | null; events: SessionEvent[] };
-type SyncNowOptions = { silent?: boolean; metadataOnly?: boolean };
+import { Topbar } from "./topbar";
 
 const SIDEBAR_SESSION_PAGE_SIZE = 80;
-const DEFAULT_SIDEBAR_WIDTH = 320;
-const MIN_SIDEBAR_WIDTH = 240;
-const MAX_SIDEBAR_WIDTH = 680;
-const SIDEBAR_WIDTH_STORAGE_KEY = "chatview:sidebar-width";
-const GROUP_BY_PROJECT_STORAGE_KEY = "chatview:group-by-project";
-const PROVIDER_FILTER_STORAGE_KEY = "chatview:provider-filter";
-const DEVICE_FILTER_STORAGE_KEY = "chatview:device-filter";
-
-function formatBytes(value?: number | null) {
-  if (!value) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
-  let size = value;
-  let unit = 0;
-  while (size >= 1024 && unit < units.length - 1) {
-    size /= 1024;
-    unit += 1;
-  }
-  return `${size.toFixed(unit ? 1 : 0)} ${units[unit]}`;
-}
-
-function formatDate(value?: string | null) {
-  if (!value) return "never";
-  return new Date(value).toLocaleString();
-}
-
-function formatNumber(value?: number | null) {
-  return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : "unknown";
-}
-
-function formatLimit(value?: number | null) {
-  return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : "unlimited";
-}
-
-function readLocalStorageString(key: string, fallback: string) {
-  try {
-    return localStorage.getItem(key) ?? fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function writeLocalStorageValue(key: string, value: string) {
-  try {
-    localStorage.setItem(key, value);
-  } catch {
-    return;
-  }
-}
-
-function readLocalStorageBoolean(key: string, fallback: boolean) {
-  const value = readLocalStorageString(key, fallback ? "true" : "false");
-  if (value === "true") return true;
-  if (value === "false") return false;
-  return fallback;
-}
-
-function sidebarWidthLimit() {
-  const viewportLimit = typeof window === "undefined" ? MAX_SIDEBAR_WIDTH : Math.max(MIN_SIDEBAR_WIDTH, window.innerWidth - 28);
-  return Math.min(MAX_SIDEBAR_WIDTH, viewportLimit);
-}
-
-function clampSidebarWidth(value: number) {
-  if (!Number.isFinite(value)) return DEFAULT_SIDEBAR_WIDTH;
-  return Math.round(Math.min(sidebarWidthLimit(), Math.max(MIN_SIDEBAR_WIDTH, value)));
-}
-
-function readSidebarWidth() {
-  const value = Number(readLocalStorageString(SIDEBAR_WIDTH_STORAGE_KEY, String(DEFAULT_SIDEBAR_WIDTH)));
-  return clampSidebarWidth(value);
-}
-
-function shallowEqualObject(a: object, b: object) {
-  const aKeys = Object.keys(a);
-  const bKeys = Object.keys(b);
-  if (aKeys.length !== bKeys.length) return false;
-  for (const key of aKeys) {
-    if ((a as Record<string, unknown>)[key] !== (b as Record<string, unknown>)[key]) return false;
-  }
-  return true;
-}
-
-function sameEntityList<T extends object>(current: T[], next: T[], keyOf: (item: T) => string) {
-  if (current.length !== next.length) return false;
-  for (let index = 0; index < current.length; index += 1) {
-    if (keyOf(current[index]) !== keyOf(next[index])) return false;
-    if (!shallowEqualObject(current[index], next[index])) return false;
-  }
-  return true;
-}
-
-function shortId(value: string, size = 8) {
-  return value.length <= size ? value : value.slice(0, size);
-}
-
-function sourceProviderLabel(session: SessionInfo) {
-  const provider = providerFilterValue(session);
-  return providerLabel(provider);
-}
-
-function providerFilterValue(session: SessionInfo) {
-  return session.sourceProvider || (session.id.startsWith("v2:") ? "v2" : "legacy");
-}
-
-function providerLabel(provider: string) {
-  if (provider === "claude") return "Claude";
-  if (provider === "codex") return "Codex";
-  if (provider === "gemini") return "Gemini";
-  if (provider === "legacy") return "Legacy";
-  if (provider === "v2") return "V2";
-  if (provider === "unknown") return "Unknown";
-  return provider.slice(0, 1).toUpperCase() + provider.slice(1);
-}
-
-function sourceGenerationLabel(session: SessionInfo) {
-  return session.sourceGeneration ? `g${session.sourceGeneration}` : null;
-}
-
-function hostLabel(hostname: string, agentId: string, duplicateHostnames: Set<string>) {
-  return duplicateHostnames.has(hostname) ? `${hostname} · ${shortId(agentId)}` : hostname;
-}
-
-function sessionSourceTitle(session: SessionInfo) {
-  return [
-    `Provider: ${sourceProviderLabel(session)}`,
-    `Host: ${session.hostname}`,
-    `Agent: ${session.agentId}`,
-    session.sourceGeneration ? `Generation: ${session.sourceGeneration}` : null,
-    `Source: ${session.sourcePath}`,
-    session.gitBranch ? `Git: ${session.gitBranch}${session.gitCommit ? ` @ ${shortId(session.gitCommit, 10)}` : ""}` : null,
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
-function openRouterStatusLabel(settings: AppSettingsInfo | null) {
-  const status = settings?.openRouter.status;
-  if (status === "ok") return "ready";
-  if (status === "checking") return "checking";
-  if (status === "error") return "error";
-  return "missing";
-}
-
-async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
-  if (!response.ok) throw new Error(await response.text());
-  return (await response.json()) as T;
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = window.setTimeout(() => reject(new Error(message)), timeoutMs);
-    promise.then(
-      (value) => {
-        window.clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        window.clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
-
-function ModalFrame({
-  title,
-  children,
-  onClose,
-}: {
-  title: string;
-  children: ReactElement | ReactElement[];
-  onClose: () => void;
-}) {
-  return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className="modal-panel" role="dialog" aria-modal="true" aria-label={title} onMouseDown={(event) => event.stopPropagation()}>
-        <div className="modal-head">
-          <h2>{title}</h2>
-          <button className="icon-button compact-button" onClick={onClose}>
-            Close
-          </button>
-        </div>
-        {children}
-      </section>
-    </div>
-  );
-}
-
-function SettingsModal({
-  settings,
-  cacheStats,
-  loading,
-  message,
-  onClose,
-  onRefresh,
-  onCopy,
-  onCreateToken,
-  onCheckOpenRouter,
-  onResetIndexedDb,
-  onClearCaches,
-  onUnregisterServiceWorkers,
-  groupByProject,
-  sidebarWidth,
-  onGroupByProjectChange,
-  onResetSidebarWidth,
-}: {
-  settings: AppSettingsInfo | null;
-  cacheStats: CacheStats | null;
-  loading: boolean;
-  message: string;
-  onClose: () => void;
-  onRefresh: () => void;
-  onCopy: (value: string) => void;
-  onCreateToken: () => void;
-  onCheckOpenRouter: () => void;
-  onResetIndexedDb: () => void;
-  onClearCaches: () => void;
-  onUnregisterServiceWorkers: () => void;
-  groupByProject: boolean;
-  sidebarWidth: number;
-  onGroupByProjectChange: (value: boolean) => void;
-  onResetSidebarWidth: () => void;
-}) {
-  const openRouter = settings?.openRouter;
-  const openRouterReady = openRouter?.status === "ok";
-  const openRouterKey = openRouter?.key;
-  return (
-    <ModalFrame title="Settings" onClose={onClose}>
-      <div className="modal-body">
-        <div className="settings-section">
-          <div className="section-title">iPhone Upload</div>
-          {settings?.importTokens.length ? (
-            <div className="url-list">
-              {settings.importTokens.map((token) => (
-                <div className="url-row" key={token.id}>
-                  <div className="url-meta">
-                    <span>{token.label}</span>
-                    <span>{token.tokenPreview} / last used {formatDate(token.lastUsedAt)}</span>
-                  </div>
-                  <code>{token.uploadUrl}</code>
-                  <button className="icon-button compact-button" onClick={() => onCopy(token.uploadUrl)}>
-                    Copy
-                  </button>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="muted-text">No import tokens yet.</div>
-          )}
-          <button className="icon-button" onClick={onCreateToken} disabled={loading}>
-            New token
-          </button>
-        </div>
-
-        <div className="settings-section">
-          <div className="section-title">OpenRouter</div>
-          <div className={`service-status ${openRouterStatusLabel(settings)}`}>
-            <span>{openRouterStatusLabel(settings)}</span>
-            <b>{openRouter?.message ?? "OPENROUTER_API_KEY is not configured"}</b>
-          </div>
-          <div className="kv-grid">
-            <span>Configured</span>
-            <b>{openRouter?.configured ? "yes" : "no"}</b>
-            <span>Model</span>
-            <b>{openRouter?.model ?? "unknown"}</b>
-            <span>Reasoning</span>
-            <b>{openRouter?.reasoningEffort ?? "medium"}</b>
-            <span>Key label</span>
-            <b>{openRouterKey?.label ?? (openRouter?.configured ? "unknown" : "missing")}</b>
-            <span>Limit remaining</span>
-            <b>{openRouterReady ? formatLimit(openRouterKey?.limitRemaining) : "not available"}</b>
-            <span>Usage</span>
-            <b>{openRouterReady ? formatNumber(openRouterKey?.usage) : "not available"}</b>
-            <span>Rate limit</span>
-            <b>
-              {typeof openRouterKey?.rateLimit?.requests === "number" && openRouterKey.rateLimit.requests > 0
-                ? `${openRouterKey.rateLimit.requests.toLocaleString()} / ${openRouterKey.rateLimit.interval ?? "window"}`
-                : "not available"}
-            </b>
-            <span>Checked</span>
-            <b>{formatDate(openRouter?.checkedAt)}</b>
-          </div>
-          <div className="settings-actions">
-            <button className="icon-button" onClick={onCheckOpenRouter} disabled={loading}>
-              Check OpenRouter
-            </button>
-          </div>
-        </div>
-
-        <div className="settings-section">
-          <div className="section-title">Interface</div>
-          <label className="toggle-row">
-            <input type="checkbox" checked={groupByProject} onChange={(event) => onGroupByProjectChange(event.target.checked)} />
-            <span>
-              <b>Group chats by project</b>
-            </span>
-          </label>
-          <div className="kv-grid">
-            <span>Sidebar width</span>
-            <b>{sidebarWidth}px</b>
-          </div>
-          <div className="settings-actions">
-            <button className="icon-button" onClick={onResetSidebarWidth}>
-              Reset sidebar width
-            </button>
-          </div>
-        </div>
-
-        <div className="settings-section">
-          <div className="section-title">Cache</div>
-          <div className="kv-grid">
-            <span>Storage</span>
-            <b>
-              {formatBytes(cacheStats?.storageUsageBytes)} / {formatBytes(cacheStats?.storageQuotaBytes)}
-            </b>
-            <span>IndexedDB</span>
-            <b>{cacheStats ? Object.entries(cacheStats.indexedDb).map(([k, v]) => `${k}:${v}`).join(" ") : "loading"}</b>
-            <span>Cache API</span>
-            <b>{cacheStats?.cacheNames.length ?? 0}</b>
-            <span>Service workers</span>
-            <b>{cacheStats?.serviceWorkers ?? 0}</b>
-          </div>
-          <div className="settings-actions">
-            <button className="icon-button" onClick={onRefresh} disabled={loading}>
-              Refresh
-            </button>
-            <button className="icon-button" onClick={onResetIndexedDb} disabled={loading}>
-              Reset IndexedDB
-            </button>
-            <button className="icon-button" onClick={onClearCaches} disabled={loading}>
-              Clear caches
-            </button>
-            <button className="icon-button" onClick={onUnregisterServiceWorkers} disabled={loading}>
-              Reset service workers
-            </button>
-          </div>
-        </div>
-
-        {message && <div className="modal-message">{message}</div>}
-      </div>
-    </ModalFrame>
-  );
-}
 
 export function App() {
   const [route, navigateRoute] = useRoute();
@@ -449,31 +101,8 @@ export function App() {
   const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState("");
-  const [audioItems, setAudioItems] = useState<ImportedAudioInfo[]>([]);
-  const [audioLoading, setAudioLoading] = useState(false);
-  const [audioError, setAudioError] = useState("");
-  const [audioLanguage, setAudioLanguage] = useState<TranscriptLanguage>("ru");
-  const [audioRetryingId, setAudioRetryingId] = useState("");
-  const [audioUploadStatus, setAudioUploadStatus] = useState("");
-  const [cachedAudioRecordings, setCachedAudioRecordings] = useState<CachedAudioRecording[]>([]);
-  const [recordingState, setRecordingState] = useState<RecordingUiState>({
-    active: false,
-    elapsedMs: 0,
-    chunkCount: 0,
-    mimeType: "",
-    error: "",
-  });
   const syncing = useRef(false);
-  const cachedAudioUploadRunning = useRef(false);
-  const cachedAudioRecoveryStarted = useRef(false);
   const sidebarRef = useRef<HTMLElement | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordingStreamRef = useRef<MediaStream | null>(null);
-  const recordingIdRef = useRef<string | null>(null);
-  const recordingStartedAtRef = useRef(0);
-  const recordingChunkIndexRef = useRef(0);
-  const recordingChunkWritesRef = useRef<Promise<void>[]>([]);
-  const recordingTimerRef = useRef<number | null>(null);
   const activeRef = useRef<SessionInfo | null>(null);
   const eventStateRef = useRef<EventState>({ sessionId: null, events: [] });
   const sessionsRef = useRef<SessionInfo[]>([]);
@@ -484,6 +113,7 @@ export function App() {
   const isAuthenticated = authState === "authenticated";
   const settingsOpen = route.panel === "settings";
   const audioOpen = route.panel === "audio";
+  const audio = useAudioImports({ isAuthenticated, audioOpen });
   const activeId = active?.id ?? null;
   const events = eventState.sessionId === activeId ? eventState.events : [];
 
@@ -669,7 +299,6 @@ export function App() {
     setActive(null);
     setSessionEvents(null, []);
     setDraft("");
-    cachedAudioRecoveryStarted.current = false;
     setAuthState("anonymous");
   }, [setSessionEvents]);
 
@@ -737,7 +366,6 @@ export function App() {
       setSessionEvents(null, []);
       setActive(null);
       setDraft("");
-      setCachedAudioRecordings([]);
       navigateRoute({}, { replace: true });
       await refreshSettings();
       setSettingsMessage("IndexedDB cache reset");
@@ -775,238 +403,6 @@ export function App() {
       setSettingsBusy(false);
     }
   }, [refreshSettings]);
-
-  const refreshAudio = useCallback(async () => {
-    setAudioLoading(true);
-    setAudioError("");
-    try {
-      setAudioItems(await fetchJson<ImportedAudioInfo[]>("/api/imports/audio"));
-    } catch (error) {
-      setAudioError(error instanceof Error ? error.message : "Could not load audio");
-    } finally {
-      setAudioLoading(false);
-    }
-  }, []);
-
-  const refreshCachedAudioRecordings = useCallback(async () => {
-    try {
-      setCachedAudioRecordings(await loadCachedAudioRecordings());
-    } catch (error) {
-      setAudioError(error instanceof Error ? error.message : "Could not load cached recordings");
-    }
-  }, []);
-
-  const uploadAudioFiles = useCallback(
-    async (files: File[]) => {
-      const audioFiles = files.filter(isAudioLikeFile);
-      if (!audioFiles.length) {
-        setAudioUploadStatus("No audio files selected");
-        return;
-      }
-
-      setAudioUploadStatus(`Uploading ${audioFiles.length} file${audioFiles.length === 1 ? "" : "s"}`);
-      setAudioError("");
-      try {
-        const form = new FormData();
-        for (const file of audioFiles) form.append("audio", file, file.name);
-        form.append("source", "browser-file-upload");
-        form.append("clientNow", new Date().toISOString());
-        const result = await fetchJson<{ audioFiles?: number; mediaFiles?: number }>("/api/imports/audio/upload", {
-          method: "POST",
-          body: form,
-        });
-        setAudioUploadStatus(`Uploaded ${result.audioFiles ?? result.mediaFiles ?? audioFiles.length} audio file(s)`);
-        await refreshAudio();
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Could not upload audio";
-        setAudioError(message);
-        setAudioUploadStatus(message);
-      }
-    },
-    [refreshAudio],
-  );
-
-  const flushCachedAudioUploads = useCallback(async () => {
-    if (!isAuthenticated || cachedAudioUploadRunning.current) return;
-    cachedAudioUploadRunning.current = true;
-    setAudioError("");
-    try {
-      const records = await loadCachedAudioRecordings();
-      setCachedAudioRecordings(records);
-      for (const record of records) {
-        if (record.id === recordingIdRef.current || record.status === "uploading") continue;
-        await markCachedAudioRecordingStatus(record.id, "uploading");
-        await refreshCachedAudioRecordings();
-        setAudioUploadStatus(`Uploading cached ${record.filename}`);
-
-        try {
-          const blob = await loadCachedAudioBlob(record.id);
-          const filename = record.filename || `recording-${record.createdAt}.${extensionForMime(blob.type || record.mimeType)}`;
-          const form = new FormData();
-          form.append("audio", blob, filename);
-          form.append("source", "browser-recording");
-          form.append("recordingId", record.id);
-          form.append("recordedAt", record.createdAt);
-          form.append("durationMs", String(record.durationMs));
-          await fetchJson("/api/imports/audio/upload", { method: "POST", body: form });
-          await deleteCachedAudioRecording(record.id);
-          setAudioUploadStatus(`Uploaded cached ${filename}`);
-          await refreshAudio();
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "Could not upload cached recording";
-          await markCachedAudioRecordingStatus(record.id, "failed", message);
-          setAudioUploadStatus(message);
-        } finally {
-          await refreshCachedAudioRecordings();
-        }
-      }
-    } finally {
-      cachedAudioUploadRunning.current = false;
-    }
-  }, [isAuthenticated, refreshAudio, refreshCachedAudioRecordings]);
-
-  const stopAudioRecording = useCallback(() => {
-    const recorder = mediaRecorderRef.current;
-    if (!recorder) return;
-    if (recorder.state !== "inactive") {
-      try {
-        recorder.requestData();
-      } catch {
-        // Some browsers do not allow requestData while stopping.
-      }
-      recorder.stop();
-    }
-  }, []);
-
-  const startAudioRecording = useCallback(async () => {
-    if (mediaRecorderRef.current?.state === "recording") return;
-    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-      setRecordingState((current) => ({ ...current, error: "Audio recording is not available in this browser" }));
-      return;
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = chooseRecorderMimeType();
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      const cached = await createCachedAudioRecording(recorder.mimeType || mimeType || "audio/webm");
-      recordingStreamRef.current = stream;
-      mediaRecorderRef.current = recorder;
-      recordingIdRef.current = cached.id;
-      recordingStartedAtRef.current = Date.now();
-      recordingChunkIndexRef.current = 0;
-      recordingChunkWritesRef.current = [];
-      setAudioUploadStatus("");
-      setRecordingState({
-        active: true,
-        elapsedMs: 0,
-        chunkCount: 0,
-        mimeType: recorder.mimeType || mimeType || "audio/webm",
-        error: "",
-      });
-      await refreshCachedAudioRecordings();
-
-      recorder.ondataavailable = (event) => {
-        if (!event.data.size || !recordingIdRef.current) return;
-        const index = recordingChunkIndexRef.current;
-        recordingChunkIndexRef.current += 1;
-        const elapsedMs = Date.now() - recordingStartedAtRef.current;
-        const write = appendCachedAudioChunk(recordingIdRef.current, index, event.data, elapsedMs).catch((error) => {
-          setRecordingState((current) => ({
-            ...current,
-            error: error instanceof Error ? error.message : "Could not cache recording chunk",
-          }));
-        });
-        recordingChunkWritesRef.current.push(write);
-        setRecordingState((current) => ({ ...current, elapsedMs, chunkCount: index + 1 }));
-      };
-      recorder.onerror = (event) => {
-        setRecordingState((current) => ({
-          ...current,
-          error: (event as ErrorEvent).message || "Recording failed",
-        }));
-      };
-      recorder.onstop = () => {
-        const recordingId = recordingIdRef.current;
-        const elapsedMs = Date.now() - recordingStartedAtRef.current;
-        if (recordingTimerRef.current) window.clearInterval(recordingTimerRef.current);
-        recordingTimerRef.current = null;
-        stream.getTracks().forEach((track) => track.stop());
-        mediaRecorderRef.current = null;
-        recordingStreamRef.current = null;
-        recordingIdRef.current = null;
-        const chunkWrites = recordingChunkWritesRef.current;
-        recordingChunkWritesRef.current = [];
-        setRecordingState((current) => ({ ...current, active: false, elapsedMs }));
-        if (recordingId) {
-          void Promise.allSettled(chunkWrites)
-            .then(() => finalizeCachedAudioRecording(recordingId, elapsedMs))
-            .then(refreshCachedAudioRecordings)
-            .then(flushCachedAudioUploads)
-            .catch((error) => {
-              setRecordingState((current) => ({
-                ...current,
-                error: error instanceof Error ? error.message : "Could not finalize recording",
-              }));
-            });
-        }
-      };
-      recorder.start(1000);
-      recordingTimerRef.current = window.setInterval(() => {
-        setRecordingState((current) => ({ ...current, elapsedMs: Date.now() - recordingStartedAtRef.current }));
-      }, 1000);
-    } catch (error) {
-      recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
-      recordingStreamRef.current = null;
-      setRecordingState((current) => ({
-        ...current,
-        active: false,
-        error: error instanceof Error ? error.message : "Could not start audio recording",
-      }));
-    }
-  }, [flushCachedAudioUploads, refreshCachedAudioRecordings]);
-
-  const toggleAudioRecording = useCallback(() => {
-    if (recordingState.active) stopAudioRecording();
-    else void startAudioRecording();
-  }, [recordingState.active, startAudioRecording, stopAudioRecording]);
-
-  const retryAudioTranscription = useCallback(
-    async (mediaId: string, options: AudioRetryOptions) => {
-      setAudioRetryingId(mediaId);
-      setAudioError("");
-      try {
-        await fetchJson<AudioTranscriptionInfo>("/api/imports/audio/transcriptions", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ mediaId, ...options }),
-        });
-        await refreshAudio();
-      } catch (error) {
-        setAudioError(error instanceof Error ? error.message : "Could not queue transcription");
-      } finally {
-        setAudioRetryingId("");
-      }
-    },
-    [refreshAudio],
-  );
-
-  const deleteAudio = useCallback(
-    async (mediaId: string) => {
-      if (!window.confirm("Delete this audio and its transcriptions?")) return;
-      setAudioRetryingId(mediaId);
-      setAudioError("");
-      try {
-        await fetchJson(`/api/imports/audio?mediaId=${encodeURIComponent(mediaId)}`, { method: "DELETE" });
-        setAudioItems((current) => current.filter((item) => item.id !== mediaId));
-      } catch (error) {
-        setAudioError(error instanceof Error ? error.message : "Could not delete audio");
-      } finally {
-        setAudioRetryingId("");
-      }
-    },
-    [],
-  );
 
   const insertTranscriptIntoDraft = useCallback(
     (text: string) => {
@@ -1188,7 +584,6 @@ export function App() {
       }
     } catch (error) {
       if (error instanceof SyncAuthError) {
-        cachedAudioRecoveryStarted.current = false;
         setAuthState("anonymous");
         setAuthError("Session expired. Enter the token again.");
       }
@@ -1246,51 +641,6 @@ export function App() {
   useEffect(() => {
     if (settingsOpen) refreshSettings();
   }, [refreshSettings, settingsOpen]);
-
-  useEffect(() => {
-    if (audioOpen) refreshAudio();
-  }, [audioOpen, refreshAudio]);
-
-  useEffect(() => {
-    if (audioOpen) refreshCachedAudioRecordings();
-  }, [audioOpen, refreshCachedAudioRecordings]);
-
-  useEffect(() => {
-    if (!isAuthenticated || cachedAudioRecoveryStarted.current) return;
-    cachedAudioRecoveryStarted.current = true;
-    void refreshCachedAudioRecordings().then(flushCachedAudioUploads);
-  }, [flushCachedAudioUploads, isAuthenticated, refreshCachedAudioRecordings]);
-
-  useEffect(() => {
-    if (!audioOpen) return;
-    const hasPending = audioItems.some((item) =>
-      item.transcriptions.some((transcription) => transcription.status === "queued" || transcription.status === "processing"),
-    );
-    if (!hasPending) return;
-    const id = window.setInterval(refreshAudio, 4000);
-    return () => window.clearInterval(id);
-  }, [audioItems, audioOpen, refreshAudio]);
-
-  useEffect(() => {
-    const flushActiveRecording = () => {
-      const recorder = mediaRecorderRef.current;
-      if (recorder?.state === "recording") {
-        try {
-          recorder.requestData();
-        } catch {
-          return;
-        }
-      }
-    };
-    document.addEventListener("visibilitychange", flushActiveRecording);
-    window.addEventListener("beforeunload", flushActiveRecording);
-    return () => {
-      document.removeEventListener("visibilitychange", flushActiveRecording);
-      window.removeEventListener("beforeunload", flushActiveRecording);
-      if (recordingTimerRef.current) window.clearInterval(recordingTimerRef.current);
-      recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
-    };
-  }, []);
 
   useEffect(() => {
     getMeta<"light" | "dark">("theme").then((stored) => {
@@ -1778,236 +1128,79 @@ export function App() {
     subscribeYjsSocket(ySocket.current, yDocIdsToKeepWarm);
   }, [isAuthenticated, yDocIdsToKeepWarm]);
 
+  const handleDraftChange = useCallback(
+    (value: string) => {
+      const docId = activeId ? docIdForSession(activeId) : null;
+      const doc = docId ? yDocs.current.get(docId) : null;
+      if (doc) setYDraft(doc, value);
+      else setDraft(value);
+    },
+    [activeId],
+  );
+
   if (!isAuthenticated) {
     return (
-      <div className="auth-page">
-        <form className="auth-panel" onSubmit={login}>
-          <div className="auth-brand">Chatview</div>
-          <label className="auth-label" htmlFor="chatview-token">
-            Token
-          </label>
-          <input
-            id="chatview-token"
-            className="auth-input"
-            type="password"
-            value={authToken}
-            onChange={(event) => setAuthToken(event.target.value)}
-            placeholder={authState === "checking" ? "Checking session" : "Enter token"}
-            autoFocus
-            autoComplete="current-password"
-            disabled={authState === "checking" || authBusy || !authConfigured}
-          />
-          {authError && <div className="auth-error">{authError}</div>}
-          <button className="auth-button" disabled={authState === "checking" || authBusy || !authConfigured || !authToken.trim()}>
-            {authBusy ? "Signing in" : "Sign in"}
-          </button>
-        </form>
-      </div>
+      <AuthPage
+        authState={authState}
+        authConfigured={authConfigured}
+        authToken={authToken}
+        authError={authError}
+        authBusy={authBusy}
+        onTokenChange={setAuthToken}
+        onLogin={login}
+      />
     );
   }
 
   return (
     <div className={`app-shell ${sidebarOpen ? "" : "sidebar-closed"}`} style={appShellStyle}>
-      <header className="topbar">
-        <div className="top-left">
-          <button className="icon-button menu-button" onClick={() => setSidebarOpen((open) => !open)} title="Toggle chats">
-            Chats
-          </button>
-          <div>
-            <div className="brand">Chatview</div>
-            {active && <div className="active-inline">{active.hostname} / {active.projectName}</div>}
-          </div>
-        </div>
-        <div className="top-status">
-          <div className={`sync-line ${syncState}`}>{statusText}</div>
-        </div>
-        <div className="top-actions">
-          <button className="icon-button" onClick={() => openPanel("audio")} title="Uploaded audio">
-            Audio
-          </button>
-          <button className="icon-button" onClick={() => openPanel("settings")} title="Settings">
-            Settings
-          </button>
-          <a className="icon-button download-button" href="/api/agent/download?arch=arm64">
-            Download Mac Agent (M1)
-          </a>
-          <button
-            className="icon-button"
-            onClick={() => syncNow({ metadataOnly: true })}
-            disabled={syncState === "syncing"}
-            title="Sync now"
-          >
-            Sync
-          </button>
-          <button
-            className="icon-button"
-            onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
-            title="Toggle theme"
-          >
-            {theme === "dark" ? "Light" : "Dark"}
-          </button>
-          <button className="icon-button" onClick={logout} title="Sign out">
-            Logout
-          </button>
-        </div>
-      </header>
+      <Topbar
+        active={active}
+        syncState={syncState}
+        statusText={statusText}
+        theme={theme}
+        onToggleSidebar={() => setSidebarOpen((open) => !open)}
+        onOpenAudio={() => openPanel("audio")}
+        onOpenSettings={() => openPanel("settings")}
+        onSync={() => syncNow({ metadataOnly: true })}
+        onToggleTheme={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+        onLogout={logout}
+      />
 
       <div className="layout">
-        {sidebarOpen && <button className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} aria-label="Close chats" />}
-        <aside className="sidebar" ref={sidebarRef}>
-          <div
-            className="sidebar-resize-handle"
-            role="separator"
-            aria-orientation="vertical"
-            aria-label="Resize sidebar"
-            tabIndex={0}
-            onPointerDown={beginSidebarResize}
-            onKeyDown={handleSidebarResizeKey}
-          />
+        <SessionSidebar
+          sidebarOpen={sidebarOpen}
+          sidebarRef={sidebarRef}
+          activeHost={activeHost}
+          activeProvider={activeProvider}
+          active={active}
+          query={query}
+          providerOptions={providerOptions}
+          deviceOptions={deviceOptions}
+          groupedSessions={groupedSessions}
+          filteredSessionCount={filteredSessions.length}
+          visibleSessionCount={visibleSessions.length}
+          hiddenSessionCount={hiddenSessionCount}
+          duplicateHostnames={duplicateHostnames}
+          onClose={() => setSidebarOpen(false)}
+          onResizePointerDown={beginSidebarResize}
+          onResizeKeyDown={handleSidebarResizeKey}
+          onQueryChange={setQuery}
+          onProviderChange={setActiveProvider}
+          onHostChange={setActiveHost}
+          onSessionListScroll={handleSessionListScroll}
+          onLoadMore={() => setVisibleSessionLimit((limit) => limit + SIDEBAR_SESSION_PAGE_SIZE)}
+          onSelectSession={selectSession}
+        />
 
-          <div className="filter-panel">
-            <input
-              className="search"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search chats"
-              autoCapitalize="none"
-            />
-
-            <div className="filter-section">
-              <div className="filter-label">
-                <span>Source</span>
-                <span>{filteredSessions.length.toLocaleString()}</span>
-              </div>
-              <div className="filter-grid">
-                {providerOptions.map((option) => (
-                  <button
-                    key={option.value}
-                    className={`filter-chip ${activeProvider === option.value ? "active" : ""}`}
-                    onClick={() => setActiveProvider(option.value)}
-                  >
-                    <span>{option.label}</span>
-                    <b>{option.count.toLocaleString()}</b>
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <label className="filter-section">
-              <div className="filter-label">
-                <span>Device</span>
-                <span>{activeHost === "all" ? "all" : shortId(activeHost)}</span>
-              </div>
-              <select className="filter-select" value={activeHost} onChange={(event) => setActiveHost(event.target.value)}>
-                {deviceOptions.map((option) => (
-                  <option key={option.value} value={option.value} title={option.title}>
-                    {option.label} ({option.count.toLocaleString()})
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-
-          <div className="device-strip">
-            {deviceOptions.map((option) => (
-              <button
-                key={option.value}
-                className={`host-chip ${activeHost === option.value ? "active" : ""}`}
-                onClick={() => setActiveHost(option.value)}
-                title={option.title}
-              >
-                {option.label}
-                <span>{option.count.toLocaleString()}</span>
-              </button>
-            ))}
-          </div>
-
-          <div className="session-list" onScroll={handleSessionListScroll}>
-            {groupedSessions.map((group) => (
-              <div key={group.key} className="session-group">
-                <div className="session-group-head">
-                  <span>{group.title}</span>
-                  <span>
-                    {group.sessions.length}
-                    {group.total > group.sessions.length ? `/${group.total}` : ""}
-                  </span>
-                </div>
-                {group.sessions.map((session) => (
-                  <button
-                    key={session.id}
-                    className={`session-item ${active?.id === session.id ? "active" : ""}`}
-                    onClick={() => selectSession(session)}
-                    title={sessionSourceTitle(session)}
-                  >
-                    <span className="session-title">{session.title || session.sessionId.slice(0, 8)}</span>
-                    <span className="session-meta">
-                      {sourceProviderLabel(session)} · {hostLabel(session.hostname, session.agentId, duplicateHostnames)} ·{" "}
-                      {session.eventCount.toLocaleString()}
-                    </span>
-                    <span className="session-source">
-                      {sourceGenerationLabel(session) ? `${sourceGenerationLabel(session)} · ` : ""}
-                      {session.sourcePath}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            ))}
-            {hiddenSessionCount > 0 && (
-              <div className="session-group">
-                <div className="session-group-head">
-                  Showing {visibleSessions.length.toLocaleString()} of {filteredSessions.length.toLocaleString()}
-                </div>
-                <button
-                  className="icon-button compact-button"
-                  onClick={() => setVisibleSessionLimit((limit) => limit + SIDEBAR_SESSION_PAGE_SIZE)}
-                >
-                  Load more
-                </button>
-              </div>
-            )}
-          </div>
-        </aside>
-
-        <main className="main">
-          {!active && <div className="empty">No cached chats yet</div>}
-          {active && (
-            <div className="chat">
-              <div className="chat-head">
-                <div>
-                  <div className="chat-title">{active.title || active.sessionId}</div>
-                  <div className="chat-subtitle">
-                    {sourceProviderLabel(active)} / {active.projectName} / {hostLabel(active.hostname, active.agentId, duplicateHostnames)}
-                  </div>
-                  <div className="chat-source" title={sessionSourceTitle(active)}>
-                    <span className="source-pill">{active.id.startsWith("v2:") ? "v2" : "legacy"}</span>
-                    {sourceGenerationLabel(active) && <span className="source-pill">{sourceGenerationLabel(active)}</span>}
-                    <span className="chat-source-path">{active.sourcePath}</span>
-                  </div>
-                </div>
-                <div className="chat-count">{events.length}</div>
-              </div>
-
-              <VirtualChat items={items} resetKey={active.id} />
-
-              <div className="composer">
-                <textarea
-                  value={draft}
-                  onChange={(event) => {
-                    const docId = activeId ? docIdForSession(activeId) : null;
-                    const doc = docId ? yDocs.current.get(docId) : null;
-                    if (doc) setYDraft(doc, event.target.value);
-                    else setDraft(event.target.value);
-                  }}
-                  placeholder="Reply..."
-                  rows={2}
-                />
-                <button className="send-button" disabled title="UI only for now">
-                  Send
-                </button>
-              </div>
-            </div>
-          )}
-        </main>
+        <MainChat
+          active={active}
+          eventsLength={events.length}
+          items={items}
+          draft={draft}
+          duplicateHostnames={duplicateHostnames}
+          onDraftChange={handleDraftChange}
+        />
       </div>
       {settingsOpen && (
         <SettingsModal
@@ -2031,23 +1224,23 @@ export function App() {
       )}
       {audioOpen && (
         <AudioModal
-          items={audioItems}
-          loading={audioLoading}
-          error={audioError}
-          language={audioLanguage}
-          busyMediaId={audioRetryingId}
-          uploadStatus={audioUploadStatus}
-          recording={recordingState}
-          cachedRecordings={cachedAudioRecordings}
+          items={audio.items}
+          loading={audio.loading}
+          error={audio.error}
+          language={audio.language}
+          busyMediaId={audio.busyMediaId}
+          uploadStatus={audio.uploadStatus}
+          recording={audio.recording}
+          cachedRecordings={audio.cachedRecordings}
           models={settings?.transcriptionModels?.length ? settings.transcriptionModels : FALLBACK_TRANSCRIPTION_MODELS}
           reasoningEfforts={settings?.reasoningEfforts?.length ? settings.reasoningEfforts : FALLBACK_REASONING_EFFORTS}
-          onLanguage={setAudioLanguage}
-          onRefresh={refreshAudio}
-          onUploadFiles={uploadAudioFiles}
-          onFlushCache={flushCachedAudioUploads}
-          onToggleRecording={toggleAudioRecording}
-          onRetry={retryAudioTranscription}
-          onDelete={deleteAudio}
+          onLanguage={audio.setLanguage}
+          onRefresh={audio.refreshAudio}
+          onUploadFiles={audio.uploadFiles}
+          onFlushCache={audio.flushCachedUploads}
+          onToggleRecording={audio.toggleRecording}
+          onRetry={audio.retryTranscription}
+          onDelete={audio.deleteAudio}
           onInsert={insertTranscriptIntoDraft}
           onClose={closePanel}
         />
