@@ -19,6 +19,11 @@ import {
   type TranscriptLanguage,
 } from "./audio-panel";
 import { fetchJson } from "./app-utils";
+import {
+  createBrowserAudioRecorder,
+  isBrowserAudioRecordingSupported,
+  type BrowserAudioRecorder,
+} from "./browser-audio-recorder";
 
 type UseAudioImportsOptions = {
   isAuthenticated: boolean;
@@ -42,7 +47,7 @@ export function useAudioImports({ isAuthenticated, audioOpen }: UseAudioImportsO
   });
   const cachedUploadRunning = useRef(false);
   const cachedRecoveryStarted = useRef(false);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaRecorderRef = useRef<BrowserAudioRecorder | null>(null);
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const recordingIdRef = useRef<string | null>(null);
   const recordingStartedAtRef = useRef(0);
@@ -154,18 +159,22 @@ export function useAudioImports({ isAuthenticated, audioOpen }: UseAudioImportsO
 
   const startRecording = useCallback(async () => {
     if (mediaRecorderRef.current?.state === "recording") return;
-    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+    if (!navigator.mediaDevices?.getUserMedia || !isBrowserAudioRecordingSupported()) {
       setRecording((current) => ({ ...current, error: "Audio recording is not available in this browser" }));
       return;
     }
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = chooseRecorderMimeType();
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      const cached = await createCachedAudioRecording(recorder.mimeType || mimeType || "audio/webm");
       recordingStreamRef.current = stream;
+      const mimeType = chooseRecorderMimeType();
+      const recorder = createBrowserAudioRecorder(stream, mimeType);
       mediaRecorderRef.current = recorder;
+      const recorderMimeType = recorder.mimeType || mimeType || "audio/webm";
+      const cached = await createCachedAudioRecording(recorderMimeType, {
+        audioCodec: recorder.audioCodec === "pcm-s16le" ? "pcm-s16le" : null,
+        sampleRate: recorder.sampleRate ?? null,
+      });
       recordingIdRef.current = cached.id;
       recordingStartedAtRef.current = Date.now();
       recordingChunkIndexRef.current = 0;
@@ -175,7 +184,7 @@ export function useAudioImports({ isAuthenticated, audioOpen }: UseAudioImportsO
         active: true,
         elapsedMs: 0,
         chunkCount: 0,
-        mimeType: recorder.mimeType || mimeType || "audio/webm",
+        mimeType: recorderMimeType,
         error: "",
       });
       await refreshCachedRecordings();
@@ -194,10 +203,10 @@ export function useAudioImports({ isAuthenticated, audioOpen }: UseAudioImportsO
         recordingChunkWritesRef.current.push(write);
         setRecording((current) => ({ ...current, elapsedMs, chunkCount: index + 1 }));
       };
-      recorder.onerror = (event) => {
+      recorder.onerror = (error) => {
         setRecording((current) => ({
           ...current,
-          error: (event as ErrorEvent).message || "Recording failed",
+          error: error.message || "Recording failed",
         }));
       };
       recorder.onstop = () => {
@@ -225,11 +234,20 @@ export function useAudioImports({ isAuthenticated, audioOpen }: UseAudioImportsO
             });
         }
       };
-      recorder.start(1000);
+      await recorder.start(1000);
       recordingTimerRef.current = window.setInterval(() => {
         setRecording((current) => ({ ...current, elapsedMs: Date.now() - recordingStartedAtRef.current }));
       }, 1000);
     } catch (error) {
+      const recorder = mediaRecorderRef.current;
+      if (recorder) {
+        try {
+          await recorder.close?.();
+        } catch {
+          // Best-effort cleanup after a failed start.
+        }
+        mediaRecorderRef.current = null;
+      }
       recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
       recordingStreamRef.current = null;
       setRecording((current) => ({
@@ -321,6 +339,15 @@ export function useAudioImports({ isAuthenticated, audioOpen }: UseAudioImportsO
       window.removeEventListener("beforeunload", flushActiveRecording);
       if (recordingTimerRef.current) window.clearInterval(recordingTimerRef.current);
       recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+      const recorder = mediaRecorderRef.current;
+      if (recorder && recorder.state !== "inactive") {
+        try {
+          recorder.requestData();
+          void recorder.stop();
+        } catch {
+          // Ignore cleanup errors while leaving the page.
+        }
+      }
     };
   }, []);
 

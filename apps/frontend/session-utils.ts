@@ -113,7 +113,8 @@ function titleFromCodexPath(path: string) {
 }
 
 function titleFromPath(path: string) {
-  const filename = path.split(/[\\/]/).filter(Boolean).at(-1);
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  const filename = parts[parts.length - 1];
   return filename ? filename.replace(/\.[^.]+$/, "") : null;
 }
 

@@ -291,7 +291,7 @@ async function trimQueuedLogs() {
 }
 
 function newLogId() {
-  if (crypto.randomUUID) return crypto.randomUUID();
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 

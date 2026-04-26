@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import type { SessionEvent, SessionInfo } from "../../packages/shared/types";
-import type { AuthState, EventState, SyncNowOptions } from "./app-types";
+import type { AuthState, EventState } from "./app-types";
 import { loadSessionEvents } from "./db";
 import { logClientEvent } from "./client-logs";
 import { withTimeout } from "./app-utils";
@@ -20,7 +20,6 @@ type SessionEventsCacheOptions = {
   ensureSessionEventsTarget: (sessionId: string) => void;
   onNoActiveSession: () => void;
   setSessionEvents: (sessionId: string | null, nextEvents: SessionEvent[]) => void;
-  syncNow: (options?: SyncNowOptions) => Promise<void>;
   refreshActiveSessionEvents: (
     sessionId: string,
     reason: string,
@@ -43,7 +42,6 @@ export function useSessionEventsCache({
   ensureSessionEventsTarget,
   onNoActiveSession,
   setSessionEvents,
-  syncNow,
   refreshActiveSessionEvents,
   markServerError,
 }: SessionEventsCacheOptions) {
@@ -102,24 +100,19 @@ export function useSessionEventsCache({
           ).catch(() => {});
           return;
         }
-        if (cachedEvents.length && cachedEvents.length < expectedEvents) {
-          void syncNow({ silent: true, metadataOnly: false, eventMode: "forward" });
-          try {
-            await refreshActiveSessionEvents(loadForSessionId, "cache_behind_metadata", cachedEvents.length, expectedEvents);
-          } catch (error) {
-            markServerError(error);
-            void logClientEvent(
-              "warn",
-              "read.session_events.cache_behind_refresh_failed",
-              error instanceof Error ? error.message : String(error),
-              { sessionId: loadForSessionId, cachedEvents: cachedEvents.length, expectedEvents, error },
-              ["read", "session", "sync"],
-            ).catch(() => {});
-          }
-          return;
+        const reason = cachedEvents.length ? "cache_behind_metadata" : "open_session";
+        try {
+          await refreshActiveSessionEvents(loadForSessionId, reason, cachedEvents.length, expectedEvents);
+        } catch (error) {
+          markServerError(error);
+          void logClientEvent(
+            "warn",
+            "read.session_events.refresh_failed",
+            error instanceof Error ? error.message : String(error),
+            { sessionId: loadForSessionId, reason, cachedEvents: cachedEvents.length, expectedEvents, error },
+            ["read", "session", "sync"],
+          ).catch(() => {});
         }
-
-        await refreshActiveSessionEvents(loadForSessionId, "open_session", cachedEvents.length, expectedEvents);
       })
       .catch((error) => {
         markServerError(error);
@@ -149,6 +142,5 @@ export function useSessionEventsCache({
     onNoActiveSession,
     refreshActiveSessionEvents,
     setSessionEvents,
-    syncNow,
   ]);
 }

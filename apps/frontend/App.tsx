@@ -437,8 +437,12 @@ export function App() {
   }, []);
 
   const copyText = useCallback(async (value: string) => {
-    await navigator.clipboard.writeText(value);
-    setSettingsMessage("Copied");
+    try {
+      await writeClipboardText(value);
+      setSettingsMessage("Copied");
+    } catch (error) {
+      setSettingsMessage(error instanceof Error ? error.message : "Could not copy");
+    }
   }, []);
 
   const createImportToken = useCallback(async () => {
@@ -1050,7 +1054,6 @@ export function App() {
     ensureSessionEventsTarget,
     onNoActiveSession: clearActiveLocalSession,
     setSessionEvents,
-    syncNow,
     refreshActiveSessionEvents,
     markServerError,
   });
@@ -1139,9 +1142,7 @@ export function App() {
         ).catch(() => {});
       },
       onMessage: (message, readyState) => {
-        const activeSession = activeRef.current;
-        const activeTouched = Boolean(activeSession && message.sessionIds.includes(activeSession.id));
-        const loadedEvents = activeSession && eventStateRef.current.sessionId === activeSession.id ? eventStateRef.current.events.length : 0;
+        const snapshotActive = activeRef.current;
         void logClientEvent(
           "info",
           "stream.ingest.message",
@@ -1154,10 +1155,8 @@ export function App() {
             agentId: message.agentId,
             sessionIds: message.sessionIds,
             acceptedEvents: message.acceptedEvents,
-            activeId: activeSession?.id ?? null,
-            activeTouched,
-            activeLoadedEvents: loadedEvents,
-            activeExpectedEvents: activeSession?.eventCount ?? null,
+            activeId: snapshotActive?.id ?? null,
+            activeTouched: Boolean(snapshotActive && message.sessionIds.includes(snapshotActive.id)),
             hidden: document.hidden,
             pendingIngest: pendingIngest.current,
           },
@@ -1170,21 +1169,8 @@ export function App() {
         timer = window.setTimeout(() => {
           timer = null;
           pendingIngest.current = false;
-          if (message.sessionIds.length) void syncNow({ silent: true, metadataOnly: true });
           void syncNow({ silent: true, metadataOnly: false, eventMode: "forward" });
-          if (activeSession && activeTouched) {
-            void refreshActiveSessionEvents(activeSession.id, "stream_active_session", loadedEvents, activeSession.eventCount).catch((error) => {
-              markServerError(error);
-              void logClientEvent(
-                "warn",
-                "read.session_events.stream_refresh_failed",
-                error instanceof Error ? error.message : String(error),
-                { sessionId: activeSession.id, cachedEvents: loadedEvents, expectedEvents: activeSession.eventCount, error },
-                ["read", "session", "stream"],
-              ).catch(() => {});
-            });
-          }
-        }, 300);
+        }, 50);
       },
       onHeartbeat: (message, readyState) => {
         void logClientEvent(
@@ -1237,7 +1223,7 @@ export function App() {
       ).catch(() => {});
       close();
     };
-  }, [isAuthenticated, markServerError, refreshActiveSessionEvents, syncNow]);
+  }, [isAuthenticated, syncNow]);
 
   const filteredSessions = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -1456,10 +1442,36 @@ function sameRawValue(a: unknown, b: unknown) {
 }
 
 function eventSourceReadyStateLabel(value: number) {
-  if (value === EventSource.CONNECTING) return "connecting";
-  if (value === EventSource.OPEN) return "open";
-  if (value === EventSource.CLOSED) return "closed";
+  if (value === 0) return "connecting";
+  if (value === 1) return "open";
+  if (value === 2) return "closed";
   return "unknown";
+}
+
+async function writeClipboardText(value: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Fall back to the legacy path while the click activation is still live.
+    }
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  try {
+    if (!document.execCommand("copy")) throw new Error("Could not copy");
+  } finally {
+    textarea.remove();
+  }
 }
 
 function errorMessage(error: unknown) {

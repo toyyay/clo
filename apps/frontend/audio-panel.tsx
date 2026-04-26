@@ -184,6 +184,7 @@ export function chooseRecorderMimeType() {
 
 export function extensionForMime(mimeType: string) {
   if (mimeType.includes("mp4")) return "m4a";
+  if (mimeType.includes("wav")) return "wav";
   if (mimeType.includes("ogg")) return "ogg";
   if (mimeType.includes("mpeg")) return "mp3";
   return "webm";

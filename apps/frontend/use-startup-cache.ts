@@ -138,8 +138,7 @@ export function useStartupCache({
           },
           ["cache", "startup"],
         ).catch(() => {});
-        if (isAuthenticated && !("source" in shell)) {
-          void syncNow({ silent: true, metadataOnly: true });
+        if (isAuthenticated) {
           void syncNow({ silent: true, metadataOnly: false, eventMode: "recent" });
         }
       })

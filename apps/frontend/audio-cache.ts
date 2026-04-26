@@ -1,11 +1,15 @@
 import { openCacheDb } from "./db";
+import { PCM_AUDIO_CHUNK_MIME_TYPE } from "./browser-audio-recorder";
 
 export type CachedAudioStatus = "recording" | "pending" | "uploading" | "failed";
+export type CachedAudioCodec = "pcm-s16le";
 
 export type CachedAudioRecording = {
   id: string;
   filename: string;
   mimeType: string;
+  audioCodec?: CachedAudioCodec | null;
+  sampleRate?: number | null;
   status: CachedAudioStatus;
   createdAt: string;
   updatedAt: string;
@@ -24,13 +28,18 @@ type CachedAudioChunk = {
   createdAt: string;
 };
 
-export async function createCachedAudioRecording(mimeType: string): Promise<CachedAudioRecording> {
+export async function createCachedAudioRecording(
+  mimeType: string,
+  options: { audioCodec?: CachedAudioCodec | null; sampleRate?: number | null } = {},
+): Promise<CachedAudioRecording> {
   const now = new Date().toISOString();
-  const id = `rec_${Date.now()}_${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
+  const id = `rec_${Date.now()}_${newRecordingIdPart()}`;
   const recording: CachedAudioRecording = {
     id,
     filename: `recording-${now.replace(/[:.]/g, "-")}.${audioExtensionForMime(mimeType)}`,
     mimeType,
+    audioCodec: options.audioCodec ?? null,
+    sampleRate: options.sampleRate ?? null,
     status: "recording",
     createdAt: now,
     updatedAt: now,
@@ -117,6 +126,11 @@ export async function loadCachedAudioBlob(recordingId: string): Promise<Blob> {
   const ordered = chunks.sort((a, b) => a.index - b.index);
   if (!ordered.length) throw new Error("cached recording has no audio chunks");
   const recording = await loadCachedAudioRecording(recordingId);
+  if (recording?.audioCodec === "pcm-s16le" || ordered.some((chunk) => chunk.mimeType === PCM_AUDIO_CHUNK_MIME_TYPE)) {
+    const sampleRate = normalizedSampleRate(recording?.sampleRate);
+    const buffers = await Promise.all(ordered.map((chunk) => chunk.blob.arrayBuffer()));
+    return new Blob([encodeWavFromPcm16Chunks(buffers, sampleRate)], { type: "audio/wav" });
+  }
   return new Blob(ordered.map((chunk) => chunk.blob), {
     type: recording?.mimeType || ordered[0]?.mimeType || "audio/webm",
   });
@@ -150,6 +164,46 @@ function audioExtensionForMime(mimeType: string) {
   if (mimeType.includes("ogg")) return "ogg";
   if (mimeType.includes("wav")) return "wav";
   return "webm";
+}
+
+function normalizedSampleRate(value?: number | null) {
+  return Number.isFinite(value) && value && value > 0 ? Math.round(value) : 44100;
+}
+
+function encodeWavFromPcm16Chunks(chunks: ArrayBuffer[], sampleRate: number) {
+  const dataBytes = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const bytes = new Uint8Array(44 + dataBytes);
+  const view = new DataView(bytes.buffer);
+  writeAscii(bytes, 0, "RIFF");
+  view.setUint32(4, 36 + dataBytes, true);
+  writeAscii(bytes, 8, "WAVE");
+  writeAscii(bytes, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(bytes, 36, "data");
+  view.setUint32(40, dataBytes, true);
+
+  let offset = 44;
+  for (const chunk of chunks) {
+    bytes.set(new Uint8Array(chunk), offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function writeAscii(bytes: Uint8Array, offset: number, value: string) {
+  for (let index = 0; index < value.length; index += 1) {
+    bytes[offset + index] = value.charCodeAt(index);
+  }
+}
+
+function newRecordingIdPart() {
+  return globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
 }
 
 function request<T>(req: IDBRequest<T>): Promise<T> {

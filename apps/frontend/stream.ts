@@ -16,6 +16,11 @@ export type IngestStreamHandlers = {
 };
 
 export function openIngestStream(handlers: IngestStreamHandlers) {
+  if (typeof EventSource === "undefined") {
+    window.setTimeout(() => handlers.onError?.(new Event("error"), 2), 0);
+    return () => {};
+  }
+
   const source = new EventSource("/api/stream");
   source.addEventListener("open", (event) => {
     handlers.onOpen?.(event, source.readyState);
