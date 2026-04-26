@@ -11,10 +11,6 @@ export function planUploadChunks(files: InventoryFile[], batches: TailBatch[], p
       skipped.push({ sourcePath: file.sourcePath, reason: `provider ${file.provider} disabled by policy` });
       continue;
     }
-    if (file.sizeBytes > policy.maxFileBytes) {
-      skipped.push({ sourcePath: file.sourcePath, reason: `file exceeds maxFileBytes (${policy.maxFileBytes})` });
-      continue;
-    }
 
     const batch = batchByPath.get(file.sourcePath);
     if (!batch?.records.length) continue;

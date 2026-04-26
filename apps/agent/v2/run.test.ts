@@ -132,6 +132,51 @@ describe("agent-v2 live runner", () => {
     expect(state.cursors[missingPath]).toBeUndefined();
   });
 
+  test("uploads append chunks from files larger than the raw file limit", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "chatview-agent-v2-run-large-"));
+    const rootPath = join(dir, "codex");
+    const sourcePath = join(rootPath, "session.jsonl");
+    const statePath = join(dir, "state", "v2.json");
+    const line = "{\"type\":\"user_message\",\"message\":\"still append me\"}\n";
+    await mkdir(rootPath, { recursive: true });
+    await writeFile(sourcePath, line);
+
+    const uploads: unknown[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      if (String(url).endsWith("/api/agent/v1/hello")) {
+        return jsonResponse({
+          policy: {
+            enabled: true,
+            uploadsEnabled: true,
+            maxFileBytes: 1,
+            maxUploadChunkBytes: 1024,
+            maxUploadLines: 10,
+            scanRoots: ["codex"],
+            ignorePatterns: [],
+          },
+        });
+      }
+      if (String(url).endsWith("/api/agent/v1/append")) {
+        uploads.push(JSON.parse(String(init?.body)));
+        return jsonResponse({ ok: true, cursor: "1" });
+      }
+      return jsonResponse({ error: "not found" }, 404);
+    }) as unknown as typeof fetch;
+
+    const summary = await scanAndUploadAgentV2({
+      roots: [{ provider: "codex", rootPath }],
+      statePath,
+      backendUrl: "http://backend.test",
+      token: "test-token",
+      readChunkBytes: 1024,
+      fetchImpl,
+    });
+
+    expect(summary.uploadedChunkCount).toBe(1);
+    expect(uploads).toHaveLength(1);
+    expect((uploads[0] as any).chunks[0].rawText).toBe(line);
+  });
+
   test("does not advance the cursor when all pending records are skipped", async () => {
     const dir = await mkdtemp(join(tmpdir(), "chatview-agent-v2-run-skip-"));
     const rootPath = join(dir, "codex");

@@ -114,7 +114,6 @@ export async function scanAndUploadAgentV2(options: AgentV2RunOptions): Promise<
   const readChunkBytes = options.readChunkBytes ?? policy.maxUploadChunkBytes;
 
   for (const file of files) {
-    if (file.sizeBytes > policy.maxFileBytes) continue;
     const batch = await readAppendJsonl(file, state.cursors[file.sourcePath], { readChunkBytes });
     batches.push(batch);
   }
