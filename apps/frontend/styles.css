@@ -147,9 +147,39 @@ pre {
   display: flex;
   justify-content: flex-end;
 }
-.sync-line { font-size: 12px; color: var(--muted); margin-top: 0; white-space: nowrap; }
-.sync-line.syncing { color: var(--accent); }
-.sync-line.offline, .sync-line.error { color: var(--danger); }
+.sync-line {
+  min-width: 0;
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 0;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.sync-main,
+.sync-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sync-main { color: var(--text); }
+.sync-detail { color: var(--muted); }
+.sync-line.syncing .sync-main { color: var(--accent); }
+.sync-line.offline .sync-main,
+.sync-line.error .sync-main { color: var(--danger); }
+.sync-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: 999px;
+  background: var(--muted);
+}
+.sync-dot.online { background: #2f9e66; }
+.sync-dot.offline,
+.sync-dot.error { background: var(--danger); }
 .top-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .icon-button {
   display: inline-flex;
@@ -579,9 +609,26 @@ body.resizing-sidebar {
   display: flex;
   align-items: center;
   justify-content: center;
+  gap: 6px;
+  max-width: min(44vw, 360px);
   min-width: 24px;
   min-height: 24px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
+.chat-status span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chat-status.syncing { color: var(--accent); }
+.chat-status.offline,
+.chat-status.error { color: var(--danger); }
+.chat-status.pending { color: var(--muted); }
 .chat-count {
   align-self: start;
   min-width: 34px;
@@ -610,12 +657,24 @@ body.resizing-sidebar {
   gap: 0;
   padding-top: 8px;
 }
-.bottom-button {
+.bottom-controls {
   position: sticky;
   bottom: 8px;
   float: right;
   z-index: 3;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
   margin: 0 8px 8px auto;
+  pointer-events: none;
+}
+.bottom-button,
+.follow-button {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
   min-height: 30px;
   padding: 5px 9px;
   border: 1px solid var(--line);
@@ -624,6 +683,31 @@ body.resizing-sidebar {
   color: var(--text);
   box-shadow: var(--shadow);
   font-size: 13px;
+}
+.bottom-button:disabled {
+  opacity: 0.45;
+}
+.follow-button {
+  background: var(--panel);
+}
+.follow-button.active {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  background: var(--accent-soft);
+}
+.follow-check {
+  width: 13px;
+  height: 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--accent);
+  font-size: 10px;
+  line-height: 1;
+}
+.follow-button.active .follow-check {
+  border-color: var(--accent);
 }
 
 .bubble-row { display: flex; justify-content: flex-start; }

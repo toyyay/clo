@@ -33,7 +33,7 @@ import {
 import { AudioModal, FALLBACK_REASONING_EFFORTS, FALLBACK_TRANSCRIPTION_MODELS } from "./audio-panel";
 import { fetchJson, sameEntityList, shallowEqualObject, withTimeout } from "./app-utils";
 import { AuthPage } from "./auth-page";
-import type { AuthState, EventState, SyncNowOptions, SyncState } from "./app-types";
+import type { AuthState, EventState, SyncHealth, SyncNowOptions, SyncState } from "./app-types";
 import { flatten, groupItems } from "./chat-transcript";
 import { flushClientLogs, installClientLogHandlers, logClientEvent } from "./client-logs";
 import { MainChat } from "./main-chat";
@@ -70,6 +70,8 @@ import {
 } from "./yjs";
 import { Topbar } from "./topbar";
 
+const HEALTH_REFRESH_MS = 30_000;
+
 export function App() {
   const [route, navigateRoute] = useRoute();
   const [authState, setAuthState] = useState<AuthState>("checking");
@@ -84,6 +86,13 @@ export function App() {
   const [query, setQuery] = useState("");
   const [syncState, setSyncState] = useState<SyncState>("loading");
   const [statusText, setStatusText] = useState("Loading cache");
+  const [syncHealth, setSyncHealth] = useState<SyncHealth>(() => ({
+    online: navigator.onLine,
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    lastError: null,
+  }));
+  const [now, setNow] = useState(() => Date.now());
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [sidebarOpen, setSidebarOpen] = useState(() => !window.matchMedia("(max-width: 780px)").matches);
   const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth);
@@ -179,6 +188,47 @@ export function App() {
     [sidebarWidth],
   );
 
+  const markServerAttempt = useCallback(() => {
+    const timestampMs = Date.now();
+    const timestamp = new Date(timestampMs).toISOString();
+    setSyncHealth((current) => {
+      if (!shouldRefreshHealthTimestamp(current.lastAttemptAt, timestampMs) && current.online === navigator.onLine) return current;
+      return { ...current, online: navigator.onLine, lastAttemptAt: timestamp };
+    });
+  }, []);
+
+  const markServerReachable = useCallback(() => {
+    const timestampMs = Date.now();
+    const timestamp = new Date(timestampMs).toISOString();
+    setSyncHealth((current) => {
+      if (
+        !current.lastError &&
+        current.online === navigator.onLine &&
+        current.lastSuccessAt &&
+        !shouldRefreshHealthTimestamp(current.lastSuccessAt, timestampMs)
+      ) {
+        return current;
+      }
+      return {
+        ...current,
+        online: navigator.onLine,
+        lastAttemptAt: current.lastAttemptAt ?? timestamp,
+        lastSuccessAt: timestamp,
+        lastError: null,
+      };
+    });
+  }, []);
+
+  const markServerError = useCallback((error: unknown) => {
+    const timestamp = new Date().toISOString();
+    setSyncHealth((current) => ({
+      ...current,
+      online: navigator.onLine,
+      lastAttemptAt: timestamp,
+      lastError: errorMessage(error),
+    }));
+  }, []);
+
   const setActiveSession = useCallback((next: SessionInfo | null) => {
     setActive((current) => {
       if (current === null && next === null) return current;
@@ -197,11 +247,13 @@ export function App() {
 
   const checkAuth = useCallback(async () => {
     const started = performance.now();
+    markServerAttempt();
     void logClientEvent("debug", "auth.status.start", null, { online: navigator.onLine }, ["auth"]).catch(() => {});
     try {
       const response = await fetch("/api/auth/status");
       if (!response.ok) throw new Error(`auth status failed: ${response.status}`);
       const payload = (await response.json()) as { configured?: boolean; authenticated?: boolean };
+      markServerReachable();
       setAuthConfigured(Boolean(payload.configured));
       setAuthState(payload.authenticated ? "authenticated" : "anonymous");
       setAuthError(payload.configured ? "" : "WEB_TOKEN is not configured on the server.");
@@ -217,6 +269,7 @@ export function App() {
         ["auth"],
       ).catch(() => {});
     } catch (error) {
+      markServerError(error);
       const cachedSessions = await loadSessions().catch(() => []);
       if (cachedSessions.length && navigator.onLine === false) {
         setAuthConfigured(true);
@@ -236,7 +289,7 @@ export function App() {
       ).catch(() => {});
       console.error(error);
     }
-  }, []);
+  }, [markServerAttempt, markServerError, markServerReachable]);
 
   const login = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
@@ -476,6 +529,7 @@ export function App() {
     const eventMode = metadataOnly ? undefined : options.eventMode;
     syncing.current = true;
     const started = performance.now();
+    markServerAttempt();
     if (!silent) {
       setSyncState("syncing");
       setStatusText(metadataOnly ? "Refreshing metadata" : "Syncing");
@@ -500,6 +554,7 @@ export function App() {
           }
         },
       });
+      markServerReachable();
       const shouldRefreshCache =
         !silent || result.events > 0 || result.hasMore || result.hosts > 0 || result.sessions > 0 || result.metadataFull;
       let refreshedSessions = sessionsRef.current;
@@ -607,8 +662,11 @@ export function App() {
       }
     } catch (error) {
       if (error instanceof SyncAuthError) {
+        markServerReachable();
         setAuthState("anonymous");
         setAuthError("Session expired. Enter the token again.");
+      } else {
+        markServerError(error);
       }
       setSyncState(navigator.onLine ? "error" : "offline");
       setStatusText(navigator.onLine ? "Sync failed" : "Offline cache");
@@ -627,7 +685,16 @@ export function App() {
       pendingSync.current = null;
       if (pending) window.setTimeout(() => void syncNow(pending), 0);
     }
-  }, [isAuthenticated, navigateRoute, refreshCache, setActiveSession, setSessionEvents]);
+  }, [
+    isAuthenticated,
+    markServerAttempt,
+    markServerError,
+    markServerReachable,
+    navigateRoute,
+    refreshCache,
+    setActiveSession,
+    setSessionEvents,
+  ]);
 
   useEffect(() => {
     installClientLogHandlers();
@@ -649,6 +716,40 @@ export function App() {
       if (backfillTimer.current !== null) window.clearTimeout(backfillTimer.current);
     };
   }, []);
+
+  useEffect(() => {
+    const tick = () => setNow(Date.now());
+    const id = window.setInterval(tick, 30_000);
+    const onVisible = () => {
+      if (!document.hidden) tick();
+    };
+    window.addEventListener("focus", tick);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearInterval(id);
+      window.removeEventListener("focus", tick);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
+
+  useEffect(() => {
+    const setOnlineStatus = () => {
+      setSyncHealth((current) => ({ ...current, online: navigator.onLine }));
+    };
+    const onOffline = () => {
+      setSyncHealth((current) => ({ ...current, online: false, lastError: "Browser is offline" }));
+      if (isAuthenticated) {
+        setSyncState("offline");
+        setStatusText("Offline cache");
+      }
+    };
+    window.addEventListener("online", setOnlineStatus);
+    window.addEventListener("offline", onOffline);
+    return () => {
+      window.removeEventListener("online", setOnlineStatus);
+      window.removeEventListener("offline", onOffline);
+    };
+  }, [isAuthenticated]);
 
   useEffect(() => {
     checkAuth();
@@ -939,8 +1040,10 @@ export function App() {
           { sessionId: loadForSessionId, cachedEvents: cachedEvents.length, expectedEvents },
           ["read", "session"],
         ).catch(() => {});
+        markServerAttempt();
         const payload = await fetchSessionEvents(loadForSessionId);
         if (disposed || activeRef.current?.id !== loadForSessionId) return;
+        markServerReachable();
         const sessionForCache = payload.session ?? activeRef.current;
         if (payload.session) setActiveSession(payload.session);
         setSessionEvents(loadForSessionId, payload.events);
@@ -969,6 +1072,7 @@ export function App() {
         ).catch(() => {});
       })
       .catch((error) => {
+        markServerError(error);
         void logClientEvent(
           "error",
           "read.session_events.failed",
@@ -981,7 +1085,17 @@ export function App() {
     return () => {
       disposed = true;
     };
-  }, [activeId, active?.eventCount, isAuthenticated, setActiveSession, setSessionEvents, syncNow]);
+  }, [
+    activeId,
+    active?.eventCount,
+    isAuthenticated,
+    markServerAttempt,
+    markServerError,
+    markServerReachable,
+    setActiveSession,
+    setSessionEvents,
+    syncNow,
+  ]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -1139,6 +1253,8 @@ export function App() {
         active={active}
         syncState={syncState}
         statusText={statusText}
+        syncHealth={syncHealth}
+        now={now}
         theme={theme}
         onToggleSidebar={() => setSidebarOpen((open) => !open)}
         onOpenAudio={() => openPanel("audio")}
@@ -1153,6 +1269,7 @@ export function App() {
           sidebarOpen={sidebarOpen}
           sidebarRef={sidebarRef}
           active={active}
+          now={now}
           query={query}
           sessions={filteredSessions}
           filteredSessionCount={filteredSessions.length}
@@ -1169,6 +1286,9 @@ export function App() {
           eventsLength={events.length}
           items={items}
           draft={draft}
+          now={now}
+          syncHealth={syncHealth}
+          syncState={syncState}
           onDraftChange={handleDraftChange}
         />
       </div>
@@ -1239,4 +1359,13 @@ function sameSessionEvents(a: SessionEvent[], b: SessionEvent[]) {
     if (a[i].id !== b[i].id || a[i].lineNo !== b[i].lineNo || a[i].offset !== b[i].offset) return false;
   }
   return true;
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function shouldRefreshHealthTimestamp(value: string | null, now: number) {
+  const parsed = value ? Date.parse(value) : NaN;
+  return !Number.isFinite(parsed) || now - parsed >= HEALTH_REFRESH_MS;
 }

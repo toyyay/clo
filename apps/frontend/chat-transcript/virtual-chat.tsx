@@ -5,6 +5,7 @@ import type { RenderItem, SavedScroll, ScrollAnchor, UpdateRangeOptions, Virtual
 const ROW_OVERSCAN = 8;
 const DEFAULT_ROW_HEIGHT = 96;
 const SCROLL_STORAGE_PREFIX = "chatview:chat-scroll:";
+const FOLLOW_BOTTOM_STORAGE_KEY = "chatview:chat-follow-bottom";
 
 function estimateItemHeight(item: RenderItem) {
   if (item.kind === "tool_group") return 34;
@@ -55,11 +56,14 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
   const pendingRangeCapture = useRef(false);
   const previousItemsLength = useRef(0);
   const resetKeyRef = useRef(resetKey);
+  const followBottomRef = useRef(false);
   const [measureVersion, setMeasureVersion] = useState(0);
   const [range, setRange] = useState<VirtualRange>({ start: 0, end: 0, top: 0, bottom: 0 });
   const [showBottom, setShowBottom] = useState(false);
+  const [followBottom, setFollowBottom] = useState(readFollowBottom);
 
   resetKeyRef.current = resetKey;
+  followBottomRef.current = followBottom;
 
   const itemKeys = useMemo(() => stableItemKeys(items), [items]);
 
@@ -112,10 +116,10 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     scheduleRange({ captureAnchor: true });
   }, [resetKey, scheduleRange]);
 
-  const scrollToBottom = useCallback(() => {
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
     const el = scrollRef.current;
     if (!el) return;
-    el.scrollTop = el.scrollHeight;
+    el.scrollTo({ top: el.scrollHeight, behavior });
     nearBottom.current = true;
     setShowBottom(false);
     scheduleRange();
@@ -140,6 +144,12 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     },
     [cancelScrollFrame],
   );
+
+  const toggleFollowBottom = useCallback(() => {
+    const next = !followBottomRef.current;
+    setFollowBottom(next);
+    if (next) scheduleScrollFrame(() => scrollToBottom("smooth"));
+  }, [scheduleScrollFrame, scrollToBottom]);
 
   const onMeasure = useCallback((key: string, height: number) => {
     const rounded = Math.ceil(height);
@@ -191,8 +201,10 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     if (wasPendingBottom) {
       pendingBottom.current = false;
       scheduleScrollFrame(scrollToBottom);
+    } else if (appended && followBottomRef.current) {
+      scheduleScrollFrame(() => scrollToBottom("smooth"));
     } else if (appended && wasNearBottom) {
-      scheduleScrollFrame(scrollToBottom);
+      setShowBottom(true);
     }
   }, [items.length, itemKeys, layout.total, resetKey, scheduleScrollFrame, scrollToBottom, updateRange]);
 
@@ -222,6 +234,10 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
   }, [scheduleRange]);
 
   useEffect(() => {
+    writeFollowBottom(followBottom);
+  }, [followBottom]);
+
+  useEffect(() => {
     return () => {
       if (raf.current !== null) window.cancelAnimationFrame(raf.current);
       if (scrollRaf.current !== null) window.cancelAnimationFrame(scrollRaf.current);
@@ -239,10 +255,21 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
         })}
       </div>
       <div className="virtual-spacer" style={{ height: range.bottom }} />
-      {showBottom && (
-        <button className="bottom-button" onClick={scrollToBottom}>
-          Bottom
-        </button>
+      {items.length > 0 && (
+        <div className="bottom-controls">
+          <button className="bottom-button" onClick={() => scrollToBottom("smooth")} disabled={!showBottom} title="Scroll to bottom">
+            Bottom
+          </button>
+          <button
+            className={`follow-button ${followBottom ? "active" : ""}`}
+            onClick={toggleFollowBottom}
+            aria-pressed={followBottom}
+            title="Always scroll to new messages"
+          >
+            <span className="follow-check" aria-hidden="true">{followBottom ? "✓" : ""}</span>
+            Follow
+          </button>
+        </div>
       )}
     </div>
   );
@@ -275,6 +302,22 @@ function loadChatScroll(resetKey: string): SavedScroll | null {
     return { top: Math.max(0, top), nearBottom: Boolean(parsed.nearBottom) };
   } catch {
     return null;
+  }
+}
+
+function readFollowBottom() {
+  try {
+    return localStorage.getItem(FOLLOW_BOTTOM_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function writeFollowBottom(value: boolean) {
+  try {
+    localStorage.setItem(FOLLOW_BOTTOM_STORAGE_KEY, value ? "true" : "false");
+  } catch {
+    return;
   }
 }
 

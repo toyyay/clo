@@ -67,6 +67,7 @@ export function SessionSidebar({
   sidebarOpen,
   sidebarRef,
   active,
+  now,
   query,
   sessions,
   filteredSessionCount,
@@ -80,6 +81,7 @@ export function SessionSidebar({
   sidebarOpen: boolean;
   sidebarRef: RefObject<HTMLElement | null>;
   active: SessionInfo | null;
+  now: number;
   query: string;
   sessions: SessionInfo[];
   filteredSessionCount: number;
@@ -154,7 +156,7 @@ export function SessionSidebar({
             const deviceOpen = isOpen(device.key);
             return (
               <div key={device.key} className="tree-node">
-                <FolderRow nodeKey={device.key} level={0} label={device.label} title={device.title} count={device.count} updatedAt={device.updatedAt} open={deviceOpen} archivedCount={device.archivedCount} onToggle={toggleOpen} />
+                <FolderRow nodeKey={device.key} level={0} label={device.label} title={device.title} count={device.count} updatedAt={device.updatedAt} now={now} open={deviceOpen} archivedCount={device.archivedCount} onToggle={toggleOpen} />
                 {deviceOpen &&
                   device.providers.map((provider) => {
                     const providerOpen = isOpen(provider.key);
@@ -162,7 +164,7 @@ export function SessionSidebar({
                     const hiddenProjects = Math.max(0, provider.projects.length - visibleProjects.length);
                     return (
                       <div key={provider.key} className="tree-node">
-                        <FolderRow nodeKey={provider.key} level={1} label={provider.label} count={provider.count} updatedAt={provider.updatedAt} open={providerOpen} archivedCount={provider.archivedCount} onToggle={toggleOpen} />
+                        <FolderRow nodeKey={provider.key} level={1} label={provider.label} count={provider.count} updatedAt={provider.updatedAt} now={now} open={providerOpen} archivedCount={provider.archivedCount} onToggle={toggleOpen} />
                         {providerOpen && (
                           <>
                             {visibleProjects.map((project) => {
@@ -171,7 +173,7 @@ export function SessionSidebar({
                               const hiddenSessions = Math.max(0, project.sessions.length - visibleSessions.length);
                               return (
                                 <div key={project.key} className="tree-node">
-                                  <FolderRow nodeKey={project.key} level={2} label={project.label} count={project.count} updatedAt={project.updatedAt} open={projectOpen} archivedCount={project.archivedCount} onToggle={toggleOpen} />
+                                  <FolderRow nodeKey={project.key} level={2} label={project.label} count={project.count} updatedAt={project.updatedAt} now={now} open={projectOpen} archivedCount={project.archivedCount} onToggle={toggleOpen} />
                                   {projectOpen && (
                                     <>
                                       {visibleSessions.map((session) => (
@@ -184,7 +186,7 @@ export function SessionSidebar({
                                           <span className={`archive-dot ${session.deletedAt ? "archived" : "active"}`} title={session.deletedAt ? "Archived" : "Active"} />
                                           <span className="tree-label">{sessionDisplayTitle(session)}</span>
                                           <span className="tree-time" title={sessionActivityTitle(session)}>
-                                            {sessionActivityLabel(session)}
+                                            {sessionActivityLabel(session, now)}
                                           </span>
                                         </button>
                                       ))}
@@ -224,6 +226,7 @@ function FolderRow({
   title,
   count,
   updatedAt,
+  now,
   open,
   archivedCount,
   onToggle,
@@ -234,6 +237,7 @@ function FolderRow({
   title?: string;
   count: number;
   updatedAt: string;
+  now: number;
   open: boolean;
   archivedCount: number;
   onToggle: (key: string) => void;
@@ -245,7 +249,7 @@ function FolderRow({
       <span className="tree-meta">
         {archivedCount > 0 && <span className="archive-dot archived" title={`${archivedCount.toLocaleString()} archived`} />}
         {count.toLocaleString()}
-        {updatedAt ? ` · ${relativeActivityLabel(updatedAt)}` : ""}
+        {updatedAt ? ` · ${relativeActivityLabel(updatedAt, now)}` : ""}
       </span>
     </button>
   );
