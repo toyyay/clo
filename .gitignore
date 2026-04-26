@@ -2,3 +2,7 @@ node_modules/
 dist/
 .chatview-agent-dev/
 .DS_Store
+data/
+.env
+*.dump
+*.sql.gz
