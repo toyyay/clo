@@ -113,6 +113,23 @@ pre {
   flex-direction: column;
   overflow: hidden;
 }
+.build-badge {
+  position: fixed;
+  top: 48px;
+  right: 10px;
+  z-index: 5;
+  max-width: calc(100vw - 20px);
+  padding: 1px 4px;
+  color: color-mix(in srgb, var(--muted) 76%, transparent);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.2;
+  letter-spacing: 0;
+  opacity: 0.68;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
 .topbar {
   z-index: 4;
   min-height: 44px;

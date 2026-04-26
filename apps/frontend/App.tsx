@@ -80,6 +80,7 @@ export function App() {
   const [authToken, setAuthToken] = useState("");
   const [authError, setAuthError] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
+  const [buildSha, setBuildSha] = useState<string | null>(null);
   const [hosts, setHosts] = useState<HostInfo[]>([]);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [active, setActive] = useState<SessionInfo | null>(null);
@@ -880,6 +881,24 @@ export function App() {
   }, [checkAuth]);
 
   useEffect(() => {
+    let disposed = false;
+    fetch("/api/health", { cache: "no-store" })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`health failed: ${response.status}`);
+        return (await response.json()) as { commit_sha?: string };
+      })
+      .then((payload) => {
+        if (!disposed) setBuildSha(payload.commit_sha ?? null);
+      })
+      .catch(() => {
+        if (!disposed) setBuildSha(null);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!isAuthenticated) return;
     void flushClientLogs().catch(() => {});
     const id = window.setInterval(() => {
@@ -1278,20 +1297,24 @@ export function App() {
 
   if (!canShowLocalApp) {
     return (
-      <AuthPage
-        authState={authState}
-        authConfigured={authConfigured}
-        authToken={authToken}
-        authError={authError}
-        authBusy={authBusy}
-        onTokenChange={setAuthToken}
-        onLogin={login}
-      />
+      <>
+        <AuthPage
+          authState={authState}
+          authConfigured={authConfigured}
+          authToken={authToken}
+          authError={authError}
+          authBusy={authBusy}
+          onTokenChange={setAuthToken}
+          onLogin={login}
+        />
+        <BuildBadge sha={buildSha} />
+      </>
     );
   }
 
   return (
     <div className={`app-shell ${sidebarOpen ? "" : "sidebar-closed"}`} style={appShellStyle}>
+      <BuildBadge sha={buildSha} />
       <Topbar
         active={active}
         syncState={syncState}
@@ -1380,6 +1403,18 @@ export function App() {
       )}
     </div>
   );
+}
+
+function BuildBadge({ sha }: { sha: string | null }) {
+  const shortSha = formatBuildSha(sha);
+  if (!shortSha) return null;
+  return <div className="build-badge" aria-hidden="true">{`build ${shortSha}`}</div>;
+}
+
+function formatBuildSha(sha: string | null) {
+  const clean = sha?.trim();
+  if (!clean || clean === "unknown") return null;
+  return clean.slice(0, 8);
 }
 
 function mergeSyncOptions(current: SyncNowOptions | null, next: SyncNowOptions): SyncNowOptions {
