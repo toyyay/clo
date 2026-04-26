@@ -40,7 +40,7 @@ function appendNormalizedEvent(out: FlatPart[], value: any, event: SessionEvent)
 
 function appendContent(out: FlatPart[], role: TextPart["role"] | null, content: unknown) {
   if (typeof content === "string") {
-    if (role && content.trim()) out.push({ kind: "text", role, text: content });
+    appendText(out, role, content);
     return;
   }
   if (!Array.isArray(content)) return;
@@ -49,13 +49,13 @@ function appendContent(out: FlatPart[], role: TextPart["role"] | null, content: 
 
 function appendContentPart(out: FlatPart[], role: TextPart["role"] | null, value: any) {
   if (typeof value === "string") {
-    if (role && value.trim()) out.push({ kind: "text", role, text: value });
+    appendText(out, role, value);
     return;
   }
   if (!value || typeof value !== "object") return;
   const kind = String(value.kind ?? value.type ?? "").toLowerCase();
   if ((kind === "text" || kind === "input_text" || kind === "output_text" || kind === "summary_text") && role && value.text?.trim()) {
-    out.push({ kind: "text", role, text: value.text });
+    appendText(out, role, value.text);
   } else if (kind === "thinking" || kind === "reasoning" || kind === "reasoning_text") {
     const thinking = value.thinking ?? value.text ?? value.content;
     if (typeof thinking === "string" && thinking.trim()) out.push({ kind: "thinking", text: thinking });
@@ -76,8 +76,55 @@ function appendContentPart(out: FlatPart[], role: TextPart["role"] | null, value
   } else if (Array.isArray(value.content)) {
     appendContent(out, role, value.content);
   } else if (typeof value.text === "string" && role && value.text.trim()) {
-    out.push({ kind: "text", role, text: value.text });
+    appendText(out, role, value.text);
   }
+}
+
+function appendText(out: FlatPart[], role: TextPart["role"] | null, text: string) {
+  const readable = readableText(text);
+  if (role && readable.trim()) out.push({ kind: "text", role, text: readable });
+}
+
+function readableText(text: string) {
+  return codexNotificationText(text) ?? text;
+}
+
+function codexNotificationText(text: string) {
+  const trimmed = text.trimStart();
+  const tag = "<subagent_notification>";
+  if (!trimmed.startsWith(tag)) return null;
+  const parsed = parseTaggedJson(trimmed.slice(tag.length).trim());
+  if (!parsed) return null;
+  return notificationStatusText(parsed) ?? null;
+}
+
+function parseTaggedJson(text: string): any | null {
+  try {
+    return JSON.parse(text);
+  } catch {
+    for (let end = text.lastIndexOf("}"); end >= 0; end = text.lastIndexOf("}", end - 1)) {
+      try {
+        return JSON.parse(text.slice(0, end + 1));
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+}
+
+function notificationStatusText(value: any): string | undefined {
+  const status = value?.status;
+  if (typeof status === "string") return status;
+  if (status && typeof status === "object") {
+    for (const key of ["completed", "failed", "error", "running", "started"]) {
+      if (typeof status[key] === "string") return status[key];
+    }
+  }
+  for (const key of ["message", "text", "summary", "output"]) {
+    if (typeof value?.[key] === "string") return value[key];
+  }
+  return undefined;
 }
 
 function normalizedTextRole(value: unknown): TextPart["role"] | null {

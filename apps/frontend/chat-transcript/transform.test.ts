@@ -96,4 +96,19 @@ describe("chat transcript transform", () => {
       { kind: "text", role: "assistant", text: "Older event-msg-only record" },
     ]);
   });
+
+  test("unwraps Codex subagent notification JSON before markdown rendering", () => {
+    const flat = flatten([
+      event({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content:
+            '<subagent_notification> {"agent_path":"","status":{"completed":"Проверил.\\n\\n**Затронуто**\\n- `sync.ts`"}}',
+        },
+      }),
+    ]);
+
+    expect(flat).toEqual([{ kind: "text", role: "assistant", text: "Проверил.\n\n**Затронуто**\n- `sync.ts`" }]);
+  });
 });
