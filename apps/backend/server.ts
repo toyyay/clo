@@ -2146,7 +2146,7 @@ async function syncMetadata(body: SyncRequest): Promise<{
   ]);
   for (const session of [...legacySessions, ...v2Sessions]) hostIds.add(session.agentId);
   const hosts = hostIds.size ? (await listReadableHosts()).filter((host) => hostIds.has(host.agentId)) : [];
-  const cursor = page.length ? formatMetadataCursor(page[page.length - 1]) : body.metadataCursor ?? (await currentMetadataCursor());
+  const cursor = page.length ? formatMetadataCursor(page[page.length - 1]) : formatMetadataCursor(parsedCursor);
   return { mode, full: false, hasMore, cursor, hosts, sessions: [...legacySessions, ...v2Sessions] };
 }
 
@@ -2230,7 +2230,7 @@ function parseMetadataCursor(value: string | undefined): MetadataChangeKey | nul
   try {
     const parsed = JSON.parse(Buffer.from(value.slice("meta:".length), "base64url").toString("utf8"));
     if (!parsed || typeof parsed !== "object") return null;
-    const at = typeof parsed.at === "string" && parsed.at ? parsed.at : null;
+    const at = normalizeMetadataCursorTimestamp(parsed.at);
     const kind: MetadataChangeKey["kind"] | null =
       parsed.kind === "h" || parsed.kind === "l" || parsed.kind === "v" ? parsed.kind : null;
     const id = typeof parsed.id === "string" ? parsed.id : "";
@@ -2239,6 +2239,13 @@ function parseMetadataCursor(value: string | undefined): MetadataChangeKey | nul
   } catch {
     return null;
   }
+}
+
+function normalizeMetadataCursorTimestamp(value: unknown) {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value !== "string" || !value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
 }
 
 function metadataTimestampString(value: unknown) {
