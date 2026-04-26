@@ -1,4 +1,5 @@
 import type { AppLogInput, AppLogLevel } from "../../packages/shared/types";
+import { withTimeout } from "./app-utils";
 import { openCacheDb } from "./db";
 
 type QueuedClientLog = AppLogInput & {
@@ -13,6 +14,9 @@ const MAX_TEXT_LENGTH = 4000;
 const MAX_JSON_DEPTH = 6;
 const MAX_ARRAY_LENGTH = 80;
 const MAX_OBJECT_KEYS = 80;
+const IDB_LOG_TIMEOUT_MS = 1200;
+const IDB_LOG_RETRY_DELAY_MS = 30000;
+const MEMORY_LOG_LIMIT = 100;
 
 const originalConsole = {
   error: console.error.bind(console),
@@ -21,6 +25,9 @@ const originalConsole = {
 
 let installed = false;
 let flushing = false;
+let memoryFlushing = false;
+let idbLoggingDisabledUntil = 0;
+const memoryLogs: QueuedClientLog[] = [];
 const pageSessionId = newLogId();
 
 export function installClientLogHandlers() {
@@ -81,8 +88,7 @@ export async function logClientEvent(
       client: collectClientInfo(),
       createdAt: new Date().toISOString(),
     };
-    await enqueueLog(log);
-    if (level === "error" || level === "fatal" || navigator.onLine) void flushClientLogs().catch(() => {});
+    void enqueueLogWithFallback(log);
   } catch (error) {
     originalConsole.warn("failed to queue client log", error);
   }
@@ -93,21 +99,77 @@ export async function flushClientLogs(limit = FLUSH_BATCH_SIZE) {
   if (navigator.onLine === false) return { sent: 0 };
   flushing = true;
   try {
-    const logs = await loadQueuedLogs(limit);
-    if (!logs.length) return { sent: 0 };
-    const body = JSON.stringify({ logs });
-    const response = await fetch("/api/app/logs", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body,
-      keepalive: body.length < 60_000,
+    let sent = await flushMemoryLogs();
+    if (Date.now() < idbLoggingDisabledUntil) return { sent };
+    const logs = await withTimeout(loadQueuedLogs(limit), IDB_LOG_TIMEOUT_MS, "client log IndexedDB load timed out").catch((error) => {
+      markIdbLoggingUnavailable(error);
+      return [] as QueuedClientLog[];
     });
-    if (!response.ok) throw new Error(`log upload failed: ${response.status}`);
-    await deleteQueuedLogs(logs.map((log) => log.id));
-    return { sent: logs.length };
+    if (!logs.length) return { sent };
+    await sendLogs(logs);
+    await withTimeout(deleteQueuedLogs(logs.map((log) => log.id)), IDB_LOG_TIMEOUT_MS, "client log delete timed out").catch((error) => {
+      markIdbLoggingUnavailable(error);
+    });
+    sent += logs.length;
+    return { sent };
   } finally {
     flushing = false;
   }
+}
+
+async function enqueueLogWithFallback(log: QueuedClientLog) {
+  if (Date.now() < idbLoggingDisabledUntil) {
+    queueMemoryLog(log);
+    if (navigator.onLine) void flushMemoryLogs().catch(() => {});
+    return;
+  }
+
+  try {
+    await withTimeout(enqueueLog(log), IDB_LOG_TIMEOUT_MS, "client log IndexedDB queue timed out");
+    if (log.level === "error" || log.level === "fatal" || navigator.onLine) void flushClientLogs().catch(() => {});
+  } catch (error) {
+    markIdbLoggingUnavailable(error);
+    queueMemoryLog(log);
+    if (navigator.onLine) void flushMemoryLogs().catch(() => {});
+  }
+}
+
+function queueMemoryLog(log: QueuedClientLog) {
+  memoryLogs.push(log);
+  while (memoryLogs.length > MEMORY_LOG_LIMIT) memoryLogs.shift();
+}
+
+async function flushMemoryLogs() {
+  if (memoryFlushing || navigator.onLine === false || !memoryLogs.length) return 0;
+  memoryFlushing = true;
+  const logs = memoryLogs.slice(0, FLUSH_BATCH_SIZE);
+  try {
+    await sendLogs(logs);
+    const sentIds = new Set(logs.map((log) => log.id));
+    for (let index = memoryLogs.length - 1; index >= 0; index -= 1) {
+      if (sentIds.has(memoryLogs[index].id)) memoryLogs.splice(index, 1);
+    }
+    return logs.length;
+  } finally {
+    memoryFlushing = false;
+  }
+}
+
+async function sendLogs(logs: QueuedClientLog[]) {
+  if (!logs.length) return;
+  const body = JSON.stringify({ logs });
+  const response = await fetch("/api/app/logs", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body,
+    keepalive: body.length < 60_000,
+  });
+  if (!response.ok) throw new Error(`log upload failed: ${response.status}`);
+}
+
+function markIdbLoggingUnavailable(error: unknown) {
+  idbLoggingDisabledUntil = Date.now() + IDB_LOG_RETRY_DELAY_MS;
+  originalConsole.warn("client log IndexedDB unavailable; using network fallback", error);
 }
 
 function collectClientInfo() {

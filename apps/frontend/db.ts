@@ -3,6 +3,7 @@ import type { HostInfo, SessionEvent, SessionInfo, SessionPayload, SyncResponse 
 const DB_NAME = "chatview-cache";
 const DB_VERSION = 4;
 const CURRENT_SESSION_PREFIX = "v2:";
+const DB_OPEN_TIMEOUT_MS = 4000;
 
 type StoreName =
   | "meta"
@@ -34,6 +35,21 @@ export function openCacheDb() {
   if (dbPromise) return dbPromise;
   dbPromise = new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      dbPromise = null;
+      reject(new Error("IndexedDB open timed out"));
+    }, DB_OPEN_TIMEOUT_MS);
+
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      dbPromise = null;
+      reject(error);
+    };
 
     request.onupgradeneeded = () => {
       const db = request.result;
@@ -66,15 +82,19 @@ export function openCacheDb() {
     };
 
     request.onblocked = () => {
-      dbPromise = null;
-      reject(new Error("IndexedDB upgrade is blocked by another open tab"));
+      fail(new Error("IndexedDB upgrade is blocked by another open tab"));
     };
     request.onerror = () => {
-      dbPromise = null;
-      reject(request.error);
+      fail(request.error);
     };
     request.onsuccess = () => {
       const db = request.result;
+      if (settled) {
+        db.close();
+        return;
+      }
+      settled = true;
+      window.clearTimeout(timer);
       db.onversionchange = () => {
         db.close();
         dbPromise = null;

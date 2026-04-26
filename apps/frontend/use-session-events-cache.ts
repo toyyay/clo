@@ -3,6 +3,7 @@ import type { SessionEvent, SessionInfo } from "../../packages/shared/types";
 import type { AuthState, EventState, SyncNowOptions } from "./app-types";
 import { loadSessionEvents } from "./db";
 import { logClientEvent } from "./client-logs";
+import { withTimeout } from "./app-utils";
 
 type RefLike<T> = {
   current: T;
@@ -28,6 +29,8 @@ type SessionEventsCacheOptions = {
   ) => Promise<boolean>;
   markServerError: (error: unknown) => void;
 };
+
+const SESSION_EVENTS_CACHE_TIMEOUT_MS = 2500;
 
 export function useSessionEventsCache({
   activeId,
@@ -55,7 +58,11 @@ export function useSessionEventsCache({
     let disposed = false;
     ensureSessionEventsTarget(loadForSessionId);
 
-    loadSessionEvents(loadForSessionId)
+    withTimeout(
+      loadSessionEvents(loadForSessionId),
+      SESSION_EVENTS_CACHE_TIMEOUT_MS,
+      "local session events read timed out",
+    )
       .catch((error) => {
         void logClientEvent(
           "error",

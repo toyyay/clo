@@ -82,6 +82,7 @@ const webAuthCookie = "chatview_token";
 const webAuthCookieMaxAge = 60 * 60 * 24 * 30;
 const gitSha = process.env.GIT_SHA ?? "unknown";
 const encoder = new TextEncoder();
+const STREAM_HEARTBEAT_MS = 5000;
 const streamClients = new Set<ReadableStreamDefaultController<Uint8Array>>();
 const streamClientIds = new WeakMap<ReadableStreamDefaultController<Uint8Array>, number>();
 let nextStreamClientId = 1;
@@ -2846,7 +2847,7 @@ function stream(req: Request) {
       streamController = controller;
       streamClientIds.set(controller, streamClientId);
       streamClients.add(controller);
-      controller.enqueue(encoder.encode(": connected\n\n"));
+      controller.enqueue(encoder.encode(`retry: ${STREAM_HEARTBEAT_MS}\n: connected\n\n`));
       void logBackendRequestEvent({
         level: "info",
         event: "stream.open",
@@ -2855,7 +2856,7 @@ function stream(req: Request) {
         context: {
           streamClientId,
           clientCount: streamClients.size,
-          heartbeatMs: 25_000,
+          heartbeatMs: STREAM_HEARTBEAT_MS,
         },
       }, req);
       heartbeat = setInterval(() => {
@@ -2880,7 +2881,7 @@ function stream(req: Request) {
           }, req);
           close();
         }
-      }, 25_000);
+      }, STREAM_HEARTBEAT_MS);
       req.signal.addEventListener("abort", close, { once: true });
     },
     cancel() {
@@ -2893,6 +2894,7 @@ function stream(req: Request) {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache, no-transform",
       connection: "keep-alive",
+      "x-accel-buffering": "no",
     },
   });
 }

@@ -2,7 +2,7 @@ import { useEffect, type Dispatch, type SetStateAction } from "react";
 import type { HostInfo, SessionInfo } from "../../packages/shared/types";
 import { cacheShell } from "./db";
 import type { AuthState, SyncHealth, SyncNowOptions, SyncState } from "./app-types";
-import { sameEntityList } from "./app-utils";
+import { sameEntityList, withTimeout } from "./app-utils";
 import { logClientEvent } from "./client-logs";
 import { fetchSessionMetadata } from "./sync";
 
@@ -25,6 +25,9 @@ type StartupCacheOptions = {
   setStatusText: Dispatch<SetStateAction<string>>;
   syncNow: (options?: SyncNowOptions) => Promise<void>;
 };
+
+const LOCAL_CACHE_STARTUP_TIMEOUT_MS = 2500;
+const STARTUP_STUCK_WARNING_MS = 10000;
 
 export function useStartupCache({
   authState,
@@ -68,21 +71,24 @@ export function useStartupCache({
     setStatusText("Loading local cache");
     const stuckTimer = window.setTimeout(() => {
       if (disposed) return;
-      setSyncState("error");
-      setStatusText("Chat list is taking too long");
+      setSyncState("loading");
+      setStatusText("Still loading chat list");
       void logClientEvent(
-        "error",
+        "warn",
         "cache.initial_hydrate.stuck",
         "initial chat list hydrate did not finish",
         { durationMs: Math.round(performance.now() - started) },
         ["cache", "startup"],
       ).catch(() => {});
-    }, 20000);
+    }, STARTUP_STUCK_WARNING_MS);
 
-    refreshCache({ apply: false })
+    withTimeout(refreshCache({ apply: false }), LOCAL_CACHE_STARTUP_TIMEOUT_MS, "local cache hydrate timed out")
       .catch(async (error) => {
         if (disposed) throw error;
-        if (!isAuthenticated || navigator.onLine === false) throw error;
+        if (!isAuthenticated || navigator.onLine === false) {
+          if (error instanceof Error && error.message.includes("timed out")) return { hosts: [], sessions: [] } satisfies CachedShell;
+          throw error;
+        }
         setStatusText("Loading latest chat list");
         void logClientEvent(
           "warn",
@@ -91,7 +97,7 @@ export function useStartupCache({
           { durationMs: Math.round(performance.now() - started), fallback: "read-api-metadata" },
           ["cache", "startup"],
         ).catch(() => {});
-        const shell = await fetchSessionMetadata();
+        const shell = await withTimeout(fetchSessionMetadata(), 10000, "server chat list read timed out");
         if (disposed) return shell;
         setHosts((current) => (sameEntityList(current, shell.hosts, (host) => host.agentId) ? current : shell.hosts));
         setSessions((current) => (sameEntityList(current, shell.sessions, (session) => session.id) ? current : shell.sessions));
@@ -132,7 +138,7 @@ export function useStartupCache({
           },
           ["cache", "startup"],
         ).catch(() => {});
-        if (isAuthenticated) {
+        if (isAuthenticated && !("source" in shell)) {
           void syncNow({ silent: true, metadataOnly: true });
           void syncNow({ silent: true, metadataOnly: false, eventMode: "recent" });
         }

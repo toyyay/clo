@@ -327,7 +327,7 @@ export function App() {
       ).catch(() => {});
     } catch (error) {
       markServerError(error);
-      const cachedSessions = await loadSessions().catch(() => []);
+      const cachedSessions = await withTimeout(loadSessions(), 2500, "auth fallback cache read timed out").catch(() => []);
       if (cachedSessions.length) {
         setAuthConfigured(true);
         setAuthState((current) => (current === "authenticated" ? current : "cache"));
