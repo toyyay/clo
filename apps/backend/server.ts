@@ -2250,6 +2250,10 @@ function normalizeMetadataCursorTimestamp(value: unknown) {
 
 function metadataTimestampString(value: unknown) {
   if (value instanceof Date) return value.toISOString();
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
+  }
   return String(value);
 }
 
