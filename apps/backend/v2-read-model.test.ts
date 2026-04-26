@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   getV2SessionsMeta,
   getV2Session,
+  listV2Sessions,
   listV2EventsForSync,
   mapV2EventRow,
   mapV2SessionRow,
@@ -263,6 +264,18 @@ describe("v2 read model helpers", () => {
     const text = normalizeSql(calls[0].text);
     expect(text).toContain("where f.id = any(?::bigint[]) and f.source_kind = 'conversation'");
     expect(text).not.toContain("and f.deleted_at is null");
+  });
+
+  test("v2 session list can derive titles from visible user text", async () => {
+    const { calls, sql } = recordingSql();
+
+    await listV2Sessions(sql);
+
+    expect(calls).toHaveLength(1);
+    const text = normalizeSql(calls[0].text);
+    expect(text).toContain("nullif(e.normalized #>> '{parts,0,text}', '')");
+    expect(text).toContain("e.normalized ->> 'display' = 'true'");
+    expect(text).toContain("coalesce(e.normalized ->> 'role', e.role) = 'user'");
   });
 
   test("merges legacy and v2 host counts without dropping host metadata", () => {

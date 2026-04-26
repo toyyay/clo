@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { validateAppendPayload } from "../../backend/sync-engine";
-import { buildAgentV1AppendRequest } from "./upload";
+import { validateAppendPayload, validateInventoryPayload } from "../../backend/sync-engine";
+import { buildAgentV1AppendRequest, buildAgentV1InventoryRequest } from "./upload";
 import type { AgentV2Identity, UploadChunk } from "./types";
 
 const agent: AgentV2Identity = {
@@ -83,5 +83,42 @@ describe("agent-v2 upload adapter", () => {
       projectName: "chatview",
       sessionId: "thread-1",
     });
+  });
+
+  test("builds a backend-valid inventory envelope with tombstones", () => {
+    const request = buildAgentV1InventoryRequest(
+      agent,
+      [
+        {
+          provider: "claude",
+          sourcePath: "/Users/example/.claude/projects/project-a/live.jsonl",
+          relativePath: "project-a/live.jsonl",
+          logicalId: "claude:project-a/live.jsonl",
+          sizeBytes: 42,
+          mtimeMs: 1000,
+          projectKey: "project-a",
+          sessionId: "live",
+        },
+      ],
+      [
+        {
+          provider: "claude",
+          sourcePath: "/Users/example/.claude/projects/project-a/gone.jsonl",
+          relativePath: "project-a/gone.jsonl",
+          logicalId: "claude:project-a/gone.jsonl",
+          sizeBytes: 10,
+          mtimeMs: 500,
+          projectKey: "project-a",
+          sessionId: "gone",
+        },
+      ],
+    );
+    const validated = validateInventoryPayload(request);
+
+    expect(request.files[0].metadata).toMatchObject({ projectKey: "project-a", projectName: "project-a", sessionId: "live" });
+    expect(request.files[1].deleted).toBe(true);
+    expect(validated.files[0].sourcePath).toBe("project-a/live.jsonl");
+    expect(validated.files[1].sourcePath).toBe("project-a/gone.jsonl");
+    expect(validated.files[1].deleted).toBe(true);
   });
 });

@@ -975,12 +975,6 @@ export function App() {
     };
   }, [isAuthenticated, syncNow]);
 
-  const duplicateHostnames = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const host of hosts) counts.set(host.hostname, (counts.get(host.hostname) ?? 0) + 1);
-    return new Set([...counts.entries()].filter(([, count]) => count > 1).map(([hostname]) => hostname));
-  }, [hosts]);
-
   const filteredSessions = useMemo(() => {
     const q = query.trim().toLowerCase();
     return sessions.filter((session) => {
@@ -1074,7 +1068,6 @@ export function App() {
           query={query}
           sessions={filteredSessions}
           filteredSessionCount={filteredSessions.length}
-          duplicateHostnames={duplicateHostnames}
           groupByProject={groupByProject}
           onClose={() => setSidebarOpen(false)}
           onResizePointerDown={beginSidebarResize}

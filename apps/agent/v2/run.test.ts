@@ -31,6 +31,10 @@ describe("agent-v2 live runner", () => {
           },
         });
       }
+      if (String(url).endsWith("/api/agent/v1/inventory")) {
+        uploads.push({ inventory: JSON.parse(String(init?.body)) });
+        return jsonResponse({ ok: true, acceptedFiles: 1, deletedFiles: 0, fileIds: [] });
+      }
       if (String(url).endsWith("/api/agent/v1/append")) {
         uploads.push(JSON.parse(String(init?.body)));
         return jsonResponse({ ok: true, cursor: "43" });
@@ -48,13 +52,15 @@ describe("agent-v2 live runner", () => {
     });
 
     expect(summary.uploadedChunkCount).toBe(1);
-    expect(seenUrls).toEqual(["http://backend.test/api/agent/v1/hello", "http://backend.test/api/agent/v1/append"]);
-    expect(uploads).toHaveLength(1);
-    expect((uploads[0] as any).files[0].relativePath).toBe("nested/session.jsonl");
-    expect((uploads[0] as any).chunks[0].generation).toBe(1);
-    expect((uploads[0] as any).chunks[0].cursorStart).toBe("0");
-    expect((uploads[0] as any).chunks[0].rawText).toBe(line);
-    expect((uploads[0] as any).chunks[0].events[0].eventUid).toContain(":g1:");
+    expect(summary.inventoryFileCount).toBe(1);
+    expect(seenUrls).toEqual(["http://backend.test/api/agent/v1/hello", "http://backend.test/api/agent/v1/inventory", "http://backend.test/api/agent/v1/append"]);
+    expect(uploads).toHaveLength(2);
+    expect((uploads[0] as any).inventory.files[0].relativePath).toBe("nested/session.jsonl");
+    expect((uploads[1] as any).files[0].relativePath).toBe("nested/session.jsonl");
+    expect((uploads[1] as any).chunks[0].generation).toBe(1);
+    expect((uploads[1] as any).chunks[0].cursorStart).toBe("0");
+    expect((uploads[1] as any).chunks[0].rawText).toBe(line);
+    expect((uploads[1] as any).chunks[0].events[0].eventUid).toContain(":g1:");
 
     const state = JSON.parse(await readFile(statePath, "utf8"));
     expect(state.cursors[sourcePath].offset).toBe(Buffer.byteLength(line));
@@ -68,6 +74,70 @@ describe("agent-v2 live runner", () => {
       fetchImpl,
     });
     expect(second.uploadedChunkCount).toBe(0);
+  });
+
+  test("sends tombstones for cursor files missing from the active scan", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "chatview-agent-v2-run-missing-"));
+    const rootPath = join(dir, "claude");
+    const statePath = join(dir, "state", "v2.json");
+    const activePath = join(rootPath, "project-a", "active.jsonl");
+    const missingPath = join(rootPath, "project-a", "gone.jsonl");
+    const line = "{\"type\":\"message\",\"message\":{\"role\":\"user\"}}\n";
+    await mkdir(join(rootPath, "project-a"), { recursive: true });
+    await writeFile(activePath, line);
+    await mkdir(join(dir, "state"), { recursive: true });
+    await writeFile(
+      statePath,
+      JSON.stringify({
+        agentId: "agent-test",
+        cursors: {
+          [activePath]: { generation: 1, offset: Buffer.byteLength(line), lineNo: 1, sizeBytes: Buffer.byteLength(line), mtimeMs: 1 },
+          [missingPath]: { generation: 1, offset: 10, lineNo: 1, sizeBytes: 10, mtimeMs: 1 },
+        },
+      }),
+    );
+
+    const uploads: unknown[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      if (String(url).endsWith("/api/agent/v1/hello")) {
+        return jsonResponse({
+          policy: {
+            enabled: true,
+            uploadsEnabled: true,
+            maxFileBytes: 1024 * 1024,
+            maxUploadChunkBytes: 1024,
+            maxUploadLines: 10,
+            scanRoots: ["claude"],
+            ignorePatterns: [],
+          },
+        });
+      }
+      if (String(url).endsWith("/api/agent/v1/inventory")) {
+        uploads.push(JSON.parse(String(init?.body)));
+        return jsonResponse({ ok: true, acceptedFiles: 2, deletedFiles: 1, fileIds: [] });
+      }
+      return jsonResponse({ error: "not found" }, 404);
+    }) as unknown as typeof fetch;
+
+    const summary = await scanAndUploadAgentV2({
+      roots: [{ provider: "claude", rootPath }],
+      statePath,
+      backendUrl: "http://backend.test",
+      token: "test-token",
+      readChunkBytes: 1024,
+      fetchImpl,
+    });
+
+    expect(summary.uploadedChunkCount).toBe(0);
+    expect(summary.deletedInventoryFileCount).toBe(1);
+    expect(uploads).toHaveLength(1);
+    expect((uploads[0] as any).files.map((file: any) => [file.relativePath, file.deleted])).toEqual([
+      ["project-a/active.jsonl", undefined],
+      ["project-a/gone.jsonl", true],
+    ]);
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    expect(state.cursors[activePath]).toBeDefined();
+    expect(state.cursors[missingPath]).toBeUndefined();
   });
 
   test("does not advance the cursor when all pending records are skipped", async () => {

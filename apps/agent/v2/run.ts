@@ -3,13 +3,13 @@ import { join } from "node:path";
 import { envPositiveInteger, envValue, type EnvSource } from "../../../packages/shared/env";
 import { AGENT_V1_ENDPOINTS } from "../../../packages/contracts";
 import { readAppendJsonl } from "./cursor";
-import { scanInventory } from "./inventory";
+import { missingInventoryFilesFromCursors, scanInventory } from "./inventory";
 import { DEFAULT_SYNC_POLICY, fetchServerSyncPolicy } from "./policy";
 import { executeUploadPlan, planUploadChunks } from "./planner";
 import { parseRootSpec, rootsFromEnv } from "./roots";
 import { identityForAgentV2, loadAgentV2State, saveAgentV2State } from "./state";
-import { buildAgentV1AppendRequest } from "./upload";
-import type { AgentV2Identity, SyncPolicy, SyncRootConfig, TailBatch, UploadChunk, UploadTransport } from "./types";
+import { buildAgentV1AppendRequest, buildAgentV1InventoryRequest } from "./upload";
+import type { AgentV2Identity, InventoryFile, SyncPolicy, SyncRootConfig, TailBatch, UploadChunk, UploadTransport } from "./types";
 
 declare const CHATVIEW_EMBEDDED_BACKEND_URL: string | undefined;
 declare const CHATVIEW_EMBEDDED_AGENT_TOKEN: string | undefined;
@@ -19,6 +19,7 @@ const DEFAULT_BACKEND_URL =
 const DEFAULT_AGENT_TOKEN = typeof CHATVIEW_EMBEDDED_AGENT_TOKEN !== "undefined" ? CHATVIEW_EMBEDDED_AGENT_TOKEN : "";
 const DEFAULT_STATE_PATH = join(homedir(), ".chatview-agent", "v2-state.json");
 const DEFAULT_APPEND_PATH = AGENT_V1_ENDPOINTS.append;
+const DEFAULT_INVENTORY_PATH = AGENT_V1_ENDPOINTS.inventory;
 
 export type AgentV2RunOptions = {
   roots?: SyncRootConfig[];
@@ -28,6 +29,7 @@ export type AgentV2RunOptions = {
   pollMs?: number;
   readChunkBytes?: number;
   appendPath?: string;
+  inventoryPath?: string;
   fetchPolicy?: boolean;
   logIdleEveryScans?: number;
   once?: boolean;
@@ -43,6 +45,8 @@ export type AgentV2ScanSummary = {
   roots: SyncRootConfig[];
   fileCount: number;
   pendingRecordCount: number;
+  inventoryFileCount: number;
+  deletedInventoryFileCount: number;
   plannedChunkCount: number;
   uploadedChunkCount: number;
   skippedCount: number;
@@ -66,6 +70,8 @@ export async function runAgentV2(options: AgentV2RunOptions): Promise<void> {
       const hasActivity =
         summary.uploadedChunkCount > 0 ||
         summary.plannedChunkCount > 0 ||
+        summary.inventoryFileCount > 0 ||
+        summary.deletedInventoryFileCount > 0 ||
         !summary.uploadsEnabled;
       const shouldLogIdle = logIdleEveryScans > 0 && scanCount % logIdleEveryScans === 0;
       if (options.once || hasActivity || shouldLogIdle) {
@@ -101,10 +107,9 @@ export async function scanAndUploadAgentV2(options: AgentV2RunOptions): Promise<
     return emptySummary(state.agentId, policy, roots);
   }
 
-  const files = await scanInventory(
-    roots.filter((root) => policy.scanRoots.includes(root.provider)),
-    policy.ignorePatterns,
-  );
+  const scanRoots = roots.filter((root) => policy.scanRoots.includes(root.provider));
+  const files = await scanInventory(scanRoots, policy.ignorePatterns);
+  const deletedInventoryFiles = missingInventoryFilesFromCursors(state.cursors, scanRoots, files);
   const batches: TailBatch[] = [];
   const readChunkBytes = options.readChunkBytes ?? policy.maxUploadChunkBytes;
 
@@ -124,6 +129,8 @@ export async function scanAndUploadAgentV2(options: AgentV2RunOptions): Promise<
       roots,
       fileCount: files.length,
       pendingRecordCount: countPendingRecords(batches),
+      inventoryFileCount: 0,
+      deletedInventoryFileCount: 0,
       plannedChunkCount: plan.chunks.length,
       uploadedChunkCount: 0,
       skippedCount: plan.skipped.length,
@@ -137,6 +144,18 @@ export async function scanAndUploadAgentV2(options: AgentV2RunOptions): Promise<
     identity,
     fetchImpl: options.fetchImpl,
   });
+  const shouldUploadInventory = deletedInventoryFiles.length > 0 || plan.chunks.length > 0;
+  if (shouldUploadInventory) {
+    await uploadAgentV2Inventory({
+      backendUrl: options.backendUrl,
+      token: options.token,
+      inventoryPath: options.inventoryPath,
+      identity,
+      activeFiles: files,
+      deletedFiles: deletedInventoryFiles,
+      fetchImpl: options.fetchImpl,
+    });
+  }
   await executeUploadPlan(plan, transport);
   const uploadedSourcePaths = new Set(plan.chunks.map((chunk) => chunk.sourcePath));
 
@@ -144,6 +163,12 @@ export async function scanAndUploadAgentV2(options: AgentV2RunOptions): Promise<
     if (!uploadedSourcePaths.has(batch.file.sourcePath) && batch.records.length) continue;
     state.cursors[batch.file.sourcePath] = batch.nextCursor;
     if (state.previewCursors) delete state.previewCursors[batch.file.sourcePath];
+  }
+  if (shouldUploadInventory) {
+    for (const file of deletedInventoryFiles) {
+      delete state.cursors[file.sourcePath];
+      if (state.previewCursors) delete state.previewCursors[file.sourcePath];
+    }
   }
   await saveAgentV2State(options.statePath, state);
 
@@ -154,6 +179,8 @@ export async function scanAndUploadAgentV2(options: AgentV2RunOptions): Promise<
     roots,
     fileCount: files.length,
     pendingRecordCount: countPendingRecords(batches),
+    inventoryFileCount: shouldUploadInventory ? files.length : 0,
+    deletedInventoryFileCount: shouldUploadInventory ? deletedInventoryFiles.length : 0,
     plannedChunkCount: plan.chunks.length,
     uploadedChunkCount: plan.chunks.length,
     skippedCount: plan.skipped.length,
@@ -191,6 +218,34 @@ export function createAgentV2UploadTransport(options: {
   };
 }
 
+async function uploadAgentV2Inventory(options: {
+  backendUrl: string;
+  token: string;
+  inventoryPath?: string;
+  identity: AgentV2Identity;
+  activeFiles: InventoryFile[];
+  deletedFiles: InventoryFile[];
+  fetchImpl?: typeof fetch;
+}) {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const inventoryUrl = `${trimSlash(options.backendUrl)}${normalizePath(options.inventoryPath ?? DEFAULT_INVENTORY_PATH)}`;
+  const response = await fetchWithRetry(
+    inventoryUrl,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${options.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(buildAgentV1InventoryRequest(options.identity, options.activeFiles, options.deletedFiles)),
+    },
+    fetchImpl,
+  );
+  if (!response.ok) {
+    throw new Error(`v2 inventory failed: ${response.status} ${await response.text()}`);
+  }
+}
+
 export async function runAgentV2FromCli(argv: string[], overrides: Partial<AgentV2RunOptions> = {}) {
   const options = { ...parseAgentV2RunArgs(argv), ...overrides };
   await runAgentV2(options);
@@ -204,6 +259,7 @@ export function parseAgentV2RunArgs(argv: string[], env: EnvSource = process.env
   let pollMs = envPositiveInteger(env, ["POLL_MS", "CHATVIEW_POLL_MS"], 2000);
   let readChunkBytes = envPositiveInteger(env, ["READ_CHUNK_BYTES", "CHATVIEW_READ_CHUNK_BYTES"], 0) || undefined;
   let appendPath = envValue(env, "APPEND_PATH", "AGENT_APPEND_PATH", "CHATVIEW_AGENT_APPEND_PATH") ?? DEFAULT_APPEND_PATH;
+  let inventoryPath = envValue(env, "INVENTORY_PATH", "AGENT_INVENTORY_PATH", "CHATVIEW_AGENT_INVENTORY_PATH") ?? DEFAULT_INVENTORY_PATH;
   let logIdleEveryScans = envNonNegativeInteger(env, ["LOG_IDLE_EVERY_SCANS", "CHATVIEW_LOG_IDLE_EVERY_SCANS"], 30);
   let fetchPolicy = true;
   let once = false;
@@ -231,6 +287,8 @@ export function parseAgentV2RunArgs(argv: string[], env: EnvSource = process.env
       readChunkBytes = positiveInteger(argv[++i], readChunkBytes);
     } else if (value === "--append-path") {
       appendPath = argv[++i] ?? appendPath;
+    } else if (value === "--inventory-path") {
+      inventoryPath = argv[++i] ?? inventoryPath;
     } else if (value === "--log-idle-every-scans") {
       logIdleEveryScans = nonNegativeInteger(argv[++i], logIdleEveryScans) ?? logIdleEveryScans;
     } else if (value === "--no-fetch-policy") {
@@ -248,6 +306,7 @@ export function parseAgentV2RunArgs(argv: string[], env: EnvSource = process.env
     pollMs,
     readChunkBytes,
     appendPath,
+    inventoryPath,
     logIdleEveryScans,
     fetchPolicy,
     once,
@@ -287,6 +346,8 @@ function emptySummary(agentId: string, policy: SyncPolicy, roots: SyncRootConfig
     roots,
     fileCount: 0,
     pendingRecordCount: 0,
+    inventoryFileCount: 0,
+    deletedInventoryFileCount: 0,
     plannedChunkCount: 0,
     uploadedChunkCount: 0,
     skippedCount: 0,
@@ -299,11 +360,15 @@ function countPendingRecords(batches: TailBatch[]) {
 
 function formatAgentV2Summary(summary: AgentV2ScanSummary, mode: "activity" | "idle") {
   const uploadNote = summary.uploadsEnabled ? `uploaded ${summary.uploadedChunkCount}` : "uploads disabled";
+  const inventoryNote = summary.inventoryFileCount || summary.deletedInventoryFileCount
+    ? `inventory ${summary.inventoryFileCount} active, ${summary.deletedInventoryFileCount} deleted`
+    : "inventory idle";
   return [
     `[agent-v2] ${mode}`,
     `files ${summary.fileCount}`,
     `pending ${summary.pendingRecordCount}`,
     `planned ${summary.plannedChunkCount}`,
+    inventoryNote,
     uploadNote,
     `policy ${summary.policySource}`,
   ].join("; ");

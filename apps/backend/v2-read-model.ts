@@ -129,19 +129,29 @@ export async function listV2Sessions(sql: SqlTag, agentId?: string): Promise<Ses
             ),
             'title', (
               select coalesce(
-                e.normalized #>> '{parts,0,data,thread_name}',
-                e.normalized #>> '{parts,0,data,payload,thread_name}',
-                e.normalized #>> '{parts,0,data,payload,message}'
+                nullif(e.normalized #>> '{parts,0,data,thread_name}', ''),
+                nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', ''),
+                nullif(e.normalized #>> '{parts,0,data,payload,message}', ''),
+                nullif(e.normalized #>> '{parts,0,text}', '')
               )
               from agent_normalized_events e
               where e.source_file_id = f.id
                 and e.source_generation = f.current_generation
                 and (
-                  coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null
+                  coalesce(nullif(e.normalized #>> '{parts,0,data,thread_name}', ''), nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', '')) is not null
                   or e.normalized #>> '{parts,0,data,payload,type}' = 'user_message'
+                  or (
+                    e.normalized ->> 'display' = 'true'
+                    and coalesce(e.normalized ->> 'role', e.role) = 'user'
+                    and nullif(e.normalized #>> '{parts,0,text}', '') is not null
+                  )
                 )
               order by
-                case when coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null then 0 else 1 end,
+                case
+                  when coalesce(nullif(e.normalized #>> '{parts,0,data,thread_name}', ''), nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', '')) is not null then 0
+                  when nullif(e.normalized #>> '{parts,0,data,payload,message}', '') is not null then 1
+                  else 2
+                end,
                 e.source_line_no asc nulls last,
                 e.id asc
               limit 1
@@ -204,19 +214,29 @@ export async function listV2Sessions(sql: SqlTag, agentId?: string): Promise<Ses
             ),
             'title', (
               select coalesce(
-                e.normalized #>> '{parts,0,data,thread_name}',
-                e.normalized #>> '{parts,0,data,payload,thread_name}',
-                e.normalized #>> '{parts,0,data,payload,message}'
+                nullif(e.normalized #>> '{parts,0,data,thread_name}', ''),
+                nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', ''),
+                nullif(e.normalized #>> '{parts,0,data,payload,message}', ''),
+                nullif(e.normalized #>> '{parts,0,text}', '')
               )
               from agent_normalized_events e
               where e.source_file_id = f.id
                 and e.source_generation = f.current_generation
                 and (
-                  coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null
+                  coalesce(nullif(e.normalized #>> '{parts,0,data,thread_name}', ''), nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', '')) is not null
                   or e.normalized #>> '{parts,0,data,payload,type}' = 'user_message'
+                  or (
+                    e.normalized ->> 'display' = 'true'
+                    and coalesce(e.normalized ->> 'role', e.role) = 'user'
+                    and nullif(e.normalized #>> '{parts,0,text}', '') is not null
+                  )
                 )
               order by
-                case when coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null then 0 else 1 end,
+                case
+                  when coalesce(nullif(e.normalized #>> '{parts,0,data,thread_name}', ''), nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', '')) is not null then 0
+                  when nullif(e.normalized #>> '{parts,0,data,payload,message}', '') is not null then 1
+                  else 2
+                end,
                 e.source_line_no asc nulls last,
                 e.id asc
               limit 1
@@ -286,19 +306,29 @@ export async function getV2SessionsMeta(sql: SqlTag, sourceFileIds: string[], op
             ),
             'title', (
               select coalesce(
-                e.normalized #>> '{parts,0,data,thread_name}',
-                e.normalized #>> '{parts,0,data,payload,thread_name}',
-                e.normalized #>> '{parts,0,data,payload,message}'
+                nullif(e.normalized #>> '{parts,0,data,thread_name}', ''),
+                nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', ''),
+                nullif(e.normalized #>> '{parts,0,data,payload,message}', ''),
+                nullif(e.normalized #>> '{parts,0,text}', '')
               )
               from agent_normalized_events e
               where e.source_file_id = f.id
                 and e.source_generation = f.current_generation
                 and (
-                  coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null
+                  coalesce(nullif(e.normalized #>> '{parts,0,data,thread_name}', ''), nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', '')) is not null
                   or e.normalized #>> '{parts,0,data,payload,type}' = 'user_message'
+                  or (
+                    e.normalized ->> 'display' = 'true'
+                    and coalesce(e.normalized ->> 'role', e.role) = 'user'
+                    and nullif(e.normalized #>> '{parts,0,text}', '') is not null
+                  )
                 )
               order by
-                case when coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null then 0 else 1 end,
+                case
+                  when coalesce(nullif(e.normalized #>> '{parts,0,data,thread_name}', ''), nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', '')) is not null then 0
+                  when nullif(e.normalized #>> '{parts,0,data,payload,message}', '') is not null then 1
+                  else 2
+                end,
                 e.source_line_no asc nulls last,
                 e.id asc
               limit 1
@@ -359,19 +389,29 @@ export async function getV2SessionsMeta(sql: SqlTag, sourceFileIds: string[], op
             ),
             'title', (
               select coalesce(
-                e.normalized #>> '{parts,0,data,thread_name}',
-                e.normalized #>> '{parts,0,data,payload,thread_name}',
-                e.normalized #>> '{parts,0,data,payload,message}'
+                nullif(e.normalized #>> '{parts,0,data,thread_name}', ''),
+                nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', ''),
+                nullif(e.normalized #>> '{parts,0,data,payload,message}', ''),
+                nullif(e.normalized #>> '{parts,0,text}', '')
               )
               from agent_normalized_events e
               where e.source_file_id = f.id
                 and e.source_generation = f.current_generation
                 and (
-                  coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null
+                  coalesce(nullif(e.normalized #>> '{parts,0,data,thread_name}', ''), nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', '')) is not null
                   or e.normalized #>> '{parts,0,data,payload,type}' = 'user_message'
+                  or (
+                    e.normalized ->> 'display' = 'true'
+                    and coalesce(e.normalized ->> 'role', e.role) = 'user'
+                    and nullif(e.normalized #>> '{parts,0,text}', '') is not null
+                  )
                 )
               order by
-                case when coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null then 0 else 1 end,
+                case
+                  when coalesce(nullif(e.normalized #>> '{parts,0,data,thread_name}', ''), nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', '')) is not null then 0
+                  when nullif(e.normalized #>> '{parts,0,data,payload,message}', '') is not null then 1
+                  else 2
+                end,
                 e.source_line_no asc nulls last,
                 e.id asc
               limit 1
@@ -441,19 +481,29 @@ export async function getV2Session(sql: SqlTag, sessionId: string): Promise<Sess
         ),
         'title', (
           select coalesce(
-            e.normalized #>> '{parts,0,data,thread_name}',
-            e.normalized #>> '{parts,0,data,payload,thread_name}',
-            e.normalized #>> '{parts,0,data,payload,message}'
+            nullif(e.normalized #>> '{parts,0,data,thread_name}', ''),
+            nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', ''),
+            nullif(e.normalized #>> '{parts,0,data,payload,message}', ''),
+            nullif(e.normalized #>> '{parts,0,text}', '')
           )
           from agent_normalized_events e
           where e.source_file_id = f.id
             and e.source_generation = f.current_generation
             and (
-              coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null
+              coalesce(nullif(e.normalized #>> '{parts,0,data,thread_name}', ''), nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', '')) is not null
               or e.normalized #>> '{parts,0,data,payload,type}' = 'user_message'
+              or (
+                e.normalized ->> 'display' = 'true'
+                and coalesce(e.normalized ->> 'role', e.role) = 'user'
+                and nullif(e.normalized #>> '{parts,0,text}', '') is not null
+              )
             )
           order by
-            case when coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null then 0 else 1 end,
+            case
+              when coalesce(nullif(e.normalized #>> '{parts,0,data,thread_name}', ''), nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', '')) is not null then 0
+              when nullif(e.normalized #>> '{parts,0,data,payload,message}', '') is not null then 1
+              else 2
+            end,
             e.source_line_no asc nulls last,
             e.id asc
           limit 1

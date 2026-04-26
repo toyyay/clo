@@ -9,7 +9,6 @@ import {
 } from "react";
 import type { SessionInfo } from "../../packages/shared/types";
 import {
-  hostLabel,
   projectFilterValue,
   projectLabel,
   providerFilterValue,
@@ -71,7 +70,6 @@ export function SessionSidebar({
   query,
   sessions,
   filteredSessionCount,
-  duplicateHostnames,
   groupByProject,
   onClose,
   onResizePointerDown,
@@ -85,7 +83,6 @@ export function SessionSidebar({
   query: string;
   sessions: SessionInfo[];
   filteredSessionCount: number;
-  duplicateHostnames: Set<string>;
   groupByProject: boolean;
   onClose: () => void;
   onResizePointerDown: (event: ReactPointerEvent<HTMLDivElement>) => void;
@@ -94,7 +91,7 @@ export function SessionSidebar({
   onSelectSession: (session: SessionInfo) => void;
 }) {
   const [treePrefs, setTreePrefs] = useState<TreePrefs>(readTreePrefs);
-  const tree = useMemo(() => buildTree(sessions, duplicateHostnames, groupByProject), [duplicateHostnames, groupByProject, sessions]);
+  const tree = useMemo(() => buildTree(sessions, groupByProject), [groupByProject, sessions]);
 
   useEffect(() => {
     writeTreePrefs(treePrefs);
@@ -253,23 +250,25 @@ function FolderRow({
   );
 }
 
-function buildTree(sessions: SessionInfo[], duplicateHostnames: Set<string>, groupByProject: boolean): DeviceNode[] {
+function buildTree(sessions: SessionInfo[], groupByProject: boolean): DeviceNode[] {
   const devices = new Map<string, MutableDeviceNode>();
   for (const session of sessions) {
-    const deviceKey = `device:${session.agentId}`;
+    const deviceKey = deviceTreeKey(session);
     let device = devices.get(deviceKey);
     if (!device) {
       device = {
         key: deviceKey,
-        label: hostLabel(session.hostname, session.agentId, duplicateHostnames),
-        title: `${session.hostname}\n${session.agentId}`,
+        label: session.hostname || "Unknown device",
+        title: session.hostname || "Unknown device",
         count: 0,
         archivedCount: 0,
         updatedAt: "",
+        agentIds: new Set(),
         providers: new Map(),
       };
       devices.set(deviceKey, device);
     }
+    device.agentIds.add(session.agentId);
 
     const providerValue = providerFilterValue(session);
     const providerKey = `${deviceKey}:provider:${providerValue}`;
@@ -322,6 +321,7 @@ function buildTree(sessions: SessionInfo[], duplicateHostnames: Set<string>, gro
   return [...devices.values()]
     .map((device) => ({
       ...device,
+      title: [`${device.label}`, ...[...device.agentIds].sort()].join("\n"),
       providers: [...device.providers.values()]
         .map((provider) => ({
           ...provider,
@@ -337,8 +337,13 @@ function buildTree(sessions: SessionInfo[], duplicateHostnames: Set<string>, gro
     .sort(compareDevices);
 }
 
-type MutableDeviceNode = Omit<DeviceNode, "providers"> & { providers: Map<string, MutableProviderNode> };
+type MutableDeviceNode = Omit<DeviceNode, "providers"> & { providers: Map<string, MutableProviderNode>; agentIds: Set<string> };
 type MutableProviderNode = Omit<ProviderNode, "projects"> & { projects: Map<string, ProjectNode> };
+
+function deviceTreeKey(session: SessionInfo) {
+  const hostname = session.hostname.trim().toLowerCase();
+  return hostname ? `device:host:${hostname}` : `device:agent:${session.agentId}`;
+}
 
 function compareDevices(a: DeviceNode, b: DeviceNode) {
   return b.updatedAt.localeCompare(a.updatedAt) || a.label.localeCompare(b.label);

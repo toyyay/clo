@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { normalizeTranscriptRecord } from "../../../packages/parsers";
 import type { AgentNormalizedEventInput } from "../../../packages/contracts";
-import type { AgentV2Identity, UploadChunk } from "./types";
+import type { AgentV2Identity, InventoryFile, UploadChunk } from "./types";
 
 export type AgentV1AppendRequest = {
   agent: AgentV2Identity;
@@ -67,6 +67,33 @@ export type AgentV1AppendRequest = {
   }>;
 };
 
+export type AgentV1InventoryRequest = {
+  agent: AgentV2Identity;
+  files: Array<{
+    provider: InventoryFile["provider"];
+    sourcePath: string;
+    relativePath: string;
+    logicalId: string;
+    pathSha256: string;
+    sizeBytes: number;
+    mtimeMs: number;
+    metadata: {
+      projectKey?: string;
+      projectName?: string;
+      sessionId?: string;
+    };
+    deleted?: boolean;
+  }>;
+  cursor: {
+    scope: "inventory";
+    value: string;
+    metadata: {
+      activeFiles: number;
+      deletedFiles: number;
+    };
+  };
+};
+
 export function buildAgentV1AppendRequest(agent: AgentV2Identity, chunk: UploadChunk): AgentV1AppendRequest {
   const generation = chunk.generation ?? 1;
   const sourceMetadata = sourceMetadataForChunk(chunk, generation);
@@ -120,6 +147,27 @@ export function buildAgentV1AppendRequest(agent: AgentV2Identity, chunk: UploadC
   };
 }
 
+export function buildAgentV1InventoryRequest(
+  agent: AgentV2Identity,
+  activeFiles: InventoryFile[],
+  deletedFiles: InventoryFile[] = [],
+): AgentV1InventoryRequest {
+  const active = activeFiles.map((file) => inventorySourceFile(file, false));
+  const deleted = deletedFiles.map((file) => inventorySourceFile(file, true));
+  return {
+    agent,
+    files: [...active, ...deleted],
+    cursor: {
+      scope: "inventory",
+      value: String(Date.now()),
+      metadata: {
+        activeFiles: active.length,
+        deletedFiles: deleted.length,
+      },
+    },
+  };
+}
+
 function sourceMetadataForChunk(chunk: UploadChunk, generation: number) {
   const metadata: AgentV1AppendRequest["source"]["metadata"] = { generation };
   if (chunk.sessionId) metadata.sessionId = chunk.sessionId;
@@ -150,6 +198,27 @@ function sourceMetadataForChunk(chunk: UploadChunk, generation: number) {
   }
 
   return metadata;
+}
+
+function inventorySourceFile(file: InventoryFile, deleted: boolean) {
+  const metadata: AgentV1InventoryRequest["files"][number]["metadata"] = {};
+  if (file.projectKey) {
+    metadata.projectKey = file.projectKey;
+    metadata.projectName = shortProject(file.projectKey);
+  }
+  if (file.sessionId) metadata.sessionId = file.sessionId;
+
+  return {
+    provider: file.provider,
+    sourcePath: file.logicalId,
+    relativePath: file.relativePath,
+    logicalId: file.logicalId,
+    pathSha256: sha256Hex(file.sourcePath),
+    sizeBytes: file.sizeBytes,
+    mtimeMs: file.mtimeMs,
+    metadata,
+    ...(deleted ? { deleted: true } : {}),
+  };
 }
 
 function normalizeRecord(chunk: UploadChunk, record: UploadChunk["records"][number]) {

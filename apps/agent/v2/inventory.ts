@@ -2,7 +2,7 @@ import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, relative, sep } from "node:path";
 import { matchesPolicyPath } from "../../../packages/sync-core";
-import type { InventoryFile, ProviderKind, SyncRootConfig } from "./types";
+import type { AppendJsonlCursor, InventoryFile, ProviderKind, SyncRootConfig } from "./types";
 
 const DEFAULT_PROVIDER_ROOTS: Record<ProviderKind, string> = {
   claude: join(homedir(), ".claude", "projects"),
@@ -52,18 +52,31 @@ async function walkRoot(root: SyncRootConfig, dir: string, ignorePatterns: strin
 
     const fileStat = await stat(sourcePath).catch(() => undefined);
     if (!fileStat?.isFile()) continue;
-    out.push({
-      provider: root.provider,
-      sourcePath,
-      relativePath,
-      sizeBytes: fileStat.size,
-      mtimeMs: fileStat.mtimeMs,
-      dev: fileStat.dev,
-      ino: fileStat.ino,
-      logicalId: `${root.provider}:${relativePath}`,
-      ...deriveProviderFields(root.provider, relativePath),
-    });
+    out.push(inventoryFileForPath(root, sourcePath, relativePath, fileStat.size, fileStat.mtimeMs, fileStat.dev, fileStat.ino));
   }
+}
+
+export function missingInventoryFilesFromCursors(
+  cursors: Record<string, AppendJsonlCursor>,
+  roots: SyncRootConfig[],
+  activeFiles: InventoryFile[],
+): InventoryFile[] {
+  const activeSourcePaths = new Set(activeFiles.map((file) => file.sourcePath));
+  const missing: InventoryFile[] = [];
+
+  for (const [sourcePath, cursor] of Object.entries(cursors)) {
+    if (activeSourcePaths.has(sourcePath)) continue;
+    if (!sourcePath.endsWith(".jsonl")) continue;
+    const root = roots.find((candidate) => relativePathWithinRoot(candidate.rootPath, sourcePath) != null);
+    if (!root) continue;
+    const relativePath = relativePathWithinRoot(root.rootPath, sourcePath);
+    if (!relativePath) continue;
+    missing.push(
+      inventoryFileForPath(root, sourcePath, relativePath, cursor.sizeBytes, cursor.mtimeMs, cursor.dev, cursor.ino),
+    );
+  }
+
+  return missing.sort((a, b) => a.sourcePath.localeCompare(b.sourcePath));
 }
 
 export function matchesIgnore(name: string, patterns: string[], relativePath = name, sourcePath = relativePath): boolean {
@@ -89,4 +102,32 @@ function deriveProviderFields(provider: ProviderKind, relativePath: string) {
     };
   }
   return { sessionId };
+}
+
+function inventoryFileForPath(
+  root: SyncRootConfig,
+  sourcePath: string,
+  relativePath: string,
+  sizeBytes: number,
+  mtimeMs: number,
+  dev?: number,
+  ino?: number,
+): InventoryFile {
+  return {
+    provider: root.provider,
+    sourcePath,
+    relativePath,
+    sizeBytes,
+    mtimeMs,
+    dev,
+    ino,
+    logicalId: `${root.provider}:${relativePath}`,
+    ...deriveProviderFields(root.provider, relativePath),
+  };
+}
+
+function relativePathWithinRoot(rootPath: string, sourcePath: string) {
+  const nativeRelative = relative(rootPath, sourcePath);
+  if (!nativeRelative || nativeRelative === ".." || nativeRelative.startsWith(`..${sep}`)) return null;
+  return nativeRelative.split(sep).join("/");
 }
