@@ -91,6 +91,9 @@ export type UploadChunk = {
   endLine: number;
   byteLength: number;
   rawText: string;
+  omitRawText?: boolean;
+  rawSha256?: string;
+  rawBytes?: number;
   records: TailRecord[];
 };
 

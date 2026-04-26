@@ -44,9 +44,10 @@ function chunkRecords(
         chunks.push(toChunk(file, pending, batch));
         pending = [];
       }
+      chunks.push(toOmittedRawChunk(file, record, batch));
       skipped.push({
         sourcePath: file.sourcePath,
-        reason: `record at line ${record.lineNo} exceeds maxUploadChunkBytes (${policy.maxUploadChunkBytes})`,
+        reason: `record at line ${record.lineNo} exceeds maxUploadChunkBytes (${policy.maxUploadChunkBytes}); raw payload omitted`,
       });
       continue;
     }
@@ -63,6 +64,42 @@ function chunkRecords(
 
   if (pending.length) chunks.push(toChunk(file, pending, batch));
   return { chunks, skipped };
+}
+
+function toOmittedRawChunk(file: InventoryFile, record: TailRecord, batch: TailBatch): UploadChunk {
+  const generation = batch.nextCursor.generation;
+  const endOffset = record.offset + record.byteLength;
+  const hash = createHash("sha256")
+    .update(file.logicalId)
+    .update(String(generation))
+    .update(String(record.offset))
+    .update(String(endOffset))
+    .update("omitted")
+    .digest("hex")
+    .slice(0, 24);
+
+  return {
+    chunkId: hash,
+    generation,
+    provider: file.provider,
+    sourcePath: file.sourcePath,
+    relativePath: file.relativePath,
+    logicalId: file.logicalId,
+    sessionId: file.sessionId,
+    projectKey: file.projectKey,
+    sizeBytes: file.sizeBytes,
+    mtimeMs: file.mtimeMs,
+    startOffset: record.offset,
+    endOffset,
+    startLine: record.lineNo,
+    endLine: record.lineNo,
+    byteLength: record.byteLength,
+    rawText: "",
+    omitRawText: true,
+    rawSha256: createHash("sha256").update(record.rawLine).digest("hex"),
+    rawBytes: record.byteLength,
+    records: [],
+  };
 }
 
 function toChunk(file: InventoryFile, records: TailRecord[], batch: TailBatch): UploadChunk {

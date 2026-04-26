@@ -177,7 +177,7 @@ describe("agent-v2 live runner", () => {
     expect((uploads[0] as any).chunks[0].rawText).toBe(line);
   });
 
-  test("does not advance the cursor when all pending records are skipped", async () => {
+  test("advances the cursor when oversized pending records omit raw payloads", async () => {
     const dir = await mkdtemp(join(tmpdir(), "chatview-agent-v2-run-skip-"));
     const rootPath = join(dir, "codex");
     const sourcePath = join(rootPath, "session.jsonl");
@@ -185,7 +185,8 @@ describe("agent-v2 live runner", () => {
     await mkdir(rootPath, { recursive: true });
     await writeFile(sourcePath, `${"x".repeat(64)}\n`);
 
-    const fetchImpl = (async (url: RequestInfo | URL) => {
+    const uploads: unknown[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
       if (String(url).endsWith("/api/agent/v1/hello")) {
         return jsonResponse({
           policy: {
@@ -199,6 +200,10 @@ describe("agent-v2 live runner", () => {
           },
         });
       }
+      if (String(url).endsWith("/api/agent/v1/append")) {
+        uploads.push(JSON.parse(String(init?.body)));
+        return jsonResponse({ ok: true, cursor: "65" });
+      }
       return jsonResponse({ ok: true }, 200);
     }) as unknown as typeof fetch;
 
@@ -211,10 +216,13 @@ describe("agent-v2 live runner", () => {
       fetchImpl,
     });
 
-    expect(summary.uploadedChunkCount).toBe(0);
+    expect(summary.uploadedChunkCount).toBe(1);
     expect(summary.skippedCount).toBe(1);
+    expect((uploads[0] as any).chunks[0].rawText).toBeUndefined();
+    expect((uploads[0] as any).chunks[0].rawBytes).toBe(65);
+    expect((uploads[0] as any).chunks[0].events).toEqual([]);
     const state = JSON.parse(await readFile(statePath, "utf8"));
-    expect(state.cursors[sourcePath]).toBeUndefined();
+    expect(state.cursors[sourcePath].offset).toBe(65);
   });
 
   test("parses repeated roots and env roots for watch or one-shot commands", () => {

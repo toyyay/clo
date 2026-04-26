@@ -57,7 +57,7 @@ export type AgentV1AppendRequest = {
     cursorEnd: string;
     rawSha256: string;
     rawBytes: number;
-    rawText: string;
+    rawText?: string;
     encoding: "utf8";
     contentType: "application/x-ndjson";
     metadata: {
@@ -110,7 +110,8 @@ export function buildAgentV1AppendRequest(agent: AgentV2Identity, chunk: UploadC
   };
 
   const rawText = chunk.rawText;
-  const rawBytes = Buffer.byteLength(rawText, "utf8");
+  const rawBytes = chunk.omitRawText ? chunk.rawBytes ?? chunk.byteLength : Buffer.byteLength(rawText, "utf8");
+  const rawSha256 = chunk.omitRawText ? chunk.rawSha256 ?? sha256Hex(rawText) : sha256Hex(rawText);
 
   return {
     agent,
@@ -133,9 +134,9 @@ export function buildAgentV1AppendRequest(agent: AgentV2Identity, chunk: UploadC
         generation,
         cursorStart: String(chunk.startOffset),
         cursorEnd: String(chunk.endOffset),
-        rawSha256: sha256Hex(rawText),
+        rawSha256,
         rawBytes,
-        rawText,
+        ...(!chunk.omitRawText ? { rawText } : {}),
         encoding: "utf8",
         contentType: "application/x-ndjson",
         metadata: {

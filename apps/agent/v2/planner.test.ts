@@ -23,7 +23,7 @@ const policy: SyncPolicy = {
 };
 
 describe("agent-v2 upload planner", () => {
-  test("skips oversized single records instead of creating rejected chunks", () => {
+  test("advances over oversized single records without raw payloads", () => {
     const batch: TailBatch = {
       file,
       records: [{ lineNo: 1, offset: 0, byteLength: 20, rawLine: "x".repeat(19) }],
@@ -36,8 +36,15 @@ describe("agent-v2 upload planner", () => {
 
     const plan = planUploadChunks([file], [batch], policy);
 
-    expect(plan.chunks).toHaveLength(0);
-    expect(plan.skipped[0].reason).toContain("exceeds maxUploadChunkBytes");
+    expect(plan.chunks).toHaveLength(1);
+    expect(plan.chunks[0]).toMatchObject({
+      startOffset: 0,
+      endOffset: 20,
+      omitRawText: true,
+      rawBytes: 20,
+      records: [],
+    });
+    expect(plan.skipped[0].reason).toContain("raw payload omitted");
   });
 
   test("uses contiguous span length for chunks with blank lines between records", () => {
