@@ -7,7 +7,7 @@ export function shortId(value: string, size = 8) {
 }
 
 export function providerFilterValue(session: SessionInfo) {
-  return session.sourceProvider || (session.id.startsWith("v2:") ? "v2" : "legacy");
+  return session.sourceProvider || (session.id.startsWith("v3:") ? "v3" : "legacy");
 }
 
 export function providerLabel(provider: string) {
@@ -15,7 +15,7 @@ export function providerLabel(provider: string) {
   if (provider === "codex") return "Codex";
   if (provider === "gemini") return "Gemini";
   if (provider === "legacy") return "Legacy";
-  if (provider === "v2") return "V2";
+  if (provider === "v3") return "V3";
   if (provider === "unknown") return "Unknown";
   return provider.slice(0, 1).toUpperCase() + provider.slice(1);
 }
@@ -125,7 +125,7 @@ function timestampFromPath(path: string) {
 }
 
 function sourceModifiedTimestamp(session: SessionInfo) {
-  if (!session.id.startsWith("v2:")) return null;
+  if (!session.id.startsWith("v3:")) return null;
   if (!Number.isFinite(session.mtimeMs) || session.mtimeMs <= 0) return null;
   return new Date(session.mtimeMs).toISOString();
 }

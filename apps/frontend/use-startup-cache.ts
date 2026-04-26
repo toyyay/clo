@@ -55,11 +55,17 @@ export function useStartupCache({
         setStatusText("Offline cache");
       }
     };
+    const onVisible = () => {
+      if (document.hidden) return;
+      if (authState === "cache" || authState === "checking") void checkAuth();
+    };
     window.addEventListener("online", onOnline);
     window.addEventListener("offline", onOffline);
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [authState, canShowLocalApp, checkAuth, setSyncHealth, setSyncState, setStatusText]);
 

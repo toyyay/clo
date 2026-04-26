@@ -14,19 +14,19 @@ export function flatten(events: SessionEvent[]): FlatPart[] {
 function flattenEvent(event: SessionEvent): FlatPart[] {
   const out: FlatPart[] = [];
   const raw = event.raw as any;
-  if (appendLegacyMessage(out, raw)) return out;
+  if (appendLegacyMessage(out, raw, event)) return out;
   if (appendNormalizedEvent(out, raw?.normalized, event)) return out;
   appendNormalizedEvent(out, raw, event);
   return out;
 }
 
-function appendLegacyMessage(out: FlatPart[], value: any) {
+function appendLegacyMessage(out: FlatPart[], value: any, event: SessionEvent) {
   if (!value || (value.type !== "user" && value.type !== "assistant")) return false;
   const message = value.message;
   const role = normalizedTextRole(message?.role ?? value.type);
   if (!message || !role) return false;
   const before = out.length;
-  appendContent(out, role, message.content);
+  appendContent(out, role, message.content, event);
   return out.length > before;
 }
 
@@ -34,37 +34,42 @@ function appendNormalizedEvent(out: FlatPart[], value: any, event: SessionEvent)
   if (!value || typeof value !== "object" || value.display === false) return false;
   const role = normalizedTextRole(value.role ?? event.role);
   const before = out.length;
-  appendContent(out, role, value.parts ?? value.content ?? value.text ?? value.message);
+  appendContent(out, role, value.parts ?? value.content ?? value.text ?? value.message, event);
   return out.length > before;
 }
 
-function appendContent(out: FlatPart[], role: TextPart["role"] | null, content: unknown) {
+function appendContent(out: FlatPart[], role: TextPart["role"] | null, content: unknown, event: SessionEvent) {
   if (typeof content === "string") {
-    appendText(out, role, content);
+    appendText(out, role, content, event);
     return;
   }
   if (!Array.isArray(content)) return;
-  for (const part of content) appendContentPart(out, role, part);
+  for (const part of content) appendContentPart(out, role, part, event);
 }
 
-function appendContentPart(out: FlatPart[], role: TextPart["role"] | null, value: any) {
+function appendContentPart(out: FlatPart[], role: TextPart["role"] | null, value: any, event: SessionEvent) {
   if (typeof value === "string") {
-    appendText(out, role, value);
+    appendText(out, role, value, event);
     return;
   }
   if (!value || typeof value !== "object") return;
   const kind = String(value.kind ?? value.type ?? "").toLowerCase();
+  const sourceEventId = event.id;
   if ((kind === "text" || kind === "input_text" || kind === "output_text" || kind === "summary_text") && role && value.text?.trim()) {
-    appendText(out, role, value.text);
+    appendText(out, role, value.text, event);
   } else if (kind === "thinking" || kind === "reasoning" || kind === "reasoning_text") {
     const thinking = value.thinking ?? value.text ?? value.content;
-    if (typeof thinking === "string" && thinking.trim()) out.push({ kind: "thinking", text: thinking });
+    if (typeof thinking === "string" && thinking.trim()) {
+      out.push({ kind: "thinking", text: thinking, sourceEventId, partIndex: out.length });
+    }
   } else if (kind === "tool_call" || kind === "tool_use" || kind === "function_call" || kind === "server_tool_use") {
     out.push({
       kind: "tool_use",
       name: value.name ?? value.tool_name ?? kind,
       input: value.input ?? value.arguments ?? value.parameters ?? {},
       id: value.id ?? value.tool_use_id ?? value.call_id ?? `${kind}:${out.length}`,
+      sourceEventId,
+      partIndex: out.length,
     });
   } else if (kind === "tool_result" || kind === "function_call_output" || kind === "tool_output") {
     out.push({
@@ -72,17 +77,21 @@ function appendContentPart(out: FlatPart[], role: TextPart["role"] | null, value
       content: value.content ?? value.output ?? value.result ?? "",
       isError: value.is_error ?? value.isError,
       id: value.tool_use_id ?? value.id ?? value.call_id ?? `result:${out.length}`,
+      sourceEventId,
+      partIndex: out.length,
     });
   } else if (Array.isArray(value.content)) {
-    appendContent(out, role, value.content);
+    appendContent(out, role, value.content, event);
   } else if (typeof value.text === "string" && role && value.text.trim()) {
-    appendText(out, role, value.text);
+    appendText(out, role, value.text, event);
   }
 }
 
-function appendText(out: FlatPart[], role: TextPart["role"] | null, text: string) {
+function appendText(out: FlatPart[], role: TextPart["role"] | null, text: string, event: SessionEvent) {
   const readable = readableText(text);
-  if (role && readable.trim()) out.push({ kind: "text", role, text: readable });
+  if (role && readable.trim()) {
+    out.push({ kind: "text", role, text: readable, sourceEventId: event.id, partIndex: out.length });
+  }
 }
 
 function readableText(text: string) {

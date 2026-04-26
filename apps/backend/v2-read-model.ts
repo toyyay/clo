@@ -1,7 +1,7 @@
 import type { HostInfo, SessionEvent, SessionInfo, SessionPayload } from "../../packages/shared/types";
 import { normalizeTranscriptRecord } from "../../packages/parsers";
 
-export const V2_SESSION_ID_PREFIX = "v2:";
+export const V2_SESSION_ID_PREFIX = "v3:";
 
 type SqlTag = (strings: TemplateStringsArray, ...values: unknown[]) => Promise<any[]>;
 

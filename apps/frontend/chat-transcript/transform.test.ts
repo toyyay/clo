@@ -25,7 +25,7 @@ describe("chat transcript transform", () => {
           message: { role: "assistant", content: "**Done**\n\n- one\n- two" },
         }),
       ]),
-    ).toEqual([{ kind: "text", role: "assistant", text: "**Done**\n\n- one\n- two" }]);
+    ).toMatchObject([{ kind: "text", role: "assistant", text: "**Done**\n\n- one\n- two" }]);
   });
 
   test("renders normalized v2 parts when legacy message shape is missing", () => {
@@ -48,11 +48,11 @@ describe("chat transcript transform", () => {
       ),
     ]);
 
-    expect(flat).toEqual([
+    expect(flat).toMatchObject([
       { kind: "thinking", text: "checking" },
       { kind: "text", role: "assistant", text: "## Answer" },
       { kind: "tool_use", id: "call-1", name: "Bash", input: { command: "pwd" } },
-      { kind: "tool_result", id: "call-1", content: "/repo", isError: undefined },
+      { kind: "tool_result", id: "call-1", content: "/repo" },
     ]);
     expect(groupItems(flat).at(-1)).toMatchObject({ kind: "tool_group" });
   });
@@ -91,7 +91,7 @@ describe("chat transcript transform", () => {
       }),
     ]);
 
-    expect(flat).toEqual([
+    expect(flat).toMatchObject([
       { kind: "text", role: "assistant", text: "Done:\n\n- one\n- two" },
       { kind: "text", role: "assistant", text: "Older event-msg-only record" },
     ]);
@@ -109,6 +109,6 @@ describe("chat transcript transform", () => {
       }),
     ]);
 
-    expect(flat).toEqual([{ kind: "text", role: "assistant", text: "Проверил.\n\n**Затронуто**\n- `sync.ts`" }]);
+    expect(flat).toMatchObject([{ kind: "text", role: "assistant", text: "Проверил.\n\n**Затронуто**\n- `sync.ts`" }]);
   });
 });

@@ -15,8 +15,8 @@ import {
 
 describe("v2 read model helpers", () => {
   test("namespaces v2 session ids", () => {
-    expect(v2SessionId(42n)).toBe("v2:42");
-    expect(parseV2SessionId("v2:42")).toBe("42");
+    expect(v2SessionId(42n)).toBe("v3:42");
+    expect(parseV2SessionId("v3:42")).toBe("42");
     expect(parseV2SessionId("42")).toBeNull();
   });
 
@@ -43,7 +43,7 @@ describe("v2 read model helpers", () => {
     });
 
     expect(session).toMatchObject({
-      id: "v2:42",
+      id: "v3:42",
       agentId: "agent-1",
       hostname: "workstation",
       sourceProvider: "claude",
@@ -135,7 +135,7 @@ describe("v2 read model helpers", () => {
 
     expect(event).toMatchObject({
       id: "v2e:99",
-      sessionDbId: "v2:42",
+      sessionDbId: "v3:42",
       lineNo: 5,
       offset: 123,
       eventType: "message",
@@ -237,7 +237,7 @@ describe("v2 read model helpers", () => {
   test("direct v2 session lookups exclude deleted source files", async () => {
     const { calls, sql } = recordingSql();
 
-    await getV2Session(sql, "v2:42");
+    await getV2Session(sql, "v3:42");
 
     expect(calls).toHaveLength(1);
     expect(normalizeSql(calls[0].text)).toContain("where f.id = ? and f.source_kind = 'conversation' and f.deleted_at is null");

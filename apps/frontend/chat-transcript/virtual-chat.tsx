@@ -354,25 +354,13 @@ function clamp(value: number, min: number, max: number) {
 }
 
 function stableItemKeys(items: RenderItem[]) {
-  const seen = new Map<string, number>();
-  return items.map((item) => {
-    const base = itemKeyBase(item);
-    const count = seen.get(base) ?? 0;
-    seen.set(base, count + 1);
-    return `${base}:${count}`;
-  });
+  return items.map((item) => itemKeyBase(item));
 }
 
 function itemKeyBase(item: RenderItem) {
-  if (item.kind === "text") return `text:${item.role}:${hashString(item.text)}`;
-  if (item.kind === "thinking") return `thinking:${hashString(item.text)}`;
-  const uses = item.uses.map((use) => `${use.name}:${use.id}`).join("|");
-  const results = item.results.map((result) => `${result.id}:${result.isError ? "1" : "0"}`).join("|");
-  return `tools:${hashString(`${uses}/${results}`)}`;
-}
-
-function hashString(value: string) {
-  let hash = 5381;
-  for (let i = 0; i < value.length; i += 1) hash = (hash * 33) ^ value.charCodeAt(i);
-  return (hash >>> 0).toString(36);
+  if (item.kind === "text") return `text:${item.sourceEventId}:${item.partIndex}`;
+  if (item.kind === "thinking") return `thinking:${item.sourceEventId}:${item.partIndex}`;
+  const head = item.uses[0] ?? item.results[0];
+  const headKey = head ? `${head.sourceEventId}:${head.partIndex}` : "empty";
+  return `tools:${headKey}`;
 }

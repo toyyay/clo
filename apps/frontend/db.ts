@@ -1,8 +1,8 @@
 import type { HostInfo, SessionEvent, SessionInfo, SessionPayload, SyncResponse } from "../../packages/shared/types";
 
-const DB_NAME = "chatview-cache";
-const DB_VERSION = 4;
-const CURRENT_SESSION_PREFIX = "v2:";
+const DB_NAME = "chatview-cache-v3";
+const DB_VERSION = 1;
+const CURRENT_SESSION_PREFIX = "v3:";
 const DB_OPEN_TIMEOUT_MS = 4000;
 
 type StoreName =
@@ -155,6 +155,9 @@ export async function applySync(
   const events = tx.objectStore("events");
   const meta = tx.objectStore("meta");
   const currentSessions = payload.sessions.filter((session) => isCurrentSessionId(session.id));
+  if (payload.sessions.length !== currentSessions.length) {
+    warnLegacyFiltered("applySync.sessions", payload.sessions.length - currentSessions.length, payload.sessions[0]?.id);
+  }
   const liveHostIds = new Set(payload.hosts.map((host) => host.agentId));
   const liveSessionIds = new Set(currentSessions.filter((session) => !session.deletedAt).map((session) => session.id));
 
@@ -253,6 +256,15 @@ export async function cacheSessionPayload(payload: SessionPayload) {
 
 function isCurrentSessionId(id: string) {
   return id.startsWith(CURRENT_SESSION_PREFIX);
+}
+
+let lastLegacyWarnAt = 0;
+function warnLegacyFiltered(scope: string, count: number, sampleId: string | undefined) {
+  if (count <= 0) return;
+  const now = Date.now();
+  if (now - lastLegacyWarnAt < 30_000) return;
+  lastLegacyWarnAt = now;
+  console.warn(`[chatview] dropped ${count} non-${CURRENT_SESSION_PREFIX} session ids in ${scope}`, { sampleId });
 }
 
 export async function loadYDocUpdate(docId: string): Promise<CachedYDoc | undefined> {
