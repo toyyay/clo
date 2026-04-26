@@ -68,12 +68,10 @@ export function missingInventoryFilesFromCursors(
     if (activeSourcePaths.has(sourcePath)) continue;
     if (!sourcePath.endsWith(".jsonl")) continue;
     const root = roots.find((candidate) => relativePathWithinRoot(candidate.rootPath, sourcePath) != null);
-    if (!root) continue;
-    const relativePath = relativePathWithinRoot(root.rootPath, sourcePath);
-    if (!relativePath) continue;
-    missing.push(
-      inventoryFileForPath(root, sourcePath, relativePath, cursor.sizeBytes, cursor.mtimeMs, cursor.dev, cursor.ino),
-    );
+    const file = root
+      ? inventoryFileForRootPath(root, sourcePath, cursor)
+      : legacyInventoryFileForSourcePath(sourcePath, cursor);
+    if (file) missing.push(file);
   }
 
   return missing.sort((a, b) => a.sourcePath.localeCompare(b.sourcePath));
@@ -124,6 +122,46 @@ function inventoryFileForPath(
     logicalId: `${root.provider}:${relativePath}`,
     ...deriveProviderFields(root.provider, relativePath),
   };
+}
+
+function inventoryFileForRootPath(root: SyncRootConfig, sourcePath: string, cursor: AppendJsonlCursor) {
+  const relativePath = relativePathWithinRoot(root.rootPath, sourcePath);
+  if (!relativePath) return null;
+  return inventoryFileForPath(root, sourcePath, relativePath, cursor.sizeBytes, cursor.mtimeMs, cursor.dev, cursor.ino);
+}
+
+function legacyInventoryFileForSourcePath(sourcePath: string, cursor: AppendJsonlCursor) {
+  const inferred = inferLegacyProviderRelativePath(sourcePath);
+  if (!inferred) return null;
+  return {
+    provider: inferred.provider,
+    sourcePath,
+    relativePath: inferred.relativePath,
+    sizeBytes: cursor.sizeBytes,
+    mtimeMs: cursor.mtimeMs,
+    dev: cursor.dev,
+    ino: cursor.ino,
+    logicalId: `${inferred.provider}:${inferred.relativePath}`,
+    ...deriveProviderFields(inferred.provider, inferred.relativePath),
+  };
+}
+
+function inferLegacyProviderRelativePath(sourcePath: string): { provider: ProviderKind; relativePath: string } | null {
+  const normalized = sourcePath.replaceAll("\\", "/");
+  const markers: Array<{ marker: string; provider: ProviderKind }> = [
+    { marker: "/.claude/projects/", provider: "claude" },
+    { marker: "/claude/projects/", provider: "claude" },
+    { marker: "/.codex/sessions/", provider: "codex" },
+    { marker: "/.gemini/", provider: "gemini" },
+  ];
+
+  for (const { marker, provider } of markers) {
+    const index = normalized.indexOf(marker);
+    if (index < 0) continue;
+    const relativePath = normalized.slice(index + marker.length);
+    if (relativePath && !relativePath.startsWith("../")) return { provider, relativePath };
+  }
+  return null;
 }
 
 function relativePathWithinRoot(rootPath: string, sourcePath: string) {
