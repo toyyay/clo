@@ -601,7 +601,7 @@ body.resizing-sidebar {
   justify-content: space-between;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
+  padding: 8px 92px 8px 10px;
   border-bottom: 1px solid var(--line);
   background: color-mix(in srgb, var(--panel) 94%, transparent);
   backdrop-filter: blur(12px);
@@ -1404,7 +1404,7 @@ body.resizing-sidebar {
   .app-shell.sidebar-closed .sidebar-backdrop { display: none; }
   .main { border-radius: 0; }
   .chat-head {
-    padding: 5px 6px;
+    padding: 5px 88px 5px 6px;
   }
   .chat-title {
     font-size: 13px;
