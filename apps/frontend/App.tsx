@@ -95,6 +95,7 @@ export function App() {
   const [settingsMessage, setSettingsMessage] = useState("");
   const syncing = useRef(false);
   const pendingSync = useRef<SyncNowOptions | null>(null);
+  const backfillTimer = useRef<number | null>(null);
   const sidebarRef = useRef<HTMLElement | null>(null);
   const activeRef = useRef<SessionInfo | null>(null);
   const eventStateRef = useRef<EventState>({ sessionId: null, events: [] });
@@ -188,7 +189,10 @@ export function App() {
   }, []);
 
   const setSessionEvents = useCallback((sessionId: string | null, nextEvents: SessionEvent[]) => {
-    setEventState({ sessionId, events: nextEvents });
+    setEventState((current) => {
+      if (current.sessionId === sessionId && sameSessionEvents(current.events, nextEvents)) return current;
+      return { sessionId, events: nextEvents };
+    });
   }, []);
 
   const checkAuth = useCallback(async () => {
@@ -469,6 +473,7 @@ export function App() {
     }
     const silent = options.silent === true;
     const metadataOnly = options.metadataOnly !== false;
+    const eventMode = metadataOnly ? undefined : options.eventMode;
     syncing.current = true;
     const started = performance.now();
     if (!silent) {
@@ -479,7 +484,8 @@ export function App() {
     try {
       const result = await pullUpdates({
         metadataOnly,
-        maxBatches: 4,
+        eventMode,
+        maxBatches: eventMode === "backfill" ? 1 : 4,
         onProgress: ({ events, batches, hasMore }) => {
           if (!events && !metadataOnly) return;
           if (!silent || hasMore) {
@@ -564,6 +570,8 @@ export function App() {
             hosts: result.hosts,
             sessions: result.sessions,
             cursor: result.cursor,
+            eventMode: result.eventMode,
+            backfillHasMore: result.backfillHasMore,
             hasMore: result.hasMore,
             metadataOnly,
             activeRemoved,
@@ -582,12 +590,20 @@ export function App() {
                 ? `Loaded ${refreshedSessions.length.toLocaleString()} chats`
               : metadataOnly
                 ? "Metadata refreshed"
+              : result.backfillHasMore
+                ? `Synced ${result.events.toLocaleString()} recent events, history pending`
               : result.events
                 ? `Synced ${result.events.toLocaleString()} events`
                 : "Up to date",
         );
       } else {
         setSyncState((currentState) => (currentState === "syncing" ? "idle" : currentState));
+      }
+      if (!metadataOnly && result.backfillHasMore && !document.hidden && backfillTimer.current === null) {
+        backfillTimer.current = window.setTimeout(() => {
+          backfillTimer.current = null;
+          void syncNow({ silent: true, metadataOnly: false, eventMode: "backfill" });
+        }, result.eventMode === "recent" ? 1000 : 2500);
       }
     } catch (error) {
       if (error instanceof SyncAuthError) {
@@ -626,6 +642,12 @@ export function App() {
       },
       ["app"],
     ).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (backfillTimer.current !== null) window.clearTimeout(backfillTimer.current);
+    };
   }, []);
 
   useEffect(() => {
@@ -724,6 +746,7 @@ export function App() {
           ["cache", "startup"],
         ).catch(() => {});
         void syncNow({ silent: true, metadataOnly: true });
+        void syncNow({ silent: true, metadataOnly: false, eventMode: "recent" });
       })
       .catch((error) => {
         if (disposed) return;
@@ -880,6 +903,10 @@ export function App() {
         const hasLiveEvents = currentEvents.sessionId === loadForSessionId && currentEvents.events.length > 0;
         if (cachedEvents.length && !hasLiveEvents) setSessionEvents(loadForSessionId, cachedEvents);
         const expectedEvents = activeRef.current?.eventCount ?? 0;
+        if (cachedEvents.length && cachedEvents.length < expectedEvents) {
+          void syncNow({ silent: true, metadataOnly: false, eventMode: "backfill" });
+          return;
+        }
         if (hasLiveEvents && currentEvents.events.length >= expectedEvents && expectedEvents > 0) {
           return;
         }
@@ -954,7 +981,7 @@ export function App() {
     return () => {
       disposed = true;
     };
-  }, [activeId, active?.eventCount, isAuthenticated, setActiveSession, setSessionEvents]);
+  }, [activeId, active?.eventCount, isAuthenticated, setActiveSession, setSessionEvents, syncNow]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -1023,7 +1050,7 @@ export function App() {
         if (timer !== null) window.clearTimeout(timer);
         timer = window.setTimeout(() => {
           timer = null;
-          void syncNow({ silent: true, metadataOnly: true });
+          void syncNow({ silent: true, metadataOnly: false, eventMode: "forward" });
         }, 300);
       },
       () => {
@@ -1196,5 +1223,20 @@ function mergeSyncOptions(current: SyncNowOptions | null, next: SyncNowOptions):
   return {
     silent: current ? current.silent === true && next.silent === true : next.silent === true,
     metadataOnly: current?.metadataOnly === false || next.metadataOnly === false ? false : true,
+    eventMode: mergeSyncEventMode(current?.eventMode, next.eventMode),
   };
+}
+
+function mergeSyncEventMode(current?: SyncNowOptions["eventMode"], next?: SyncNowOptions["eventMode"]): SyncNowOptions["eventMode"] {
+  if (current === "recent" || next === "recent") return "recent";
+  if (current === "forward" || next === "forward") return "forward";
+  return current ?? next;
+}
+
+function sameSessionEvents(a: SessionEvent[], b: SessionEvent[]) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i].id !== b[i].id || a[i].lineNo !== b[i].lineNo || a[i].offset !== b[i].offset) return false;
+  }
+  return true;
 }

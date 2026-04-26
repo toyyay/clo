@@ -15,24 +15,26 @@ function estimateItemHeight(item: RenderItem) {
 
 function VirtualRow({
   index,
+  itemKey,
   item,
   onMeasure,
 }: {
   index: number;
+  itemKey: string;
   item: RenderItem;
-  onMeasure: (index: number, height: number) => void;
+  onMeasure: (key: string, height: number) => void;
 }) {
   const rowRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const node = rowRef.current;
     if (!node) return;
-    const measure = () => onMeasure(index, node.getBoundingClientRect().height);
+    const measure = () => onMeasure(itemKey, node.getBoundingClientRect().height);
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(node);
     return () => observer.disconnect();
-  }, [index, onMeasure]);
+  }, [itemKey, onMeasure]);
 
   return (
     <div ref={rowRef} className="virtual-row">
@@ -43,7 +45,7 @@ function VirtualRow({
 
 export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey: string }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const heights = useRef(new Map<number, number>());
+  const heights = useRef(new Map<string, number>());
   const nearBottom = useRef(true);
   const pendingBottom = useRef(true);
   const restoredScrollKey = useRef<string | null>(null);
@@ -59,16 +61,18 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
 
   resetKeyRef.current = resetKey;
 
+  const itemKeys = useMemo(() => stableItemKeys(items), [items]);
+
   const layout = useMemo(() => {
     const offsets = new Array(items.length + 1);
     let total = 0;
     for (let i = 0; i < items.length; i += 1) {
       offsets[i] = total;
-      total += heights.current.get(i) ?? estimateItemHeight(items[i]) ?? DEFAULT_ROW_HEIGHT;
+      total += heights.current.get(itemKeys[i]) ?? estimateItemHeight(items[i]) ?? DEFAULT_ROW_HEIGHT;
     }
     offsets[items.length] = total;
     return { offsets, total };
-  }, [items, measureVersion]);
+  }, [items, itemKeys, measureVersion]);
 
   const updateRange = useCallback((options: UpdateRangeOptions = {}) => {
     const el = scrollRef.current;
@@ -79,7 +83,9 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     const end = Math.min(items.length, lowerBound(layout.offsets, viewportBottom) + ROW_OVERSCAN);
     const bottomGap = el.scrollHeight - el.scrollTop - el.clientHeight;
     nearBottom.current = bottomGap < 160;
-    if (options.captureAnchor && !nearBottom.current) scrollAnchor.current = anchorForScroll(layout.offsets, viewportTop, items.length);
+    if (options.captureAnchor && !nearBottom.current) {
+      scrollAnchor.current = anchorForScroll(layout.offsets, itemKeys, viewportTop, items.length);
+    }
     setShowBottom(bottomGap >= 160);
     setRange({
       start,
@@ -87,7 +93,7 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
       top: layout.offsets[start] ?? 0,
       bottom: Math.max(0, layout.total - (layout.offsets[end] ?? layout.total)),
     });
-  }, [items.length, layout]);
+  }, [items.length, itemKeys, layout]);
 
   const scheduleRange = useCallback((options: UpdateRangeOptions = {}) => {
     pendingRangeCapture.current = pendingRangeCapture.current || Boolean(options.captureAnchor);
@@ -135,10 +141,10 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     [cancelScrollFrame],
   );
 
-  const onMeasure = useCallback((index: number, height: number) => {
+  const onMeasure = useCallback((key: string, height: number) => {
     const rounded = Math.ceil(height);
-    if (Math.abs((heights.current.get(index) ?? 0) - rounded) < 2) return;
-    heights.current.set(index, rounded);
+    if (Math.abs((heights.current.get(key) ?? 0) - rounded) < 2) return;
+    heights.current.set(key, rounded);
     setMeasureVersion((version) => version + 1);
   }, []);
 
@@ -177,7 +183,7 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
         if (!el) return;
         const nextTop = Math.min(savedScroll.top, Math.max(0, el.scrollHeight - el.clientHeight));
         el.scrollTop = nextTop;
-        scrollAnchor.current = anchorForScroll(layout.offsets, nextTop, items.length);
+        scrollAnchor.current = anchorForScroll(layout.offsets, itemKeys, nextTop, items.length);
         updateRange();
       });
       return;
@@ -188,14 +194,15 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     } else if (appended && wasNearBottom) {
       scheduleScrollFrame(scrollToBottom);
     }
-  }, [items.length, layout.total, resetKey, scheduleScrollFrame, scrollToBottom, updateRange]);
+  }, [items.length, itemKeys, layout.total, resetKey, scheduleScrollFrame, scrollToBottom, updateRange]);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
     const anchor = scrollAnchor.current;
     if (!el || !anchor || !items.length || nearBottom.current || pendingBottom.current) return;
 
-    const index = Math.min(anchor.index, items.length - 1);
+    const index = itemKeys.indexOf(anchor.key);
+    if (index < 0) return;
     const nextTop = clamp(
       (layout.offsets[index] ?? 0) + anchor.offset,
       0,
@@ -204,7 +211,7 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     if (Math.abs(nextTop - el.scrollTop) < 1) return;
     el.scrollTop = nextTop;
     updateRange();
-  }, [items.length, layout, updateRange]);
+  }, [items.length, itemKeys, layout, updateRange]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -227,7 +234,8 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
       <div className="items">
         {items.slice(range.start, range.end).map((item, offset) => {
           const index = range.start + offset;
-          return <VirtualRow key={`${resetKey}:${index}`} index={index} item={item} onMeasure={onMeasure} />;
+          const itemKey = itemKeys[index];
+          return <VirtualRow key={`${resetKey}:${itemKey}`} index={index} itemKey={itemKey} item={item} onMeasure={onMeasure} />;
         })}
       </div>
       <div className="virtual-spacer" style={{ height: range.bottom }} />
@@ -292,12 +300,36 @@ function upperBound(offsets: number[], value: number) {
   return lo;
 }
 
-function anchorForScroll(offsets: number[], scrollTop: number, itemCount: number): ScrollAnchor | null {
+function anchorForScroll(offsets: number[], itemKeys: string[], scrollTop: number, itemCount: number): ScrollAnchor | null {
   if (!itemCount) return null;
   const index = clamp(upperBound(offsets, scrollTop) - 1, 0, itemCount - 1);
-  return { index, offset: scrollTop - (offsets[index] ?? 0) };
+  return { key: itemKeys[index], offset: scrollTop - (offsets[index] ?? 0) };
 }
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+function stableItemKeys(items: RenderItem[]) {
+  const seen = new Map<string, number>();
+  return items.map((item) => {
+    const base = itemKeyBase(item);
+    const count = seen.get(base) ?? 0;
+    seen.set(base, count + 1);
+    return `${base}:${count}`;
+  });
+}
+
+function itemKeyBase(item: RenderItem) {
+  if (item.kind === "text") return `text:${item.role}:${hashString(item.text)}`;
+  if (item.kind === "thinking") return `thinking:${hashString(item.text)}`;
+  const uses = item.uses.map((use) => `${use.name}:${use.id}`).join("|");
+  const results = item.results.map((result) => `${result.id}:${result.isError ? "1" : "0"}`).join("|");
+  return `tools:${hashString(`${uses}/${results}`)}`;
+}
+
+function hashString(value: string) {
+  let hash = 5381;
+  for (let i = 0; i < value.length; i += 1) hash = (hash * 33) ^ value.charCodeAt(i);
+  return (hash >>> 0).toString(36);
 }

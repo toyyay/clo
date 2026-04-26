@@ -590,6 +590,47 @@ export async function listV2EventsForSync(sql: SqlTag, cursor: bigint, limit: nu
   `;
 }
 
+export async function listV2EventsForBackfill(sql: SqlTag, before: bigint, ceiling: bigint, limit: number): Promise<V2EventRow[]> {
+  return await sql`
+    select
+      visible.id,
+      visible.source_file_id,
+      visible.source_line_no,
+      visible.source_offset,
+      visible.event_type,
+      visible.role,
+      visible.occurred_at,
+      visible.created_at,
+      visible.normalized,
+      visible.ordinal
+    from (
+      select
+        e.id,
+        e.source_file_id,
+        e.source_line_no,
+        e.source_offset,
+        e.event_type,
+        e.role,
+        e.occurred_at,
+        e.created_at,
+        e.normalized,
+        row_number() over (
+          partition by e.source_file_id
+          order by e.source_line_no asc nulls last, e.source_offset asc nulls last, e.id asc
+        ) as ordinal
+      from agent_normalized_events e
+      join agent_source_files f on f.id = e.source_file_id
+      where e.source_generation = f.current_generation
+        and f.source_kind = 'conversation'
+        and f.deleted_at is null
+    ) visible
+    where visible.id < ${before}
+      and visible.id <= ${ceiling}
+    order by visible.id desc
+    limit ${limit}
+  `;
+}
+
 export function mapV2HostRow(row: any): HostInfo {
   return {
     agentId: row.id,

@@ -27,6 +27,9 @@ export type PullResult = {
   events: number;
   batches: number;
   cursor: string;
+  backfillCursor?: string;
+  backfillHasMore: boolean;
+  eventMode?: "forward" | "recent" | "backfill";
   metadataCursor?: string;
   hasMore: boolean;
   hosts: number;
@@ -46,6 +49,7 @@ export type PullOptions = {
   maxBatches?: number;
   timeoutMs?: number;
   metadataOnly?: boolean;
+  eventMode?: "forward" | "recent" | "backfill";
   onProgress?: (progress: PullProgress) => void;
 };
 
@@ -117,6 +121,8 @@ async function fetchBatch(
   timeoutMs: number,
   metadataOnly: boolean,
   metadataCursor?: string,
+  eventMode?: "forward" | "recent" | "backfill",
+  backfillCursor?: string,
 ): Promise<SyncResponse> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -125,7 +131,7 @@ async function fetchBatch(
     const response = await fetch(READ_API_ENDPOINTS.sync, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ cursor, limitBytes, metadataOnly, metadataCursor, metadataMode }),
+      body: JSON.stringify({ cursor, limitBytes, metadataOnly, metadataCursor, metadataMode, eventMode, backfillCursor }),
       signal: controller.signal,
     });
     if (!response.ok) {
@@ -186,11 +192,15 @@ export async function pullUpdates(options: PullOptions = {}): Promise<PullResult
   const timeoutMs = Math.max(1000, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const metadataOnly = options.metadataOnly !== false;
   const onProgress = options.onProgress;
-  let cursor = (await getMeta<string>("syncCursor")) ?? "0";
+  const storedCursor = await getMeta<string>("syncCursor");
+  let cursor = storedCursor ?? "0";
+  let backfillCursor = await getMeta<string>("backfillCursor");
+  const eventMode = metadataOnly ? undefined : options.eventMode ?? (storedCursor ? "forward" : "recent");
   let metadataCursor = await getMeta<string>("metadataCursor");
   let events = 0;
   let batches = 0;
   let hasMore = false;
+  let backfillHasMore = false;
   let hosts = 0;
   let sessions = 0;
   let metadataFull = false;
@@ -199,13 +209,25 @@ export async function pullUpdates(options: PullOptions = {}): Promise<PullResult
   while (batches < maxBatches) {
     const previousCursor = cursor;
     const previousMetadataCursor = metadataCursor;
-    const payload = await fetchBatch(previousCursor, limitBytes, timeoutMs, metadataOnly, metadataCursor);
-    const nextHasMore = metadataOnly ? payload.metadataHasMore === true || payload.hasMore === true : payload.hasMore;
-    if (!metadataOnly && payload.hasMore && payload.cursor === previousCursor) throw new Error("sync cursor did not advance");
+    const previousBackfillCursor = backfillCursor;
+    const payload = await fetchBatch(previousCursor, limitBytes, timeoutMs, metadataOnly, metadataCursor, eventMode, backfillCursor);
+    const nextHasMore = metadataOnly
+      ? payload.metadataHasMore === true || payload.hasMore === true
+      : eventMode === "backfill"
+        ? payload.backfillHasMore === true
+        : payload.hasMore;
+    if (!metadataOnly && eventMode !== "backfill" && payload.hasMore && payload.cursor === previousCursor) {
+      throw new Error("sync cursor did not advance");
+    }
+    if (!metadataOnly && eventMode === "backfill" && payload.backfillHasMore && payload.backfillCursor === previousBackfillCursor) {
+      throw new Error("backfill cursor did not advance");
+    }
     if (metadataOnly && nextHasMore && payload.metadataCursor === previousMetadataCursor) {
       throw new Error("metadata cursor did not advance");
     }
-    if (!metadataOnly) cursor = payload.cursor;
+    if (!metadataOnly && eventMode !== "backfill") cursor = payload.cursor;
+    backfillCursor = payload.backfillCursor ?? backfillCursor;
+    backfillHasMore = payload.backfillHasMore === true;
     metadataCursor = payload.metadataCursor ?? metadataCursor;
     hasMore = nextHasMore;
     metadataFull = metadataFull || payload.metadataFull === true || (metadataOnly && payload.metadataMode !== "delta" && !previousMetadataCursor);
@@ -213,7 +235,7 @@ export async function pullUpdates(options: PullOptions = {}): Promise<PullResult
     sessions += payload.sessions.length;
     await applySync(payload, {
       pruneMissing: metadataOnly ? metadataPruneMode(payload, previousMetadataCursor) : "none",
-      storeEventCursor: !metadataOnly,
+      storeEventCursor: !metadataOnly && eventMode !== "backfill",
     });
     for (const event of payload.events) touchedSessionIds.add(event.sessionDbId);
     events += payload.events.length;
@@ -222,5 +244,18 @@ export async function pullUpdates(options: PullOptions = {}): Promise<PullResult
     if (!hasMore) break;
   }
 
-  return { events, batches, cursor, metadataCursor, hasMore, hosts, sessions, metadataFull, touchedSessionIds: [...touchedSessionIds] };
+  return {
+    events,
+    batches,
+    cursor,
+    backfillCursor,
+    backfillHasMore: !metadataOnly ? backfillHasMore : false,
+    eventMode,
+    metadataCursor,
+    hasMore,
+    hosts,
+    sessions,
+    metadataFull,
+    touchedSessionIds: [...touchedSessionIds],
+  };
 }

@@ -42,6 +42,7 @@ import {
   getV2Session,
   getV2SessionsMeta,
   isV2SessionId,
+  listV2EventsForBackfill,
   listV2EventsForSync,
   listV2Hosts,
   listV2Sessions,
@@ -259,6 +260,8 @@ Bun.serve<{ docIds: Set<string> }>({
               nextCursor: result.cursor,
               limitBytes: body.limitBytes ?? null,
               metadataOnly: body.metadataOnly === true,
+              eventMode: result.eventMode ?? null,
+              backfillHasMore: result.backfillHasMore ?? null,
               hosts: result.hosts.length,
               sessions: result.sessions.length,
               events: result.events.length,
@@ -2061,59 +2064,64 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
     return response;
   }
 
+  const eventMode = syncEventMode(body);
   const fetchLimit = 10000;
-  const [legacyRows, v2Rows] = await Promise.all([
-    sql`
-    select id, session_db_id, source_line_no, source_offset, event_type, role, occurred_at, ingested_at, raw
-    from session_events
-    where id > ${cursor.legacy}
-    order by id asc
-    limit ${fetchLimit}
-  `,
-    listV2EventsForSync(sql, cursor.v2, fetchLimit),
-  ]);
+  const highWater = eventMode === "recent" ? await currentEventHighWater() : null;
+  const initialBackfill =
+    eventMode === "recent"
+      ? initialBackfillCursor(highWater ?? { legacy: 0n, v2: 0n })
+      : eventMode === "backfill"
+        ? parseBackfillCursor(body.backfillCursor) ?? initialBackfillCursor(await currentEventHighWater())
+        : null;
+  const [legacyRows, v2Rows] =
+    eventMode === "forward"
+      ? await Promise.all([listLegacyEventsForSync(cursor.legacy, fetchLimit), listV2EventsForSync(sql, cursor.v2, fetchLimit)])
+      : await Promise.all([
+          listLegacyEventsForBackfill(initialBackfill!.before.legacy, initialBackfill!.ceiling.legacy, fetchLimit),
+          listV2EventsForBackfill(sql, initialBackfill!.before.v2, initialBackfill!.ceiling.v2, fetchLimit),
+        ]);
 
   const events = [];
   let approxBytes = 2;
-  let hasMore = legacyRows.length === fetchLimit || v2Rows.length === fetchLimit;
-  let nextLegacyCursor = cursor.legacy.toString();
-  let nextV2Cursor = cursor.v2.toString();
+  let budgetStopped = false;
+  let nextLegacyCursor = eventMode === "recent" ? (highWater ?? cursor).legacy.toString() : cursor.legacy.toString();
+  let nextV2Cursor = eventMode === "recent" ? (highWater ?? cursor).v2.toString() : cursor.v2.toString();
+  let nextBackfill = initialBackfill;
 
   for (const row of legacyRows) {
-    const event = {
-      id: toId(row.id),
-      sessionDbId: toId(row.session_db_id),
-      lineNo: toNumber(row.source_line_no),
-      offset: toNumber(row.source_offset),
-      eventType: row.event_type,
-      role: row.role,
-      createdAt: row.occurred_at,
-      ingestedAt: row.ingested_at,
-      raw: normalizeRaw(row.raw),
-    };
+    const event = mapLegacySyncEvent(row);
     const eventBytes = byteSize(JSON.stringify(event)) + 1;
     if (events.length && approxBytes + eventBytes > limitBytes) {
-      hasMore = true;
+      budgetStopped = true;
       break;
     }
     events.push(event);
-    nextLegacyCursor = toId(row.id);
+    if (eventMode === "forward") nextLegacyCursor = toId(row.id);
+    else if (nextBackfill) nextBackfill = advanceBackfillCursor(nextBackfill, "legacy", BigInt(toId(row.id)));
     approxBytes += eventBytes;
   }
 
-  for (const row of v2Rows) {
-    const event = mapV2EventRow(row);
-    const eventBytes = byteSize(JSON.stringify(event)) + 1;
-    if (events.length && approxBytes + eventBytes > limitBytes) {
-      hasMore = true;
-      break;
+  if (!budgetStopped) {
+    for (const row of v2Rows) {
+      const event = mapV2EventRow(row);
+      const eventBytes = byteSize(JSON.stringify(event)) + 1;
+      if (events.length && approxBytes + eventBytes > limitBytes) {
+        budgetStopped = true;
+        break;
+      }
+      events.push(event);
+      if (eventMode === "forward") nextV2Cursor = toId(row.id);
+      else if (nextBackfill) nextBackfill = advanceBackfillCursor(nextBackfill, "v2", BigInt(toId(row.id)));
+      approxBytes += eventBytes;
     }
-    events.push(event);
-    nextV2Cursor = toId(row.id);
-    approxBytes += eventBytes;
   }
 
   const nextCursor = formatSyncCursor(nextLegacyCursor, nextV2Cursor);
+  const backfillHasMore =
+    eventMode === "recent" || eventMode === "backfill"
+      ? budgetStopped || legacyRows.length === fetchLimit || v2Rows.length === fetchLimit
+      : false;
+  const hasMore = eventMode === "forward" ? budgetStopped || legacyRows.length === fetchLimit || v2Rows.length === fetchLimit : false;
   const sessionIds = [...new Set(events.map((event) => event.sessionDbId))];
   const legacySessionIds = sessionIds.filter((id) => !isV2SessionId(id));
   const v2SessionIds = new Set(sessionIds.filter(isV2SessionId));
@@ -2128,12 +2136,129 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
     cursor: nextCursor,
     hasMore,
     approxBytes: 0,
+    eventMode,
+    ...(nextBackfill ? { backfillCursor: formatBackfillCursor(nextBackfill), backfillHasMore } : {}),
     hosts,
     sessions,
     events,
   };
   response.approxBytes = byteSize(JSON.stringify(response));
   return response;
+}
+
+type EventSyncMode = NonNullable<SyncRequest["eventMode"]>;
+type EventCursor = { legacy: bigint; v2: bigint };
+type BackfillCursor = { before: EventCursor; ceiling: EventCursor };
+
+function syncEventMode(body: SyncRequest): EventSyncMode {
+  if (body.eventMode === "recent" || body.eventMode === "backfill" || body.eventMode === "forward") return body.eventMode;
+  return "forward";
+}
+
+async function listLegacyEventsForSync(cursor: bigint, limit: number) {
+  return await sql`
+    select id, session_db_id, source_line_no, source_offset, event_type, role, occurred_at, ingested_at, raw
+    from session_events
+    where id > ${cursor}
+    order by id asc
+    limit ${limit}
+  `;
+}
+
+async function listLegacyEventsForBackfill(before: bigint, ceiling: bigint, limit: number) {
+  return await sql`
+    select id, session_db_id, source_line_no, source_offset, event_type, role, occurred_at, ingested_at, raw
+    from session_events
+    where id < ${before}
+      and id <= ${ceiling}
+    order by id desc
+    limit ${limit}
+  `;
+}
+
+function mapLegacySyncEvent(row: any) {
+  return {
+    id: toId(row.id),
+    sessionDbId: toId(row.session_db_id),
+    lineNo: toNumber(row.source_line_no),
+    offset: toNumber(row.source_offset),
+    eventType: row.event_type,
+    role: row.role,
+    createdAt: row.occurred_at,
+    ingestedAt: row.ingested_at,
+    raw: normalizeRaw(row.raw),
+  };
+}
+
+async function currentEventHighWater(): Promise<EventCursor> {
+  const [legacyRows, v2Rows] = await Promise.all([
+    sql`select coalesce(max(id), 0)::text as id from session_events`,
+    sql`
+      select coalesce(max(e.id), 0)::text as id
+      from agent_normalized_events e
+      join agent_source_files f on f.id = e.source_file_id
+      where e.source_generation = f.current_generation
+        and f.source_kind = 'conversation'
+        and f.deleted_at is null
+    `,
+  ]);
+  return {
+    legacy: BigInt(String(legacyRows[0]?.id ?? "0")),
+    v2: BigInt(String(v2Rows[0]?.id ?? "0")),
+  };
+}
+
+function initialBackfillCursor(ceiling: EventCursor): BackfillCursor {
+  return {
+    before: { legacy: ceiling.legacy + 1n, v2: ceiling.v2 + 1n },
+    ceiling: { ...ceiling },
+  };
+}
+
+function advanceBackfillCursor(cursor: BackfillCursor, kind: "legacy" | "v2", id: bigint): BackfillCursor {
+  return {
+    before: {
+      legacy: kind === "legacy" && id < cursor.before.legacy ? id : cursor.before.legacy,
+      v2: kind === "v2" && id < cursor.before.v2 ? id : cursor.before.v2,
+    },
+    ceiling: cursor.ceiling,
+  };
+}
+
+function parseBackfillCursor(value: string | undefined): BackfillCursor | null {
+  if (!value?.startsWith("bf:")) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(value.slice("bf:".length), "base64url").toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || parsed.v !== 1) return null;
+    const before = parseEventCursorRecord(parsed.before);
+    const ceiling = parseEventCursorRecord(parsed.ceiling);
+    return before && ceiling ? { before, ceiling } : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseEventCursorRecord(value: unknown): EventCursor | null {
+  if (!value || typeof value !== "object") return null;
+  const legacy = bigintCursorValue((value as any).legacy);
+  const v2 = bigintCursorValue((value as any).v2);
+  return legacy === null || v2 === null ? null : { legacy, v2 };
+}
+
+function bigintCursorValue(value: unknown) {
+  if (typeof value !== "string" && typeof value !== "number" && typeof value !== "bigint") return null;
+  const text = String(value);
+  return /^\d+$/.test(text) ? BigInt(text) : null;
+}
+
+function formatBackfillCursor(cursor: BackfillCursor) {
+  return `bf:${Buffer.from(
+    JSON.stringify({
+      v: 1,
+      before: { legacy: cursor.before.legacy.toString(), v2: cursor.before.v2.toString() },
+      ceiling: { legacy: cursor.ceiling.legacy.toString(), v2: cursor.ceiling.v2.toString() },
+    }),
+  ).toString("base64url")}`;
 }
 
 type MetadataMode = "full" | "delta";

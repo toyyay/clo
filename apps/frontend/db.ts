@@ -113,7 +113,11 @@ export async function loadSessionEvents(sessionDbId: string): Promise<SessionEve
   const db = await openCacheDb();
   const index = db.transaction("events").objectStore("events").index("sessionDbId");
   const events = await request<SessionEvent[]>(index.getAll(IDBKeyRange.only(sessionDbId)));
-  return events.sort((a, b) => a.lineNo - b.lineNo);
+  return events.sort(compareSessionEvents);
+}
+
+function compareSessionEvents(a: SessionEvent, b: SessionEvent) {
+  return a.lineNo - b.lineNo || a.offset - b.offset || a.id.localeCompare(b.id);
 }
 
 export async function applySync(
@@ -155,6 +159,7 @@ export async function applySync(
   }
   for (const event of payload.events) events.put(event);
   if (options.storeEventCursor !== false) meta.put({ key: "syncCursor", value: payload.cursor });
+  if (payload.backfillCursor) meta.put({ key: "backfillCursor", value: payload.backfillCursor });
   if (payload.metadataCursor) meta.put({ key: "metadataCursor", value: payload.metadataCursor });
   meta.put({ key: "lastSyncAt", value: new Date().toISOString() });
 

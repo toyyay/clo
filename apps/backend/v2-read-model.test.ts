@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   getV2SessionsMeta,
   getV2Session,
+  listV2EventsForBackfill,
   listV2Sessions,
   listV2EventsForSync,
   mapV2EventRow,
@@ -253,6 +254,20 @@ describe("v2 read model helpers", () => {
     expect(text.indexOf("row_number() over")).toBeLessThan(text.indexOf("where visible.id > ?"));
     expect(text).toContain("and f.source_kind = 'conversation' and f.deleted_at is null");
     expect(calls[0].values).toEqual([10n, 25]);
+  });
+
+  test("backfill v2 event query walks older ids without changing ordinal visibility", async () => {
+    const { calls, sql } = recordingSql();
+
+    await listV2EventsForBackfill(sql, 100n, 150n, 25);
+
+    expect(calls).toHaveLength(1);
+    const text = normalizeSql(calls[0].text);
+    expect(text.indexOf("row_number() over")).toBeLessThan(text.indexOf("where visible.id < ?"));
+    expect(text).toContain("where visible.id < ? and visible.id <= ?");
+    expect(text).toContain("and f.source_kind = 'conversation' and f.deleted_at is null");
+    expect(text).toContain("order by visible.id desc");
+    expect(calls[0].values).toEqual([100n, 150n, 25]);
   });
 
   test("v2 metadata lookup can return deleted tombstones for delta sync", async () => {

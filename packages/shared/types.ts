@@ -123,6 +123,8 @@ export type SessionPayload = {
 
 export type SyncRequest = {
   cursor?: string;
+  backfillCursor?: string;
+  eventMode?: "forward" | "recent" | "backfill";
   metadataCursor?: string;
   metadataMode?: "full" | "delta";
   metadataLimit?: number;
@@ -134,6 +136,9 @@ export type SyncResponse = {
   cursor: string;
   hasMore: boolean;
   approxBytes: number;
+  backfillCursor?: string;
+  backfillHasMore?: boolean;
+  eventMode?: "forward" | "recent" | "backfill";
   metadataCursor?: string;
   metadataHasMore?: boolean;
   metadataMode?: "full" | "delta";

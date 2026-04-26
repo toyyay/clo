@@ -8,5 +8,5 @@ export type RenderItem = TextPart | ThinkPart | ToolGroup;
 
 export type VirtualRange = { start: number; end: number; top: number; bottom: number };
 export type SavedScroll = { top: number; nearBottom: boolean };
-export type ScrollAnchor = { index: number; offset: number };
+export type ScrollAnchor = { key: string; offset: number };
 export type UpdateRangeOptions = { captureAnchor?: boolean };
