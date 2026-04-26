@@ -203,6 +203,35 @@ describe("v2 read model helpers", () => {
     });
   });
 
+  test("repairs old Codex event_msg agent messages into markdown-capable assistant text", () => {
+    const raw = normalizedEventToLegacyRaw({
+      kind: "event",
+      role: "system",
+      display: false,
+      source: { provider: "codex", rawType: "event_msg", rawKind: "agent_message" },
+      parts: [
+        {
+          kind: "event",
+          name: "agent_message",
+          data: {
+            payload: {
+              type: "agent_message",
+              message: "**Done**\n\n- one\n- two",
+            },
+          },
+        },
+      ],
+    });
+
+    expect(raw).toMatchObject({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "**Done**\n\n- one\n- two" }],
+      },
+    });
+  });
+
   test("direct v2 session lookups exclude deleted source files", async () => {
     const { calls, sql } = recordingSql();
 

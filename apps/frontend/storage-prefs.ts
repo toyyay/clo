@@ -7,6 +7,7 @@ export const GROUP_BY_PROJECT_STORAGE_KEY = "chatview:group-by-project";
 export const PROVIDER_FILTER_STORAGE_KEY = "chatview:provider-filter";
 export const DEVICE_FILTER_STORAGE_KEY = "chatview:device-filter";
 export const PROJECT_FILTER_STORAGE_KEY = "chatview:project-filter";
+export const SIDEBAR_TREE_STORAGE_KEY = "chatview:sidebar-tree";
 
 export function readLocalStorageString(key: string, fallback: string) {
   try {

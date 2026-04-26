@@ -1,36 +1,35 @@
 import type { SessionInfo } from "../../packages/shared/types";
 import { VirtualChat, type RenderItem } from "./chat-transcript";
-import { hostLabel, sessionDisplayTitle, sessionSourceTitle, sourceGenerationLabel, sourceProviderLabel } from "./session-utils";
+import {
+  sessionActivityDateLabel,
+  sessionActivityTitle,
+  sessionArchiveLabel,
+  sessionDisplayTitle,
+  sessionSourceTitle,
+} from "./session-utils";
 
 type MainChatProps = {
   active: SessionInfo | null;
   eventsLength: number;
   items: RenderItem[];
   draft: string;
-  duplicateHostnames: Set<string>;
   onDraftChange: (value: string) => void;
 };
 
-export function MainChat({ active, eventsLength, items, draft, duplicateHostnames, onDraftChange }: MainChatProps) {
+export function MainChat({ active, eventsLength, items, draft, onDraftChange }: MainChatProps) {
   return (
     <main className="main">
       {!active && <div className="empty">No cached chats yet</div>}
       {active && (
         <div className="chat">
-          <div className="chat-head">
-            <div>
+          <div className="chat-head" title={sessionSourceTitle(active)}>
+            <div className="chat-heading">
               <div className="chat-title">{sessionDisplayTitle(active)}</div>
-              <div className="chat-subtitle">
-                {sourceProviderLabel(active)} / {active.projectName} /{" "}
-                {hostLabel(active.hostname, active.agentId, duplicateHostnames)}
-              </div>
-              <div className="chat-source" title={sessionSourceTitle(active)}>
-                <span className="source-pill">{active.id.startsWith("v2:") ? "v2" : "legacy"}</span>
-                {sourceGenerationLabel(active) && <span className="source-pill">{sourceGenerationLabel(active)}</span>}
-                <span className="chat-source-path">{active.sourcePath}</span>
-              </div>
+              <div className="chat-date" title={sessionActivityTitle(active)}>{sessionActivityDateLabel(active)}</div>
             </div>
-            <div className="chat-count">{eventsLength}</div>
+            <div className="chat-status" title={`${sessionArchiveLabel(active)} / ${eventsLength.toLocaleString()} events`}>
+              <span className={`archive-dot ${active.deletedAt ? "archived" : "active"}`} />
+            </div>
           </div>
 
           <VirtualChat items={items} resetKey={active.id} />

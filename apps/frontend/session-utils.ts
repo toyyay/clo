@@ -43,11 +43,20 @@ export function sessionDisplayTitle(session: SessionInfo) {
 }
 
 export function sessionActivityLabel(session: SessionInfo, now = Date.now()) {
-  return relativeTime(session.lastSeenAt || timestampFromPath(session.sourcePath), now);
+  return relativeTime(sessionActivityTimestamp(session), now);
 }
 
 export function relativeActivityLabel(value?: string | null, now = Date.now()) {
   return relativeTime(value, now);
+}
+
+export function sessionActivityDateLabel(session: SessionInfo) {
+  return formatDateTime(sessionActivityTimestamp(session), {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 export function sessionActivityTitle(session: SessionInfo) {
@@ -61,6 +70,14 @@ export function sessionActivityTitle(session: SessionInfo) {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+export function sessionActivityTimestamp(session: SessionInfo) {
+  return session.lastSeenAt || timestampFromPath(session.sourcePath);
+}
+
+export function sessionArchiveLabel(session: SessionInfo) {
+  return session.deletedAt ? "Archived" : "Active";
 }
 
 export function hostLabel(hostname: string, agentId: string, duplicateHostnames: Set<string>) {
@@ -118,9 +135,9 @@ function relativeTime(value?: string | null, now = Date.now()) {
   return new Date(parsed).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-function formatDateTime(value?: string | null) {
+function formatDateTime(value?: string | null, options?: Intl.DateTimeFormatOptions) {
   if (!value) return null;
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) return null;
-  return new Date(parsed).toLocaleString();
+  return new Date(parsed).toLocaleString(undefined, options);
 }

@@ -175,25 +175,15 @@ function normalizeCodexPayloadEnvelope(
   if (context.envelopeType === "response_item") return normalizeCodexItem(raw, payload, context);
 
   if (context.envelopeType === "event_msg") {
-    if (payloadType === "user_message") {
+    if (payloadType === "user_message" || payloadType === "agent_message") {
+      const role = payloadType === "agent_message" ? "assistant" : "user";
+      const parts = normalizeContentParts(payload.message ?? payload.content ?? payload.text, "codex");
       return {
-        kind: "event",
-        role: "system",
-        parts: [{ kind: "event", name: context.rawKind, data: compactEventData(payload) }],
+        kind: kindForRoleAndParts(role, parts, payloadType),
+        role,
+        parts,
         timestamp: context.timestamp,
-        display: false,
-        source: context.source,
-        raw,
-      };
-    }
-
-    if (payloadType === "agent_message") {
-      return {
-        kind: "event",
-        role: "system",
-        parts: [{ kind: "event", name: context.rawKind, data: compactEventData(payload) }],
-        timestamp: context.timestamp,
-        display: false,
+        display: parts.length > 0,
         source: context.source,
         raw,
       };

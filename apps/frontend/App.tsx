@@ -8,7 +8,6 @@ import {
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
-  type UIEvent,
 } from "react";
 import * as Y from "yjs";
 import type {
@@ -39,19 +38,15 @@ import { flatten, groupItems } from "./chat-transcript";
 import { flushClientLogs, installClientLogHandlers, logClientEvent } from "./client-logs";
 import { MainChat } from "./main-chat";
 import { parseRoute, useRoute, type RoutePanel } from "./router";
-import { hostLabel, projectFilterValue, projectLabel, providerFilterValue, providerLabel, sessionDisplayTitle } from "./session-utils";
+import { sessionDisplayTitle } from "./session-utils";
 import { SessionSidebar } from "./session-sidebar";
 import { SettingsModal } from "./settings-modal";
 import {
   clampSidebarWidth,
   DEFAULT_SIDEBAR_WIDTH,
-  DEVICE_FILTER_STORAGE_KEY,
   GROUP_BY_PROJECT_STORAGE_KEY,
   MIN_SIDEBAR_WIDTH,
-  PROJECT_FILTER_STORAGE_KEY,
-  PROVIDER_FILTER_STORAGE_KEY,
   readLocalStorageBoolean,
-  readLocalStorageString,
   readSidebarWidth,
   SIDEBAR_WIDTH_STORAGE_KEY,
   sidebarWidthLimit,
@@ -74,8 +69,6 @@ import {
 } from "./yjs";
 import { Topbar } from "./topbar";
 
-const SIDEBAR_SESSION_PAGE_SIZE = 80;
-
 export function App() {
   const [route, navigateRoute] = useRoute();
   const [authState, setAuthState] = useState<AuthState>("checking");
@@ -85,13 +78,9 @@ export function App() {
   const [authBusy, setAuthBusy] = useState(false);
   const [hosts, setHosts] = useState<HostInfo[]>([]);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
-  const [activeHost, setActiveHost] = useState(() => readLocalStorageString(DEVICE_FILTER_STORAGE_KEY, "all"));
-  const [activeProvider, setActiveProvider] = useState(() => readLocalStorageString(PROVIDER_FILTER_STORAGE_KEY, "all"));
-  const [activeProject, setActiveProject] = useState(() => readLocalStorageString(PROJECT_FILTER_STORAGE_KEY, "all"));
   const [active, setActive] = useState<SessionInfo | null>(null);
   const [eventState, setEventState] = useState<EventState>({ sessionId: null, events: [] });
   const [query, setQuery] = useState("");
-  const [visibleSessionLimit, setVisibleSessionLimit] = useState(SIDEBAR_SESSION_PAGE_SIZE);
   const [syncState, setSyncState] = useState<SyncState>("loading");
   const [statusText, setStatusText] = useState("Loading cache");
   const [theme, setTheme] = useState<"light" | "dark">("light");
@@ -820,18 +809,6 @@ export function App() {
   }, [groupByProject]);
 
   useEffect(() => {
-    writeLocalStorageValue(PROVIDER_FILTER_STORAGE_KEY, activeProvider);
-  }, [activeProvider]);
-
-  useEffect(() => {
-    writeLocalStorageValue(PROJECT_FILTER_STORAGE_KEY, activeProject);
-  }, [activeProject]);
-
-  useEffect(() => {
-    writeLocalStorageValue(DEVICE_FILTER_STORAGE_KEY, activeHost);
-  }, [activeHost]);
-
-  useEffect(() => {
     const onResize = () => setSidebarWidth((current) => clampSidebarWidth(current));
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -1004,101 +981,9 @@ export function App() {
     return new Set([...counts.entries()].filter(([, count]) => count > 1).map(([hostname]) => hostname));
   }, [hosts]);
 
-  const providerOptions = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const session of sessions) {
-      const provider = providerFilterValue(session);
-      counts.set(provider, (counts.get(provider) ?? 0) + 1);
-    }
-    const preferredOrder = ["claude", "codex", "gemini", "legacy", "v2", "unknown"];
-    const values = [...counts.keys()].sort((a, b) => {
-      const ai = preferredOrder.indexOf(a);
-      const bi = preferredOrder.indexOf(b);
-      if (ai !== -1 || bi !== -1) return (ai === -1 ? preferredOrder.length : ai) - (bi === -1 ? preferredOrder.length : bi);
-      return providerLabel(a).localeCompare(providerLabel(b));
-    });
-    return [
-      { value: "all", label: "All", count: sessions.length },
-      ...values.map((value) => ({ value, label: providerLabel(value), count: counts.get(value) ?? 0 })),
-    ];
-  }, [sessions]);
-
-  const deviceOptions = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const session of sessions) counts.set(session.agentId, (counts.get(session.agentId) ?? 0) + 1);
-    return [
-      { value: "all", label: "All devices", count: sessions.length, title: "All devices" },
-      ...hosts.map((host) => ({
-        value: host.agentId,
-        label: hostLabel(host.hostname, host.agentId, duplicateHostnames),
-        count: counts.get(host.agentId) ?? host.sessionCount,
-        title: `${host.hostname}\n${host.agentId}${host.sourceRoot ? `\n${host.sourceRoot}` : ""}`,
-      })),
-    ];
-  }, [duplicateHostnames, hosts, sessions]);
-
-  const projectOptions = useMemo(() => {
-    const projects = new Map<string, { label: string; count: number; lastSeenAt: string }>();
-    for (const session of sessions) {
-      if (providerFilterValue(session) !== "codex") continue;
-      if (activeHost !== "all" && session.agentId !== activeHost) continue;
-      const value = projectFilterValue(session);
-      const current = projects.get(value);
-      if (current) {
-        current.count += 1;
-        if (session.lastSeenAt > current.lastSeenAt) current.lastSeenAt = session.lastSeenAt;
-      } else {
-        projects.set(value, { label: projectLabel(session), count: 1, lastSeenAt: session.lastSeenAt });
-      }
-    }
-
-    const sorted = [...projects.entries()].sort(([, a], [, b]) => {
-      if (b.count !== a.count) return b.count - a.count;
-      return b.lastSeenAt.localeCompare(a.lastSeenAt);
-    });
-    const visible = sorted.slice(0, 5);
-    if (activeProject !== "all" && !visible.some(([value]) => value === activeProject)) {
-      const active = sorted.find(([value]) => value === activeProject);
-      if (active) visible.push(active);
-    }
-
-    const total = sorted.reduce((sum, [, project]) => sum + project.count, 0);
-    return [
-      { value: "all", label: "All projects", count: total, title: "All Codex projects" },
-      ...visible.map(([value, project]) => ({
-        value,
-        label: project.label,
-        count: project.count,
-        title: `${project.label}\n${value}`,
-      })),
-    ];
-  }, [activeHost, activeProject, sessions]);
-
-  useEffect(() => {
-    if (activeProvider === "all") return;
-    if (!providerOptions.some((option) => option.value === activeProvider)) setActiveProvider("all");
-  }, [activeProvider, providerOptions]);
-
-  useEffect(() => {
-    if (activeProvider !== "codex" && activeProject !== "all") {
-      setActiveProject("all");
-      return;
-    }
-    if (activeProject === "all") return;
-    if (!projectOptions.some((option) => option.value === activeProject)) setActiveProject("all");
-  }, [activeProject, activeProvider, projectOptions]);
-
-  useEffect(() => {
-    if (activeHost === "all") return;
-    if (!hosts.some((host) => host.agentId === activeHost)) setActiveHost("all");
-  }, [activeHost, hosts]);
-
   const filteredSessions = useMemo(() => {
     const q = query.trim().toLowerCase();
     return sessions.filter((session) => {
-      if (activeHost !== "all" && session.agentId !== activeHost) return false;
-      if (activeProvider !== "all" && providerFilterValue(session) !== activeProvider) return false;
-      if (activeProvider === "codex" && activeProject !== "all" && projectFilterValue(session) !== activeProject) return false;
       if (!q) return true;
       return [
         session.hostname,
@@ -1119,61 +1004,16 @@ export function App() {
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(q));
     });
-  }, [activeHost, activeProject, activeProvider, query, sessions]);
+  }, [query, sessions]);
 
-  useEffect(() => {
-    setVisibleSessionLimit(SIDEBAR_SESSION_PAGE_SIZE);
-  }, [activeHost, activeProject, activeProvider, groupByProject, query]);
-
-  const visibleSessions = useMemo(() => {
-    const visible = filteredSessions.slice(0, visibleSessionLimit);
-    const activeSession = active ? filteredSessions.find((session) => session.id === active.id) : undefined;
-    if (!activeSession || visible.some((session) => session.id === activeSession.id)) return visible;
-    return [activeSession, ...visible];
-  }, [active, filteredSessions, visibleSessionLimit]);
-
-  const hiddenSessionCount = Math.max(0, filteredSessions.length - visibleSessions.length);
   const items = useMemo(() => groupItems(flatten(events)), [events]);
   const yDocIdsToKeepWarm = useMemo(() => sessions.slice(0, 20).map((session) => docIdForSession(session.id)), [sessions]);
-  const groupedSessions = useMemo(() => {
-    if (!groupByProject) {
-      const updatedAt = visibleSessions.reduce((acc, session) => (session.lastSeenAt > acc ? session.lastSeenAt : acc), "");
-      return [{ key: "recent", title: "Recent", sessions: visibleSessions, total: filteredSessions.length, updatedAt }];
-    }
-    const grouped = new Map<string, { title: string; sessions: SessionInfo[]; total: number; updatedAt: string }>();
-    const totals = new Map<string, number>();
-    for (const session of filteredSessions) {
-      const key = projectFilterValue(session);
-      totals.set(key, (totals.get(key) ?? 0) + 1);
-    }
-    for (const session of visibleSessions) {
-      const key = projectFilterValue(session);
-      const group = grouped.get(key) ?? { title: projectLabel(session), sessions: [], total: totals.get(key) ?? 0, updatedAt: "" };
-      group.sessions.push(session);
-      if (session.lastSeenAt > group.updatedAt) group.updatedAt = session.lastSeenAt;
-      grouped.set(key, group);
-    }
-    return [...grouped.entries()]
-      .map(([key, group]) => ({ key, ...group }))
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-  }, [filteredSessions, groupByProject, visibleSessions]);
 
   const selectSession = useCallback((session: SessionInfo) => {
     setActiveSession(session);
     navigateRoute({ chatId: session.id });
     if (window.matchMedia("(max-width: 780px)").matches) setSidebarOpen(false);
   }, [navigateRoute, setActiveSession]);
-
-  const handleSessionListScroll = useCallback(
-    (event: UIEvent<HTMLDivElement>) => {
-      if (hiddenSessionCount <= 0) return;
-      const target = event.currentTarget;
-      const remaining = target.scrollHeight - target.scrollTop - target.clientHeight;
-      if (remaining > 260) return;
-      setVisibleSessionLimit((limit) => Math.min(filteredSessions.length, limit + SIDEBAR_SESSION_PAGE_SIZE));
-    },
-    [filteredSessions.length, hiddenSessionCount],
-  );
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -1230,28 +1070,16 @@ export function App() {
         <SessionSidebar
           sidebarOpen={sidebarOpen}
           sidebarRef={sidebarRef}
-          activeHost={activeHost}
-          activeProvider={activeProvider}
-          activeProject={activeProject}
           active={active}
           query={query}
-          providerOptions={providerOptions}
-          deviceOptions={deviceOptions}
-          projectOptions={activeProvider === "codex" ? projectOptions : []}
-          groupedSessions={groupedSessions}
+          sessions={filteredSessions}
           filteredSessionCount={filteredSessions.length}
-          visibleSessionCount={visibleSessions.length}
-          hiddenSessionCount={hiddenSessionCount}
           duplicateHostnames={duplicateHostnames}
+          groupByProject={groupByProject}
           onClose={() => setSidebarOpen(false)}
           onResizePointerDown={beginSidebarResize}
           onResizeKeyDown={handleSidebarResizeKey}
           onQueryChange={setQuery}
-          onProviderChange={setActiveProvider}
-          onHostChange={setActiveHost}
-          onProjectChange={setActiveProject}
-          onSessionListScroll={handleSessionListScroll}
-          onLoadMore={() => setVisibleSessionLimit((limit) => limit + SIDEBAR_SESSION_PAGE_SIZE)}
           onSelectSession={selectSession}
         />
 
@@ -1260,7 +1088,6 @@ export function App() {
           eventsLength={events.length}
           items={items}
           draft={draft}
-          duplicateHostnames={duplicateHostnames}
           onDraftChange={handleDraftChange}
         />
       </div>

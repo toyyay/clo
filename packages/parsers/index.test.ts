@@ -204,6 +204,44 @@ describe("transcript normalizers", () => {
       parts: [{ kind: "tool_result", id: "call_2", content: "/repo", isError: false }],
     });
 
+    const userMessage = normalizeTranscriptRecord(
+      {
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "render **this** please",
+        },
+      },
+      { provider: "codex" },
+    );
+
+    expect(userMessage).toMatchObject({
+      kind: "message",
+      role: "user",
+      display: true,
+      source: { rawType: "event_msg", rawKind: "user_message" },
+      parts: [{ kind: "text", text: "render **this** please" }],
+    });
+
+    const agentMessage = normalizeTranscriptRecord(
+      {
+        type: "event_msg",
+        payload: {
+          type: "agent_message",
+          message: "Done:\n\n- one\n- two",
+        },
+      },
+      { provider: "codex" },
+    );
+
+    expect(agentMessage).toMatchObject({
+      kind: "message",
+      role: "assistant",
+      display: true,
+      source: { rawType: "event_msg", rawKind: "agent_message" },
+      parts: [{ kind: "text", text: "Done:\n\n- one\n- two" }],
+    });
+
     const meta = normalizeTranscriptRecord(
       {
         type: "session_meta",
