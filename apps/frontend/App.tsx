@@ -39,7 +39,7 @@ import { flatten, groupItems } from "./chat-transcript";
 import { flushClientLogs, installClientLogHandlers, logClientEvent } from "./client-logs";
 import { MainChat } from "./main-chat";
 import { parseRoute, useRoute, type RoutePanel } from "./router";
-import { hostLabel, providerFilterValue, providerLabel } from "./session-utils";
+import { hostLabel, projectFilterValue, projectLabel, providerFilterValue, providerLabel, sessionDisplayTitle } from "./session-utils";
 import { SessionSidebar } from "./session-sidebar";
 import { SettingsModal } from "./settings-modal";
 import {
@@ -48,6 +48,7 @@ import {
   DEVICE_FILTER_STORAGE_KEY,
   GROUP_BY_PROJECT_STORAGE_KEY,
   MIN_SIDEBAR_WIDTH,
+  PROJECT_FILTER_STORAGE_KEY,
   PROVIDER_FILTER_STORAGE_KEY,
   readLocalStorageBoolean,
   readLocalStorageString,
@@ -86,6 +87,7 @@ export function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeHost, setActiveHost] = useState(() => readLocalStorageString(DEVICE_FILTER_STORAGE_KEY, "all"));
   const [activeProvider, setActiveProvider] = useState(() => readLocalStorageString(PROVIDER_FILTER_STORAGE_KEY, "all"));
+  const [activeProject, setActiveProject] = useState(() => readLocalStorageString(PROJECT_FILTER_STORAGE_KEY, "all"));
   const [active, setActive] = useState<SessionInfo | null>(null);
   const [eventState, setEventState] = useState<EventState>({ sessionId: null, events: [] });
   const [query, setQuery] = useState("");
@@ -822,6 +824,10 @@ export function App() {
   }, [activeProvider]);
 
   useEffect(() => {
+    writeLocalStorageValue(PROJECT_FILTER_STORAGE_KEY, activeProject);
+  }, [activeProject]);
+
+  useEffect(() => {
     writeLocalStorageValue(DEVICE_FILTER_STORAGE_KEY, activeHost);
   }, [activeHost]);
 
@@ -1031,10 +1037,56 @@ export function App() {
     ];
   }, [duplicateHostnames, hosts, sessions]);
 
+  const projectOptions = useMemo(() => {
+    const projects = new Map<string, { label: string; count: number; lastSeenAt: string }>();
+    for (const session of sessions) {
+      if (providerFilterValue(session) !== "codex") continue;
+      if (activeHost !== "all" && session.agentId !== activeHost) continue;
+      const value = projectFilterValue(session);
+      const current = projects.get(value);
+      if (current) {
+        current.count += 1;
+        if (session.lastSeenAt > current.lastSeenAt) current.lastSeenAt = session.lastSeenAt;
+      } else {
+        projects.set(value, { label: projectLabel(session), count: 1, lastSeenAt: session.lastSeenAt });
+      }
+    }
+
+    const sorted = [...projects.entries()].sort(([, a], [, b]) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return b.lastSeenAt.localeCompare(a.lastSeenAt);
+    });
+    const visible = sorted.slice(0, 5);
+    if (activeProject !== "all" && !visible.some(([value]) => value === activeProject)) {
+      const active = sorted.find(([value]) => value === activeProject);
+      if (active) visible.push(active);
+    }
+
+    const total = sorted.reduce((sum, [, project]) => sum + project.count, 0);
+    return [
+      { value: "all", label: "All projects", count: total, title: "All Codex projects" },
+      ...visible.map(([value, project]) => ({
+        value,
+        label: project.label,
+        count: project.count,
+        title: `${project.label}\n${value}`,
+      })),
+    ];
+  }, [activeHost, activeProject, sessions]);
+
   useEffect(() => {
     if (activeProvider === "all") return;
     if (!providerOptions.some((option) => option.value === activeProvider)) setActiveProvider("all");
   }, [activeProvider, providerOptions]);
+
+  useEffect(() => {
+    if (activeProvider !== "codex" && activeProject !== "all") {
+      setActiveProject("all");
+      return;
+    }
+    if (activeProject === "all") return;
+    if (!projectOptions.some((option) => option.value === activeProject)) setActiveProject("all");
+  }, [activeProject, activeProvider, projectOptions]);
 
   useEffect(() => {
     if (activeHost === "all") return;
@@ -1046,12 +1098,14 @@ export function App() {
     return sessions.filter((session) => {
       if (activeHost !== "all" && session.agentId !== activeHost) return false;
       if (activeProvider !== "all" && providerFilterValue(session) !== activeProvider) return false;
+      if (activeProvider === "codex" && activeProject !== "all" && projectFilterValue(session) !== activeProject) return false;
       if (!q) return true;
       return [
         session.hostname,
         session.agentId,
         session.projectName,
         session.projectKey,
+        sessionDisplayTitle(session),
         session.title,
         session.sessionId,
         session.sourcePath,
@@ -1065,11 +1119,11 @@ export function App() {
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(q));
     });
-  }, [activeHost, activeProvider, query, sessions]);
+  }, [activeHost, activeProject, activeProvider, query, sessions]);
 
   useEffect(() => {
     setVisibleSessionLimit(SIDEBAR_SESSION_PAGE_SIZE);
-  }, [activeHost, activeProvider, groupByProject, query]);
+  }, [activeHost, activeProject, activeProvider, groupByProject, query]);
 
   const visibleSessions = useMemo(() => {
     const visible = filteredSessions.slice(0, visibleSessionLimit);
@@ -1083,25 +1137,25 @@ export function App() {
   const yDocIdsToKeepWarm = useMemo(() => sessions.slice(0, 20).map((session) => docIdForSession(session.id)), [sessions]);
   const groupedSessions = useMemo(() => {
     if (!groupByProject) {
-      return [{ key: "recent", title: "Recent", sessions: visibleSessions, total: filteredSessions.length }];
+      const updatedAt = visibleSessions.reduce((acc, session) => (session.lastSeenAt > acc ? session.lastSeenAt : acc), "");
+      return [{ key: "recent", title: "Recent", sessions: visibleSessions, total: filteredSessions.length, updatedAt }];
     }
-    const grouped = new Map<string, { title: string; sessions: SessionInfo[]; total: number }>();
+    const grouped = new Map<string, { title: string; sessions: SessionInfo[]; total: number; updatedAt: string }>();
     const totals = new Map<string, number>();
     for (const session of filteredSessions) {
-      const key = session.projectName || session.projectKey || "unknown";
+      const key = projectFilterValue(session);
       totals.set(key, (totals.get(key) ?? 0) + 1);
     }
     for (const session of visibleSessions) {
-      const key = session.projectName || session.projectKey || "unknown";
-      const group = grouped.get(key) ?? { title: key, sessions: [], total: totals.get(key) ?? 0 };
+      const key = projectFilterValue(session);
+      const group = grouped.get(key) ?? { title: projectLabel(session), sessions: [], total: totals.get(key) ?? 0, updatedAt: "" };
       group.sessions.push(session);
+      if (session.lastSeenAt > group.updatedAt) group.updatedAt = session.lastSeenAt;
       grouped.set(key, group);
     }
-    const lastSeen = (list: SessionInfo[]) =>
-      list.reduce((acc, s) => (s.lastSeenAt > acc ? s.lastSeenAt : acc), "");
     return [...grouped.entries()]
       .map(([key, group]) => ({ key, ...group }))
-      .sort((a, b) => lastSeen(b.sessions).localeCompare(lastSeen(a.sessions)));
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }, [filteredSessions, groupByProject, visibleSessions]);
 
   const selectSession = useCallback((session: SessionInfo) => {
@@ -1178,10 +1232,12 @@ export function App() {
           sidebarRef={sidebarRef}
           activeHost={activeHost}
           activeProvider={activeProvider}
+          activeProject={activeProject}
           active={active}
           query={query}
           providerOptions={providerOptions}
           deviceOptions={deviceOptions}
+          projectOptions={activeProvider === "codex" ? projectOptions : []}
           groupedSessions={groupedSessions}
           filteredSessionCount={filteredSessions.length}
           visibleSessionCount={visibleSessions.length}
@@ -1193,6 +1249,7 @@ export function App() {
           onQueryChange={setQuery}
           onProviderChange={setActiveProvider}
           onHostChange={setActiveHost}
+          onProjectChange={setActiveProject}
           onSessionListScroll={handleSessionListScroll}
           onLoadMore={() => setVisibleSessionLimit((limit) => limit + SIDEBAR_SESSION_PAGE_SIZE)}
           onSelectSession={selectSession}

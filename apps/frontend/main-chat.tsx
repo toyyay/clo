@@ -1,6 +1,6 @@
 import type { SessionInfo } from "../../packages/shared/types";
 import { VirtualChat, type RenderItem } from "./chat-transcript";
-import { hostLabel, sessionSourceTitle, sourceGenerationLabel, sourceProviderLabel } from "./session-utils";
+import { hostLabel, sessionDisplayTitle, sessionSourceTitle, sourceGenerationLabel, sourceProviderLabel } from "./session-utils";
 
 type MainChatProps = {
   active: SessionInfo | null;
@@ -19,7 +19,7 @@ export function MainChat({ active, eventsLength, items, draft, duplicateHostname
         <div className="chat">
           <div className="chat-head">
             <div>
-              <div className="chat-title">{active.title || active.sessionId}</div>
+              <div className="chat-title">{sessionDisplayTitle(active)}</div>
               <div className="chat-subtitle">
                 {sourceProviderLabel(active)} / {active.projectName} /{" "}
                 {hostLabel(active.hostname, active.agentId, duplicateHostnames)}

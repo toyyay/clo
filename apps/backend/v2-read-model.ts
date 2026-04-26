@@ -107,18 +107,46 @@ export async function listV2Sessions(sql: SqlTag, agentId?: string): Promise<Ses
         join agents a on a.id = f.agent_id
         left join lateral (
           select jsonb_strip_nulls(jsonb_build_object(
-            'cwd', coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}'),
-            'sessionId', coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}'),
-            'title', coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}')
+            'cwd', (
+              select coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}')
+              from agent_normalized_events e
+              where e.source_file_id = f.id
+                and e.source_generation = f.current_generation
+                and e.event_type in ('meta', 'session', 'event', 'turn')
+                and coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is not null
+              order by e.source_line_no asc nulls last, e.id asc
+              limit 1
+            ),
+            'sessionId', (
+              select coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}')
+              from agent_normalized_events e
+              where e.source_file_id = f.id
+                and e.source_generation = f.current_generation
+                and e.event_type in ('meta', 'session', 'event')
+                and coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}') is not null
+              order by e.source_line_no asc nulls last, e.id asc
+              limit 1
+            ),
+            'title', (
+              select coalesce(
+                e.normalized #>> '{parts,0,data,thread_name}',
+                e.normalized #>> '{parts,0,data,payload,thread_name}',
+                e.normalized #>> '{parts,0,data,payload,message}'
+              )
+              from agent_normalized_events e
+              where e.source_file_id = f.id
+                and e.source_generation = f.current_generation
+                and (
+                  coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null
+                  or e.normalized #>> '{parts,0,data,payload,type}' = 'user_message'
+                )
+              order by
+                case when coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null then 0 else 1 end,
+                e.source_line_no asc nulls last,
+                e.id asc
+              limit 1
+            )
           )) as metadata
-          from agent_normalized_events e
-          where e.source_file_id = f.id
-            and e.source_generation = f.current_generation
-            and e.event_type in ('meta', 'session', 'event')
-          order by coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is null,
-            e.source_line_no asc nulls last,
-            e.id asc
-          limit 1
         ) source_meta on true
         left join agent_normalized_events e
           on e.source_file_id = f.id
@@ -154,18 +182,46 @@ export async function listV2Sessions(sql: SqlTag, agentId?: string): Promise<Ses
         join agents a on a.id = f.agent_id
         left join lateral (
           select jsonb_strip_nulls(jsonb_build_object(
-            'cwd', coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}'),
-            'sessionId', coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}'),
-            'title', coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}')
+            'cwd', (
+              select coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}')
+              from agent_normalized_events e
+              where e.source_file_id = f.id
+                and e.source_generation = f.current_generation
+                and e.event_type in ('meta', 'session', 'event', 'turn')
+                and coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is not null
+              order by e.source_line_no asc nulls last, e.id asc
+              limit 1
+            ),
+            'sessionId', (
+              select coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}')
+              from agent_normalized_events e
+              where e.source_file_id = f.id
+                and e.source_generation = f.current_generation
+                and e.event_type in ('meta', 'session', 'event')
+                and coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}') is not null
+              order by e.source_line_no asc nulls last, e.id asc
+              limit 1
+            ),
+            'title', (
+              select coalesce(
+                e.normalized #>> '{parts,0,data,thread_name}',
+                e.normalized #>> '{parts,0,data,payload,thread_name}',
+                e.normalized #>> '{parts,0,data,payload,message}'
+              )
+              from agent_normalized_events e
+              where e.source_file_id = f.id
+                and e.source_generation = f.current_generation
+                and (
+                  coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null
+                  or e.normalized #>> '{parts,0,data,payload,type}' = 'user_message'
+                )
+              order by
+                case when coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null then 0 else 1 end,
+                e.source_line_no asc nulls last,
+                e.id asc
+              limit 1
+            )
           )) as metadata
-          from agent_normalized_events e
-          where e.source_file_id = f.id
-            and e.source_generation = f.current_generation
-            and e.event_type in ('meta', 'session', 'event')
-          order by coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is null,
-            e.source_line_no asc nulls last,
-            e.id asc
-          limit 1
         ) source_meta on true
         left join agent_normalized_events e
           on e.source_file_id = f.id
@@ -208,18 +264,46 @@ export async function getV2SessionsMeta(sql: SqlTag, sourceFileIds: string[], op
         join agents a on a.id = f.agent_id
         left join lateral (
           select jsonb_strip_nulls(jsonb_build_object(
-            'cwd', coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}'),
-            'sessionId', coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}'),
-            'title', coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}')
+            'cwd', (
+              select coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}')
+              from agent_normalized_events e
+              where e.source_file_id = f.id
+                and e.source_generation = f.current_generation
+                and e.event_type in ('meta', 'session', 'event', 'turn')
+                and coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is not null
+              order by e.source_line_no asc nulls last, e.id asc
+              limit 1
+            ),
+            'sessionId', (
+              select coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}')
+              from agent_normalized_events e
+              where e.source_file_id = f.id
+                and e.source_generation = f.current_generation
+                and e.event_type in ('meta', 'session', 'event')
+                and coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}') is not null
+              order by e.source_line_no asc nulls last, e.id asc
+              limit 1
+            ),
+            'title', (
+              select coalesce(
+                e.normalized #>> '{parts,0,data,thread_name}',
+                e.normalized #>> '{parts,0,data,payload,thread_name}',
+                e.normalized #>> '{parts,0,data,payload,message}'
+              )
+              from agent_normalized_events e
+              where e.source_file_id = f.id
+                and e.source_generation = f.current_generation
+                and (
+                  coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null
+                  or e.normalized #>> '{parts,0,data,payload,type}' = 'user_message'
+                )
+              order by
+                case when coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null then 0 else 1 end,
+                e.source_line_no asc nulls last,
+                e.id asc
+              limit 1
+            )
           )) as metadata
-          from agent_normalized_events e
-          where e.source_file_id = f.id
-            and e.source_generation = f.current_generation
-            and e.event_type in ('meta', 'session', 'event')
-          order by coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is null,
-            e.source_line_no asc nulls last,
-            e.id asc
-          limit 1
         ) source_meta on true
         left join agent_normalized_events e
           on e.source_file_id = f.id
@@ -253,18 +337,46 @@ export async function getV2SessionsMeta(sql: SqlTag, sourceFileIds: string[], op
         join agents a on a.id = f.agent_id
         left join lateral (
           select jsonb_strip_nulls(jsonb_build_object(
-            'cwd', coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}'),
-            'sessionId', coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}'),
-            'title', coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}')
+            'cwd', (
+              select coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}')
+              from agent_normalized_events e
+              where e.source_file_id = f.id
+                and e.source_generation = f.current_generation
+                and e.event_type in ('meta', 'session', 'event', 'turn')
+                and coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is not null
+              order by e.source_line_no asc nulls last, e.id asc
+              limit 1
+            ),
+            'sessionId', (
+              select coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}')
+              from agent_normalized_events e
+              where e.source_file_id = f.id
+                and e.source_generation = f.current_generation
+                and e.event_type in ('meta', 'session', 'event')
+                and coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}') is not null
+              order by e.source_line_no asc nulls last, e.id asc
+              limit 1
+            ),
+            'title', (
+              select coalesce(
+                e.normalized #>> '{parts,0,data,thread_name}',
+                e.normalized #>> '{parts,0,data,payload,thread_name}',
+                e.normalized #>> '{parts,0,data,payload,message}'
+              )
+              from agent_normalized_events e
+              where e.source_file_id = f.id
+                and e.source_generation = f.current_generation
+                and (
+                  coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null
+                  or e.normalized #>> '{parts,0,data,payload,type}' = 'user_message'
+                )
+              order by
+                case when coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null then 0 else 1 end,
+                e.source_line_no asc nulls last,
+                e.id asc
+              limit 1
+            )
           )) as metadata
-          from agent_normalized_events e
-          where e.source_file_id = f.id
-            and e.source_generation = f.current_generation
-            and e.event_type in ('meta', 'session', 'event')
-          order by coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is null,
-            e.source_line_no asc nulls last,
-            e.id asc
-          limit 1
         ) source_meta on true
         left join agent_normalized_events e
           on e.source_file_id = f.id
@@ -307,18 +419,46 @@ export async function getV2Session(sql: SqlTag, sessionId: string): Promise<Sess
     join agents a on a.id = f.agent_id
     left join lateral (
       select jsonb_strip_nulls(jsonb_build_object(
-        'cwd', coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}'),
-        'sessionId', coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}'),
-        'title', coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}')
+        'cwd', (
+          select coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}')
+          from agent_normalized_events e
+          where e.source_file_id = f.id
+            and e.source_generation = f.current_generation
+            and e.event_type in ('meta', 'session', 'event', 'turn')
+            and coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is not null
+          order by e.source_line_no asc nulls last, e.id asc
+          limit 1
+        ),
+        'sessionId', (
+          select coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}')
+          from agent_normalized_events e
+          where e.source_file_id = f.id
+            and e.source_generation = f.current_generation
+            and e.event_type in ('meta', 'session', 'event')
+            and coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}') is not null
+          order by e.source_line_no asc nulls last, e.id asc
+          limit 1
+        ),
+        'title', (
+          select coalesce(
+            e.normalized #>> '{parts,0,data,thread_name}',
+            e.normalized #>> '{parts,0,data,payload,thread_name}',
+            e.normalized #>> '{parts,0,data,payload,message}'
+          )
+          from agent_normalized_events e
+          where e.source_file_id = f.id
+            and e.source_generation = f.current_generation
+            and (
+              coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null
+              or e.normalized #>> '{parts,0,data,payload,type}' = 'user_message'
+            )
+          order by
+            case when coalesce(e.normalized #>> '{parts,0,data,thread_name}', e.normalized #>> '{parts,0,data,payload,thread_name}') is not null then 0 else 1 end,
+            e.source_line_no asc nulls last,
+            e.id asc
+          limit 1
+        )
       )) as metadata
-      from agent_normalized_events e
-      where e.source_file_id = f.id
-        and e.source_generation = f.current_generation
-        and e.event_type in ('meta', 'session', 'event')
-      order by coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is null,
-        e.source_line_no asc nulls last,
-        e.id asc
-      limit 1
     ) source_meta on true
     left join agent_normalized_events e
       on e.source_file_id = f.id
@@ -424,6 +564,8 @@ export function mapV2SessionRow(row: V2SessionRow): SessionInfo {
   const sourcePath = stringValue(row.source_path) ?? "";
   const projectKey = inferProjectKey(provider, sourcePath, metadata);
   const cwd = stringValue(metadata.cwd);
+  const title = nonRedactedString(metadata.title);
+  const sessionId = nonRedactedString(metadata.sessionId) ?? nonRedactedString(metadata.chatId) ?? inferSessionId(sourcePath);
 
   return {
     id: v2SessionId(row.id),
@@ -435,8 +577,8 @@ export function mapV2SessionRow(row: V2SessionRow): SessionInfo {
     sourceId: toId(row.id),
     projectKey,
     projectName: stringValue(metadata.projectName) ?? stringValue(metadata.displayName) ?? (cwd ? basenameFromPath(cwd) : undefined) ?? defaultProjectName(provider, projectKey),
-    sessionId: stringValue(metadata.sessionId) ?? stringValue(metadata.chatId) ?? inferSessionId(sourcePath),
-    title: stringValue(metadata.title) ?? null,
+    sessionId,
+    title: title ? compactTitle(title) : null,
     sourcePath,
     sizeBytes: toNumber(row.size_bytes),
     mtimeMs: row.mtime_ms == null ? 0 : toNumber(row.mtime_ms),
@@ -691,6 +833,17 @@ function numberValue(value: unknown) {
 
 function stringValue(value: unknown) {
   return typeof value === "string" && value.length ? value : undefined;
+}
+
+function nonRedactedString(value: unknown) {
+  const string = stringValue(value);
+  if (!string) return undefined;
+  return /^<redacted(?:[:\s][^>]*)?>$/i.test(string) ? undefined : string;
+}
+
+function compactTitle(value: string) {
+  const oneLine = value.replace(/\s+/g, " ").trim();
+  return oneLine.length > 120 ? `${oneLine.slice(0, 117)}...` : oneLine;
 }
 
 function booleanValue(value: unknown): boolean | null {

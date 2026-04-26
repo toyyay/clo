@@ -87,6 +87,28 @@ describe("v2 read model helpers", () => {
     });
   });
 
+  test("ignores redacted Codex ids and keeps thread names as titles", () => {
+    const session = mapV2SessionRow({
+      id: 8,
+      agent_id: "agent-1",
+      hostname: "workstation",
+      provider: "codex",
+      source_kind: "conversation",
+      current_generation: 1,
+      source_path: "2026/04/26/rollout-2026-04-26T10-11-31-019dc8d7-fe98-7531-bb1f-6d5019833f8b.jsonl",
+      size_bytes: 100n,
+      mtime_ms: 1,
+      git: {},
+      metadata: { cwd: "/Users/example/p/chatview", sessionId: "<redacted>", title: "Улучшить интерфейс чатов" },
+      first_seen_at: "2026-04-26T08:11:34.000Z",
+      last_seen_at: "2026-04-26T08:15:43.000Z",
+      event_count: 80n,
+    });
+
+    expect(session.sessionId).toBe("rollout-2026-04-26T10-11-31-019dc8d7-fe98-7531-bb1f-6d5019833f8b");
+    expect(session.title).toBe("Улучшить интерфейс чатов");
+  });
+
   test("maps normalized event parts into renderable legacy raw payloads", () => {
     const event = mapV2EventRow({
       id: 99,

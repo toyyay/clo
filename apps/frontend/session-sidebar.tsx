@@ -7,6 +7,11 @@ import type {
 import type { SessionInfo } from "../../packages/shared/types";
 import {
   hostLabel,
+  projectLabel,
+  relativeActivityLabel,
+  sessionActivityLabel,
+  sessionActivityTitle,
+  sessionDisplayTitle,
   sessionSourceTitle,
   shortId,
   sourceGenerationLabel,
@@ -25,6 +30,7 @@ export type SidebarSessionGroup = {
   title: string;
   sessions: SessionInfo[];
   total: number;
+  updatedAt?: string;
 };
 
 export function SessionSidebar({
@@ -32,10 +38,12 @@ export function SessionSidebar({
   sidebarRef,
   activeHost,
   activeProvider,
+  activeProject,
   active,
   query,
   providerOptions,
   deviceOptions,
+  projectOptions,
   groupedSessions,
   filteredSessionCount,
   visibleSessionCount,
@@ -47,6 +55,7 @@ export function SessionSidebar({
   onQueryChange,
   onProviderChange,
   onHostChange,
+  onProjectChange,
   onSessionListScroll,
   onLoadMore,
   onSelectSession,
@@ -55,10 +64,12 @@ export function SessionSidebar({
   sidebarRef: RefObject<HTMLElement | null>;
   activeHost: string;
   activeProvider: string;
+  activeProject: string;
   active: SessionInfo | null;
   query: string;
   providerOptions: SidebarFilterOption[];
   deviceOptions: SidebarFilterOption[];
+  projectOptions: SidebarFilterOption[];
   groupedSessions: SidebarSessionGroup[];
   filteredSessionCount: number;
   visibleSessionCount: number;
@@ -70,6 +81,7 @@ export function SessionSidebar({
   onQueryChange: (value: string) => void;
   onProviderChange: (value: string) => void;
   onHostChange: (value: string) => void;
+  onProjectChange: (value: string) => void;
   onSessionListScroll: (event: UIEvent<HTMLDivElement>) => void;
   onLoadMore: () => void;
   onSelectSession: (session: SessionInfo) => void;
@@ -116,6 +128,28 @@ export function SessionSidebar({
             </div>
           </div>
 
+          {projectOptions.length > 1 && (
+            <div className="filter-section">
+              <div className="filter-label">
+                <span>Codex projects</span>
+                <span>top {Math.max(0, projectOptions.length - 1)}</span>
+              </div>
+              <div className="filter-grid project-filter-grid">
+                {projectOptions.map((option) => (
+                  <button
+                    key={option.value}
+                    className={`filter-chip ${activeProject === option.value ? "active" : ""}`}
+                    onClick={() => onProjectChange(option.value)}
+                    title={option.title}
+                  >
+                    <span>{option.label}</span>
+                    <b>{option.count.toLocaleString()}</b>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           <label className="filter-section">
             <div className="filter-label">
               <span>Device</span>
@@ -153,6 +187,7 @@ export function SessionSidebar({
                 <span>
                   {group.sessions.length}
                   {group.total > group.sessions.length ? `/${group.total}` : ""}
+                  {group.updatedAt ? ` · ${relativeActivityLabel(group.updatedAt)}` : ""}
                 </span>
               </div>
               {group.sessions.map((session) => (
@@ -162,13 +197,18 @@ export function SessionSidebar({
                   onClick={() => onSelectSession(session)}
                   title={sessionSourceTitle(session)}
                 >
-                  <span className="session-title">{session.title || session.sessionId.slice(0, 8)}</span>
+                  <span className="session-title-row">
+                    <span className="session-title">{sessionDisplayTitle(session)}</span>
+                    <span className="session-time" title={sessionActivityTitle(session)}>
+                      {sessionActivityLabel(session)}
+                    </span>
+                  </span>
                   <span className="session-meta">
                     {sourceProviderLabel(session)} · {hostLabel(session.hostname, session.agentId, duplicateHostnames)} ·{" "}
                     {session.eventCount.toLocaleString()}
                   </span>
                   <span className="session-source">
-                    {sourceGenerationLabel(session) ? `${sourceGenerationLabel(session)} · ` : ""}
+                    {projectLabel(session)} · {sourceGenerationLabel(session) ? `${sourceGenerationLabel(session)} · ` : ""}
                     {session.sourcePath}
                   </span>
                 </button>
