@@ -1,14 +1,41 @@
 import type { StreamMessage } from "../../packages/shared/types";
 
-export function openIngestStream(onMessage: (message: StreamMessage) => void, onError?: (error: Event) => void) {
+export type StreamHeartbeatMessage = {
+  type: "heartbeat";
+  streamSeq?: number;
+  sentAt?: string;
+  clientCount?: number;
+};
+
+export type IngestStreamHandlers = {
+  onOpen?: (event: Event, readyState: number) => void;
+  onMessage: (message: StreamMessage, readyState: number) => void;
+  onHeartbeat?: (message: StreamHeartbeatMessage, readyState: number) => void;
+  onError?: (error: Event, readyState: number) => void;
+  onMalformed?: (error: unknown, data: string, eventType: "ingest" | "heartbeat") => void;
+};
+
+export function openIngestStream(handlers: IngestStreamHandlers) {
   const source = new EventSource("/api/stream");
+  source.addEventListener("open", (event) => {
+    handlers.onOpen?.(event, source.readyState);
+  });
   source.addEventListener("ingest", (event) => {
     try {
-      onMessage(JSON.parse((event as MessageEvent).data) as StreamMessage);
-    } catch {
-      // Ignore malformed stream messages; the polling sync path remains authoritative.
+      handlers.onMessage(JSON.parse((event as MessageEvent).data) as StreamMessage, source.readyState);
+    } catch (error) {
+      handlers.onMalformed?.(error, (event as MessageEvent).data, "ingest");
     }
   });
-  if (onError) source.addEventListener("error", onError);
+  source.addEventListener("heartbeat", (event) => {
+    try {
+      handlers.onHeartbeat?.(JSON.parse((event as MessageEvent).data) as StreamHeartbeatMessage, source.readyState);
+    } catch (error) {
+      handlers.onMalformed?.(error, (event as MessageEvent).data, "heartbeat");
+    }
+  });
+  source.addEventListener("error", (event) => {
+    handlers.onError?.(event, source.readyState);
+  });
   return () => source.close();
 }

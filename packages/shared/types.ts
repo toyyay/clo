@@ -198,6 +198,9 @@ export type StreamMessage = {
   agentId: string;
   sessionIds: string[];
   acceptedEvents: number;
+  streamSeq?: number;
+  publishedAt?: string;
+  clientCount?: number;
 };
 
 export type YjsSyncDocRequest = {

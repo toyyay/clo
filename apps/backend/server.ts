@@ -83,6 +83,9 @@ const webAuthCookieMaxAge = 60 * 60 * 24 * 30;
 const gitSha = process.env.GIT_SHA ?? "unknown";
 const encoder = new TextEncoder();
 const streamClients = new Set<ReadableStreamDefaultController<Uint8Array>>();
+const streamClientIds = new WeakMap<ReadableStreamDefaultController<Uint8Array>, number>();
+let nextStreamClientId = 1;
+let nextStreamSeq = 1;
 const redactedHeaderNames = new Set(["authorization", "proxy-authorization", "cookie", "set-cookie"]);
 const redactedQueryNames = new Set(["token"]);
 const transcriptionQueue: string[] = [];
@@ -225,10 +228,26 @@ Bun.serve<{ docIds: Set<string> }>({
     "/api/v2/sessions/:id/events": async (req: Request & { params?: { id?: string } }) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;
+      const started = performance.now();
       const fallbackId = new URL(req.url).pathname.match(/^\/api\/v2\/sessions\/([^/]+)\/events$/)?.[1];
       const id = decodeURIComponent(req.params?.id ?? fallbackId ?? "");
       if (!id) return text("missing id", 400);
       const payload = await getReadableSession(id);
+      void logBackendRequestEvent({
+        level: payload ? "info" : "warn",
+        event: payload ? "session.events.result" : "session.events.missing",
+        message: payload ? "served session events" : "session events not found",
+        tags: ["read", "session"],
+        context: {
+          durationMs: Math.round(performance.now() - started),
+          sessionId: id,
+          found: Boolean(payload),
+          eventCount: payload?.events.length ?? 0,
+          sessionEventCount: payload?.session.eventCount ?? null,
+          firstEventId: payload?.events[0]?.id ?? null,
+          lastEventId: payload?.events.at(-1)?.id ?? null,
+        },
+      }, req);
       return payload ? json(payload) : text("session not found", 404);
     },
     "/api/session": async (req: Request) => {
@@ -249,10 +268,17 @@ Bun.serve<{ docIds: Set<string> }>({
       try {
         const result = await sync(body);
         const durationMs = Math.round(performance.now() - started);
-        if (result.hasMore || durationMs > 1000) {
+        if (
+          result.hasMore ||
+          durationMs > 1000 ||
+          result.events.length ||
+          result.sessions.length ||
+          result.hosts.length ||
+          body.metadataOnly !== true
+        ) {
           void logBackendRequestEvent({
             level: "info",
-            event: "sync.batch",
+            event: "sync.result",
             message: "served sync batch",
             tags: ["sync"],
             context: {
@@ -266,6 +292,8 @@ Bun.serve<{ docIds: Set<string> }>({
               hosts: result.hosts.length,
               sessions: result.sessions.length,
               events: result.events.length,
+              sessionIds: result.sessions.map((session) => session.id).slice(0, 25),
+              eventSessionIds: [...new Set(result.events.map((event) => event.sessionDbId))].slice(0, 25),
               approxBytes: result.approxBytes,
               hasMore: result.hasMore,
             },
@@ -326,6 +354,22 @@ Bun.serve<{ docIds: Set<string> }>({
     "/api/agent/v1/inventory": async (req: Request) =>
       handleAgentV1(req, async () => {
         const result = await handleAgentInventory(req, sql);
+        if (result.acceptedFiles || result.deletedFiles || result.fileIds.length) {
+          void logBackendRequestEvent({
+            level: "info",
+            event: "agent.inventory.accepted",
+            message: "accepted agent inventory",
+            tags: ["agent", "stream"],
+            context: {
+              agentId: result.agentId,
+              acceptedFiles: result.acceptedFiles,
+              deletedFiles: result.deletedFiles,
+              fileIds: result.fileIds.map(v2SessionId).slice(0, 50),
+              willPublish: Boolean(result.acceptedFiles || result.deletedFiles),
+              streamClients: streamClients.size,
+            },
+          }, req);
+        }
         if (result.acceptedFiles || result.deletedFiles) {
           publish({
             type: "ingest",
@@ -339,6 +383,24 @@ Bun.serve<{ docIds: Set<string> }>({
     "/api/agent/v1/append": async (req: Request) =>
       handleAgentV1(req, async () => {
         const result = await handleAgentAppend(req, sql);
+        if (result.acceptedEvents || result.acceptedChunks || result.sourceFileId) {
+          void logBackendRequestEvent({
+            level: "info",
+            event: "agent.append.accepted",
+            message: "accepted agent append",
+            tags: ["agent", "stream"],
+            context: {
+              agentId: result.agentId,
+              sourceFileId: result.sourceFileId ?? null,
+              sessionId: result.sourceFileId ? v2SessionId(result.sourceFileId) : null,
+              acceptedChunks: result.acceptedChunks,
+              acceptedEvents: result.acceptedEvents,
+              cursor: result.cursor ?? null,
+              willPublish: Boolean(result.acceptedEvents),
+              streamClients: streamClients.size,
+            },
+          }, req);
+        }
         if (result.acceptedEvents) {
           publish({
             type: "ingest",
@@ -2757,23 +2819,65 @@ function validateBatch(body: IngestBatchRequest) {
 function stream(req: Request) {
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+  const streamClientId = nextStreamClientId++;
+  const openedAt = performance.now();
   const close = () => {
+    if (!streamController && heartbeat === null) return;
     if (streamController) streamClients.delete(streamController);
     if (heartbeat !== null) {
       clearInterval(heartbeat);
       heartbeat = null;
     }
+    void logBackendRequestEvent({
+      level: "info",
+      event: "stream.close",
+      message: "SSE stream closed",
+      tags: ["stream"],
+      context: {
+        streamClientId,
+        durationMs: Math.round(performance.now() - openedAt),
+        clientCount: streamClients.size,
+      },
+    }, req);
     streamController = null;
   };
   const readable = new ReadableStream<Uint8Array>({
     start(controller) {
       streamController = controller;
+      streamClientIds.set(controller, streamClientId);
       streamClients.add(controller);
       controller.enqueue(encoder.encode(": connected\n\n"));
+      void logBackendRequestEvent({
+        level: "info",
+        event: "stream.open",
+        message: "SSE stream opened",
+        tags: ["stream"],
+        context: {
+          streamClientId,
+          clientCount: streamClients.size,
+          heartbeatMs: 25_000,
+        },
+      }, req);
       heartbeat = setInterval(() => {
         try {
-          controller.enqueue(encoder.encode(": ping\n\n"));
+          const message = {
+            type: "heartbeat",
+            streamSeq: nextStreamSeq++,
+            sentAt: new Date().toISOString(),
+            clientCount: streamClients.size,
+          };
+          controller.enqueue(encoder.encode(`event: heartbeat\ndata: ${JSON.stringify(message)}\n\n`));
         } catch {
+          void logBackendRequestEvent({
+            level: "warn",
+            event: "stream.heartbeat.failed",
+            message: "failed to write SSE heartbeat",
+            tags: ["stream"],
+            context: {
+              streamClientId,
+              clientCount: streamClients.size,
+            },
+          }, req);
           close();
         }
       }, 25_000);
@@ -2794,12 +2898,45 @@ function stream(req: Request) {
 }
 
 function publish(message: StreamMessage) {
-  const payload = encoder.encode(`event: ${message.type}\ndata: ${JSON.stringify(message)}\n\n`);
+  const streamSeq = nextStreamSeq++;
+  const publishedAt = new Date().toISOString();
+  const enriched: StreamMessage = { ...message, streamSeq, publishedAt, clientCount: streamClients.size };
+  void logBackendEvent({
+    source: "backend",
+    level: "info",
+    event: "stream.publish",
+    message: "published SSE ingest event",
+    tags: ["stream", "agent"],
+    context: {
+      streamSeq,
+      clientCount: streamClients.size,
+      agentId: message.agentId,
+      sessionIds: message.sessionIds,
+      acceptedEvents: message.acceptedEvents,
+    },
+  });
+  const payload = encoder.encode(`event: ${enriched.type}\ndata: ${JSON.stringify(enriched)}\n\n`);
+  let failedClients = 0;
   for (const controller of [...streamClients]) {
     try {
       controller.enqueue(payload);
     } catch {
+      failedClients += 1;
+      const streamClientId = streamClientIds.get(controller) ?? null;
       streamClients.delete(controller);
+      void logBackendEvent({
+        source: "backend",
+        level: "warn",
+        event: "stream.publish.client_failed",
+        message: "failed to write SSE ingest event to client",
+        tags: ["stream"],
+        context: {
+          streamSeq,
+          streamClientId,
+          failedClients,
+          clientCount: streamClients.size,
+        },
+      });
     }
   }
 }

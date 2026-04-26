@@ -567,6 +567,13 @@ export function App() {
     if (!isAuthenticated) return;
     if (syncing.current) {
       pendingSync.current = mergeSyncOptions(pendingSync.current, options);
+      void logClientEvent(
+        "debug",
+        "sync.queued",
+        null,
+        { requested: options, merged: pendingSync.current, activeId: activeRef.current?.id ?? null },
+        ["sync"],
+      ).catch(() => {});
       return;
     }
     const silent = options.silent === true;
@@ -602,6 +609,31 @@ export function App() {
       markServerReachable();
       const shouldRefreshCache =
         !silent || result.events > 0 || result.hasMore || result.hosts > 0 || result.sessions > 0 || result.metadataFull;
+      void logClientEvent(
+        result.events || result.sessions || result.hosts || result.hasMore || !metadataOnly ? "info" : "debug",
+        "sync.result",
+        null,
+        {
+          durationMs: Math.round(performance.now() - started),
+          metadataOnly,
+          requestedEventMode: eventMode ?? null,
+          resultEventMode: result.eventMode ?? null,
+          events: result.events,
+          batches: result.batches,
+          hosts: result.hosts,
+          sessions: result.sessions,
+          hasMore: result.hasMore,
+          backfillHasMore: result.backfillHasMore,
+          touchedSessionIds: result.touchedSessionIds,
+          activeId: activeRef.current?.id ?? null,
+          activeLoadedEvents:
+            eventStateRef.current.sessionId === activeRef.current?.id ? eventStateRef.current.events.length : null,
+          shouldRefreshCache,
+          cursor: result.cursor,
+          metadataCursor: result.metadataCursor,
+        },
+        ["sync"],
+      ).catch(() => {});
       let refreshedSessions = sessionsRef.current;
       if (shouldRefreshCache) {
         if (metadataOnly) {
@@ -652,6 +684,22 @@ export function App() {
           const loadedEvents = eventStateRef.current.sessionId === current.id ? eventStateRef.current.events.length : 0;
           const activeMetadataChanged = !shallowEqualObject(current, fresh);
           setActiveSession(fresh);
+          void logClientEvent(
+            "debug",
+            "active.metadata_checked",
+            null,
+            {
+              sessionId: current.id,
+              loadedEvents,
+              previousEventCount: current.eventCount,
+              freshEventCount: fresh.eventCount,
+              activeMetadataChanged,
+              willRefresh:
+                navigator.onLine !== false &&
+                (fresh.eventCount > loadedEvents || (activeMetadataChanged && loadedEvents > 0 && fresh.eventCount >= loadedEvents)),
+            },
+            ["sync", "session"],
+          ).catch(() => {});
           if (
             navigator.onLine !== false &&
             (fresh.eventCount > loadedEvents || (activeMetadataChanged && loadedEvents > 0 && fresh.eventCount >= loadedEvents))
@@ -1211,8 +1259,41 @@ export function App() {
   useEffect(() => {
     if (!isAuthenticated) return;
     let timer: number | null = null;
-    const close = openIngestStream(
-      (message) => {
+    const close = openIngestStream({
+      onOpen: (_event, readyState) => {
+        void logClientEvent(
+          "info",
+          "stream.open",
+          null,
+          { readyState, activeId: activeRef.current?.id ?? null, visibilityState: document.visibilityState },
+          ["sync", "stream"],
+        ).catch(() => {});
+      },
+      onMessage: (message, readyState) => {
+        const activeSession = activeRef.current;
+        const activeTouched = Boolean(activeSession && message.sessionIds.includes(activeSession.id));
+        const loadedEvents = activeSession && eventStateRef.current.sessionId === activeSession.id ? eventStateRef.current.events.length : 0;
+        void logClientEvent(
+          "info",
+          "stream.ingest.message",
+          null,
+          {
+            readyState,
+            streamSeq: message.streamSeq ?? null,
+            publishedAt: message.publishedAt ?? null,
+            clientCount: message.clientCount ?? null,
+            agentId: message.agentId,
+            sessionIds: message.sessionIds,
+            acceptedEvents: message.acceptedEvents,
+            activeId: activeSession?.id ?? null,
+            activeTouched,
+            activeLoadedEvents: loadedEvents,
+            activeExpectedEvents: activeSession?.eventCount ?? null,
+            hidden: document.hidden,
+            pendingIngest: pendingIngest.current,
+          },
+          ["sync", "stream"],
+        ).catch(() => {});
         if (!message.sessionIds.length && !message.acceptedEvents) return;
         pendingIngest.current = true;
         if (document.hidden) return;
@@ -1222,17 +1303,72 @@ export function App() {
           pendingIngest.current = false;
           if (message.sessionIds.length) void syncNow({ silent: true, metadataOnly: true });
           void syncNow({ silent: true, metadataOnly: false, eventMode: "forward" });
+          if (activeSession && activeTouched) {
+            void refreshActiveSessionEvents(activeSession.id, "stream_active_session", loadedEvents, activeSession.eventCount).catch((error) => {
+              markServerError(error);
+              void logClientEvent(
+                "warn",
+                "read.session_events.stream_refresh_failed",
+                error instanceof Error ? error.message : String(error),
+                { sessionId: activeSession.id, cachedEvents: loadedEvents, expectedEvents: activeSession.eventCount, error },
+                ["read", "session", "stream"],
+              ).catch(() => {});
+            });
+          }
         }, 300);
       },
-      () => {
-        void logClientEvent("warn", "stream.ingest.error", "ingest stream disconnected", { online: navigator.onLine }, ["sync", "stream"]).catch(() => {});
+      onHeartbeat: (message, readyState) => {
+        void logClientEvent(
+          "debug",
+          "stream.heartbeat",
+          null,
+          {
+            readyState,
+            streamSeq: message.streamSeq ?? null,
+            sentAt: message.sentAt ?? null,
+            clientCount: message.clientCount ?? null,
+            activeId: activeRef.current?.id ?? null,
+          },
+          ["sync", "stream"],
+        ).catch(() => {});
       },
-    );
+      onError: (_event, readyState) => {
+        void logClientEvent(
+          "warn",
+          "stream.ingest.error",
+          "ingest stream disconnected",
+          {
+            readyState,
+            readyStateLabel: eventSourceReadyStateLabel(readyState),
+            online: navigator.onLine,
+            activeId: activeRef.current?.id ?? null,
+            visibilityState: document.visibilityState,
+          },
+          ["sync", "stream"],
+        ).catch(() => {});
+      },
+      onMalformed: (error, data, eventType) => {
+        void logClientEvent(
+          "warn",
+          "stream.message.malformed",
+          error instanceof Error ? error.message : String(error),
+          { eventType, dataPreview: data.slice(0, 500), activeId: activeRef.current?.id ?? null },
+          ["sync", "stream"],
+        ).catch(() => {});
+      },
+    });
     return () => {
       if (timer !== null) window.clearTimeout(timer);
+      void logClientEvent(
+        "info",
+        "stream.close.local",
+        null,
+        { activeId: activeRef.current?.id ?? null, visibilityState: document.visibilityState },
+        ["sync", "stream"],
+      ).catch(() => {});
       close();
     };
-  }, [isAuthenticated, syncNow]);
+  }, [isAuthenticated, markServerError, refreshActiveSessionEvents, syncNow]);
 
   const filteredSessions = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -1432,6 +1568,13 @@ function sameSessionEvents(a: SessionEvent[], b: SessionEvent[]) {
 function sameRawValue(a: unknown, b: unknown) {
   if (a === b) return true;
   return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function eventSourceReadyStateLabel(value: number) {
+  if (value === EventSource.CONNECTING) return "connecting";
+  if (value === EventSource.OPEN) return "open";
+  if (value === EventSource.CLOSED) return "closed";
+  return "unknown";
 }
 
 function errorMessage(error: unknown) {
