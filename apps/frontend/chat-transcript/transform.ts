@@ -3,12 +3,20 @@ import type { FlatPart, RenderItem, TextPart, ToolGroup } from "./types";
 
 export function flatten(events: SessionEvent[]): FlatPart[] {
   const out: FlatPart[] = [];
-  for (const event of events) {
-    const raw = event.raw as any;
-    if (appendLegacyMessage(out, raw)) continue;
-    if (appendNormalizedEvent(out, raw?.normalized, event)) continue;
-    appendNormalizedEvent(out, raw, event);
+  const entries = events.map((event) => ({ event, raw: event.raw as any, parts: flattenEvent(event) }));
+  for (let i = 0; i < entries.length; i += 1) {
+    if (isCodexMessageEcho(entries[i], entries[i - 1]) || isCodexMessageEcho(entries[i], entries[i + 1])) continue;
+    out.push(...entries[i].parts);
   }
+  return out;
+}
+
+function flattenEvent(event: SessionEvent): FlatPart[] {
+  const out: FlatPart[] = [];
+  const raw = event.raw as any;
+  if (appendLegacyMessage(out, raw)) return out;
+  if (appendNormalizedEvent(out, raw?.normalized, event)) return out;
+  appendNormalizedEvent(out, raw, event);
   return out;
 }
 
@@ -77,6 +85,34 @@ function normalizedTextRole(value: unknown): TextPart["role"] | null {
   if (role === "assistant") return "assistant";
   if (role === "user" || role === "tool") return "user";
   return null;
+}
+
+function isCodexMessageEcho(
+  entry: { raw: any; parts: FlatPart[] },
+  neighbor?: { raw: any; parts: FlatPart[] },
+) {
+  if (!neighbor) return false;
+  const source = rawSource(entry.raw);
+  const neighborSource = rawSource(neighbor.raw);
+  if (source.provider !== "codex" || neighborSource.provider !== "codex") return false;
+  if (source.rawType !== "event_msg" || neighborSource.rawType !== "response_item") return false;
+  if (source.rawKind !== "agent_message" && source.rawKind !== "user_message") return false;
+  const signature = textPartsSignature(entry.parts);
+  return signature !== null && signature === textPartsSignature(neighbor.parts);
+}
+
+function rawSource(raw: any) {
+  const source = raw?.normalized?.source ?? raw?.source ?? {};
+  return {
+    provider: String(source.provider ?? "").toLowerCase(),
+    rawType: String(source.rawType ?? source.raw_type ?? "").toLowerCase(),
+    rawKind: String(source.rawKind ?? source.raw_kind ?? "").toLowerCase(),
+  };
+}
+
+function textPartsSignature(parts: FlatPart[]) {
+  if (!parts.length || !parts.every((part) => part.kind === "text")) return null;
+  return JSON.stringify(parts.map((part) => [part.role, part.text]));
 }
 
 export function groupItems(flat: FlatPart[]): RenderItem[] {

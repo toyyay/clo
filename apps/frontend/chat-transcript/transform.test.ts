@@ -56,4 +56,44 @@ describe("chat transcript transform", () => {
     ]);
     expect(groupItems(flat).at(-1)).toMatchObject({ kind: "tool_group" });
   });
+
+  test("hides Codex event_msg echoes when the adjacent response_item has the same text", () => {
+    const flat = flatten([
+      event({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "Done:\n\n- one\n- two" }] },
+        normalized: {
+          role: "assistant",
+          display: true,
+          parts: [{ kind: "text", text: "Done:\n\n- one\n- two" }],
+          source: { provider: "codex", rawType: "event_msg", rawKind: "agent_message" },
+        },
+      }),
+      event({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "Done:\n\n- one\n- two" }] },
+        normalized: {
+          role: "assistant",
+          display: true,
+          parts: [{ kind: "text", text: "Done:\n\n- one\n- two" }],
+          source: { provider: "codex", rawType: "response_item", rawKind: "message" },
+        },
+      }),
+      event({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "Older event-msg-only record" }] },
+        normalized: {
+          role: "assistant",
+          display: true,
+          parts: [{ kind: "text", text: "Older event-msg-only record" }],
+          source: { provider: "codex", rawType: "event_msg", rawKind: "agent_message" },
+        },
+      }),
+    ]);
+
+    expect(flat).toEqual([
+      { kind: "text", role: "assistant", text: "Done:\n\n- one\n- two" },
+      { kind: "text", role: "assistant", text: "Older event-msg-only record" },
+    ]);
+  });
 });
