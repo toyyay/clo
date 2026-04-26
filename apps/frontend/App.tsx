@@ -23,7 +23,6 @@ import {
   getMeta,
   loadCacheStats,
   loadHosts,
-  loadSessionEvents,
   loadSessions,
   resetIndexedDbCache,
   setMeta,
@@ -55,6 +54,8 @@ import {
 } from "./storage-prefs";
 import { fetchSessionEvents, fetchSessionMetadata, pullUpdates, SyncAuthError } from "./sync";
 import { useAudioImports } from "./use-audio-imports";
+import { useSessionEventsCache } from "./use-session-events-cache";
+import { useStartupCache } from "./use-startup-cache";
 import {
   docIdForSession,
   getDraft,
@@ -115,6 +116,7 @@ export function App() {
   const ySocket = useRef<WebSocket | null>(null);
   const yPushTimers = useRef(new Map<string, number>());
   const isAuthenticated = authState === "authenticated";
+  const canShowLocalApp = authState !== "anonymous";
   const settingsOpen = route.panel === "settings";
   const audioOpen = route.panel === "audio";
   const audio = useAudioImports({ isAuthenticated, audioOpen });
@@ -246,6 +248,16 @@ export function App() {
     });
   }, []);
 
+  const ensureSessionEventsTarget = useCallback((sessionId: string) => {
+    setEventState((current) => (current.sessionId === sessionId ? current : { sessionId, events: [] }));
+  }, []);
+
+  const clearActiveLocalSession = useCallback(() => {
+    setSessionEvents(null, []);
+    activeYDocId.current = null;
+    setDraft("");
+  }, [setSessionEvents]);
+
   const refreshActiveSessionEvents = useCallback(async (sessionId: string, reason: string, cachedEvents: number, expectedEvents: number) => {
     if (navigator.onLine === false) return false;
     const readStarted = performance.now();
@@ -300,7 +312,7 @@ export function App() {
       const payload = (await response.json()) as { configured?: boolean; authenticated?: boolean };
       markServerReachable();
       setAuthConfigured(Boolean(payload.configured));
-      setAuthState(payload.authenticated ? "authenticated" : "anonymous");
+      setAuthState((current) => (payload.authenticated ? "authenticated" : current === "authenticated" ? current : "anonymous"));
       setAuthError(payload.configured ? "" : "WEB_TOKEN is not configured on the server.");
       void logClientEvent(
         "info",
@@ -316,17 +328,18 @@ export function App() {
     } catch (error) {
       markServerError(error);
       const cachedSessions = await loadSessions().catch(() => []);
-      if (cachedSessions.length && navigator.onLine === false) {
+      if (cachedSessions.length) {
         setAuthConfigured(true);
-        setAuthState("authenticated");
+        setAuthState((current) => (current === "authenticated" ? current : "cache"));
         setAuthError("");
-        setStatusText("Offline cache");
+        setSyncState(navigator.onLine ? "error" : "offline");
+        setStatusText(navigator.onLine ? "Backend issue; showing cache" : "Offline cache");
       } else {
         setAuthState("anonymous");
         setAuthError("Could not reach the auth endpoint.");
       }
       void logClientEvent(
-        cachedSessions.length && navigator.onLine === false ? "warn" : "error",
+        cachedSessions.length ? "warn" : "error",
         "auth.status.failed",
         error instanceof Error ? error.message : String(error),
         { durationMs: Math.round(performance.now() - started), cachedSessions: cachedSessions.length, online: navigator.onLine, error },
@@ -847,24 +860,20 @@ export function App() {
     };
   }, []);
 
-  useEffect(() => {
-    const setOnlineStatus = () => {
-      setSyncHealth((current) => ({ ...current, online: navigator.onLine }));
-    };
-    const onOffline = () => {
-      setSyncHealth((current) => ({ ...current, online: false, lastError: "Browser is offline" }));
-      if (isAuthenticated) {
-        setSyncState("offline");
-        setStatusText("Offline cache");
-      }
-    };
-    window.addEventListener("online", setOnlineStatus);
-    window.addEventListener("offline", onOffline);
-    return () => {
-      window.removeEventListener("online", setOnlineStatus);
-      window.removeEventListener("offline", onOffline);
-    };
-  }, [isAuthenticated]);
+  useStartupCache({
+    authState,
+    canShowLocalApp,
+    isAuthenticated,
+    checkAuth,
+    refreshCache,
+    setAuthState,
+    setHosts,
+    setSessions,
+    setSyncHealth,
+    setSyncState,
+    setStatusText,
+    syncNow,
+  });
 
   useEffect(() => {
     checkAuth();
@@ -899,85 +908,6 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (!isAuthenticated) return;
-    let disposed = false;
-    const started = performance.now();
-    setSyncState("loading");
-    setStatusText("Loading chat list");
-    const stuckTimer = window.setTimeout(() => {
-      if (disposed) return;
-      setSyncState("error");
-      setStatusText("Chat list is taking too long");
-      void logClientEvent(
-        "error",
-        "cache.initial_hydrate.stuck",
-        "initial chat list hydrate did not finish",
-        { durationMs: Math.round(performance.now() - started) },
-        ["cache", "startup"],
-      ).catch(() => {});
-    }, 20000);
-    withTimeout(refreshCache({ apply: false }), 1200, "browser cache hydrate timed out")
-      .catch(async (error) => {
-        if (disposed) throw error;
-        setStatusText("Loading latest chat list");
-        void logClientEvent(
-          "warn",
-          "cache.initial_hydrate.fallback",
-          error instanceof Error ? error.message : String(error),
-          { durationMs: Math.round(performance.now() - started), fallback: "read-api-metadata" },
-          ["cache", "startup"],
-        ).catch(() => {});
-        const shell = await fetchSessionMetadata();
-        if (disposed) return shell;
-        setHosts((current) => (sameEntityList(current, shell.hosts, (host) => host.agentId) ? current : shell.hosts));
-        setSessions((current) => (sameEntityList(current, shell.sessions, (session) => session.id) ? current : shell.sessions));
-        void cacheShell(shell.hosts, shell.sessions).catch((cacheError) => {
-          void logClientEvent(
-            "warn",
-            "cache.shell_write.failed",
-            cacheError instanceof Error ? cacheError.message : String(cacheError),
-            { error: cacheError },
-            ["cache"],
-          ).catch(() => {});
-        });
-        return shell;
-      })
-      .then((shell) => {
-        if (disposed) return;
-        window.clearTimeout(stuckTimer);
-        setHosts((current) => (sameEntityList(current, shell.hosts, (host) => host.agentId) ? current : shell.hosts));
-        setSessions((current) => (sameEntityList(current, shell.sessions, (session) => session.id) ? current : shell.sessions));
-        setSyncState("idle");
-        setStatusText(shell.sessions.length ? `Loaded ${shell.sessions.length.toLocaleString()} chats` : "No cached chats yet");
-        void logClientEvent(
-          "info",
-          "cache.initial_hydrate.complete",
-          null,
-          {
-            durationMs: Math.round(performance.now() - started),
-            hosts: shell.hosts.length,
-            sessions: shell.sessions.length,
-            readSource: "source" in shell ? shell.source : "indexeddb",
-          },
-          ["cache", "startup"],
-        ).catch(() => {});
-        void syncNow({ silent: true, metadataOnly: true });
-        void syncNow({ silent: true, metadataOnly: false, eventMode: "recent" });
-      })
-      .catch((error) => {
-        if (disposed) return;
-        window.clearTimeout(stuckTimer);
-        setSyncState(navigator.onLine ? "error" : "offline");
-        setStatusText(navigator.onLine ? "Browser cache failed" : "Offline cache failed");
-        console.error(error);
-      });
-    return () => {
-      disposed = true;
-      window.clearTimeout(stuckTimer);
-    };
-  }, [isAuthenticated, refreshCache, syncNow]);
-
-  useEffect(() => {
     activeRef.current = active;
   }, [active]);
 
@@ -990,7 +920,7 @@ export function App() {
   }, [sessions]);
 
   useEffect(() => {
-    if (!isAuthenticated) return;
+    if (!canShowLocalApp) return;
 
     if (!sessions.length) {
       setActiveSession(null);
@@ -1011,7 +941,7 @@ export function App() {
     }
 
     setActiveSession(sessions[0]);
-  }, [isAuthenticated, navigateRoute, route.chatId, route.panel, sessions, setActiveSession]);
+  }, [canShowLocalApp, navigateRoute, route.chatId, route.panel, sessions, setActiveSession]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -1053,6 +983,7 @@ export function App() {
   }, [isAuthenticated]);
 
   const scheduleYjsPush = useCallback((docId: string, sessionDbId: string, doc: Y.Doc, update: Uint8Array) => {
+    if (!isAuthenticated || navigator.onLine === false) return;
     sendYjsSocketUpdate(ySocket.current, docId, sessionDbId, update);
     const current = yPushTimers.current.get(docId);
     if (current) window.clearTimeout(current);
@@ -1061,7 +992,7 @@ export function App() {
       syncDraftDoc(docId, sessionDbId, doc, true).catch((error) => console.error(error));
     }, 500);
     yPushTimers.current.set(docId, timer);
-  }, []);
+  }, [isAuthenticated]);
 
   useEffect(() => {
     return () => {
@@ -1089,107 +1020,24 @@ export function App() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    if (!activeId) {
-      setSessionEvents(null, []);
-      activeYDocId.current = null;
-      setDraft("");
-      return;
-    }
-    const loadForSessionId = activeId;
-    let disposed = false;
-    setEventState((current) =>
-      current.sessionId === loadForSessionId ? current : { sessionId: loadForSessionId, events: [] },
-    );
-    withTimeout(loadSessionEvents(loadForSessionId), 1000, "cached session events timed out")
-      .catch((error) => {
-        void logClientEvent(
-          "warn",
-          "cache.session_events.fallback",
-          error instanceof Error ? error.message : String(error),
-          { sessionId: loadForSessionId, expectedEvents: activeRef.current?.eventCount ?? null },
-          ["cache", "session"],
-        ).catch(() => {});
-        return [] as SessionEvent[];
-      })
-      .then(async (cachedEvents) => {
-        if (disposed || activeRef.current?.id !== loadForSessionId) return;
-        const currentEvents = eventStateRef.current;
-        const hasLiveEvents = currentEvents.sessionId === loadForSessionId && currentEvents.events.length > 0;
-        if (cachedEvents.length && !hasLiveEvents) setSessionEvents(loadForSessionId, cachedEvents);
-        const expectedEvents = activeRef.current?.eventCount ?? 0;
-        if (cachedEvents.length && cachedEvents.length < expectedEvents) {
-          void syncNow({ silent: true, metadataOnly: false, eventMode: "forward" });
-          try {
-            await refreshActiveSessionEvents(loadForSessionId, "cache_behind_metadata", cachedEvents.length, expectedEvents);
-          } catch (error) {
-            markServerError(error);
-            void logClientEvent(
-              "warn",
-              "read.session_events.cache_behind_refresh_failed",
-              error instanceof Error ? error.message : String(error),
-              { sessionId: loadForSessionId, cachedEvents: cachedEvents.length, expectedEvents, error },
-              ["read", "session", "sync"],
-            ).catch(() => {});
-          }
-          return;
-        }
-        if (hasLiveEvents && currentEvents.events.length >= expectedEvents && expectedEvents > 0) {
-          return;
-        }
-        if (cachedEvents.length >= expectedEvents && expectedEvents > 0) {
-          void logClientEvent(
-            "debug",
-            "read.session_events.cache_hit",
-            null,
-            { sessionId: loadForSessionId, cachedEvents: cachedEvents.length, expectedEvents },
-            ["read", "cache", "session"],
-          ).catch(() => {});
-          return;
-        }
-        if (navigator.onLine === false) {
-          void logClientEvent(
-            "info",
-            "read.session_events.offline_cache",
-            null,
-            { sessionId: loadForSessionId, cachedEvents: cachedEvents.length, expectedEvents },
-            ["read", "cache", "session"],
-          ).catch(() => {});
-          return;
-        }
-
-        await refreshActiveSessionEvents(loadForSessionId, "open_session", cachedEvents.length, expectedEvents);
-      })
-      .catch((error) => {
-        markServerError(error);
-        void logClientEvent(
-          "error",
-          "read.session_events.failed",
-          error instanceof Error ? error.message : String(error),
-          { sessionId: loadForSessionId, error },
-          ["read", "session"],
-        ).catch(() => {});
-        console.error(error);
-      });
-    return () => {
-      disposed = true;
-    };
-  }, [
+  useSessionEventsCache({
     activeId,
-    active?.eventCount,
+    expectedEventCount: active?.eventCount,
+    authState,
+    canShowLocalApp,
     isAuthenticated,
-    markServerAttempt,
-    markServerError,
-    markServerReachable,
-    refreshActiveSessionEvents,
-    setActiveSession,
+    activeRef,
+    eventStateRef,
+    ensureSessionEventsTarget,
+    onNoActiveSession: clearActiveLocalSession,
     setSessionEvents,
     syncNow,
-  ]);
+    refreshActiveSessionEvents,
+    markServerError,
+  });
 
   useEffect(() => {
-    if (!isAuthenticated) return;
+    if (!canShowLocalApp) return;
     if (!activeId) return;
     const sessionDbId = activeId;
     const docId = docIdForSession(sessionDbId);
@@ -1212,8 +1060,10 @@ export function App() {
 
         doc.on("update", onUpdate);
         cleanup = () => doc.off("update", onUpdate);
-        await syncDraftDoc(docId, sessionDbId, doc, true);
-        if (!disposed) setDraft(getDraft(doc));
+        if (isAuthenticated) {
+          await syncDraftDoc(docId, sessionDbId, doc, true);
+          if (!disposed) setDraft(getDraft(doc));
+        }
 
         if (disposed) cleanup();
       })
@@ -1225,7 +1075,7 @@ export function App() {
       if (activeYDocId.current === docId) activeYDocId.current = null;
       yDocs.current.delete(docId);
     };
-  }, [activeId, isAuthenticated, scheduleYjsPush]);
+  }, [activeId, canShowLocalApp, isAuthenticated, scheduleYjsPush]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -1426,7 +1276,7 @@ export function App() {
     [activeId],
   );
 
-  if (!isAuthenticated) {
+  if (!canShowLocalApp) {
     return (
       <AuthPage
         authState={authState}

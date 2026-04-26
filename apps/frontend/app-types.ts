@@ -7,7 +7,7 @@ export type SyncHealth = {
   lastSuccessAt: string | null;
   lastError: string | null;
 };
-export type AuthState = "checking" | "authenticated" | "anonymous";
+export type AuthState = "checking" | "authenticated" | "cache" | "anonymous";
 export type EventState = { sessionId: string | null; events: SessionEvent[] };
 export type SyncEventMode = "forward" | "recent" | "backfill";
 export type SyncNowOptions = { silent?: boolean; metadataOnly?: boolean; eventMode?: SyncEventMode };
