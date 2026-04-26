@@ -32,6 +32,14 @@ There are two read models:
 - Legacy Claude model: `chat_sessions` and `session_events`
 - Agent v2 model: `agents`, `agent_source_files`, `agent_raw_chunks`, `agent_normalized_events`, `agent_sync_cursors`
 
+Current product behavior after the legacy quarantine change:
+
+- Legacy tables stay in Postgres for reference and rollback.
+- Default reads and sync ignore `chat_sessions`, `session_events`, and legacy `projects`.
+- Only v2 session ids (`v2:*`) are loaded from browser cache and accepted into the current IndexedDB shell.
+- Legacy readback can be temporarily re-enabled with `LEGACY_READ_ENABLED=true` if we need a debugging escape hatch.
+- Legacy ingest remains separately gated by `LEGACY_INGEST_ENABLED`.
+
 The active current path is v2:
 
 1. The local agent scans provider JSONL roots.

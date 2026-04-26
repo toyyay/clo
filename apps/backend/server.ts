@@ -76,6 +76,7 @@ const openRouterKeyEndpoint = envValue(process.env, "OPENROUTER_KEY_ENDPOINT") ?
 const ffmpegBin = envValue(process.env, "FFMPEG_BIN") ?? "ffmpeg";
 const dataDir = envValue(process.env, "DATA_DIR", "CHATVIEW_DATA_DIR") ?? "";
 const legacyIngestEnabled = envFlag(process.env, ["LEGACY_INGEST_ENABLED", "CHATVIEW_LEGACY_INGEST_ENABLED"]);
+const legacyReadEnabled = envFlag(process.env, ["LEGACY_READ_ENABLED", "CHATVIEW_LEGACY_READ_ENABLED"]);
 const transcriptionConcurrency = envPositiveInteger(process.env, ["TRANSCRIPTION_CONCURRENCY"], 2);
 const webAuthCookie = "chatview_token";
 const webAuthCookieMaxAge = 60 * 60 * 24 * 30;
@@ -1812,17 +1813,20 @@ function sha256Hex(bytes: Uint8Array) {
 }
 
 async function listReadableHosts(): Promise<HostInfo[]> {
+  if (!legacyReadEnabled) return listV2Hosts(sql);
   const [legacyHosts, v2Hosts] = await Promise.all([listHosts(), listV2Hosts(sql)]);
   return mergeHostLists(legacyHosts, v2Hosts);
 }
 
 async function listReadableSessions(agentId?: string): Promise<SessionInfo[]> {
+  if (!legacyReadEnabled) return listV2Sessions(sql, agentId);
   const [legacySessions, v2Sessions] = await Promise.all([listSessions(agentId), listV2Sessions(sql, agentId)]);
   return mergeSessionLists(legacySessions, v2Sessions);
 }
 
 async function getReadableSession(id: string): Promise<SessionPayload | null> {
   if (isV2SessionId(id)) return getV2Session(sql, id);
+  if (!legacyReadEnabled) return null;
   return getSession(id);
 }
 
@@ -2046,10 +2050,11 @@ async function getSession(id: string): Promise<SessionPayload | null> {
 async function sync(body: SyncRequest): Promise<SyncResponse> {
   const limitBytes = clamp(Math.floor(body.limitBytes ?? 2 * 1024 * 1024), 64 * 1024, 16 * 1024 * 1024);
   const cursor = parseSyncCursor(body.cursor);
+  const readableCursor = legacyReadEnabled ? cursor : { legacy: 0n, v2: cursor.v2 };
   if (body.metadataOnly) {
     const metadata = await syncMetadata(body);
     const response: SyncResponse = {
-      cursor: formatSyncCursor(cursor.legacy.toString(), cursor.v2.toString()),
+      cursor: formatSyncCursor(readableCursor.legacy.toString(), readableCursor.v2.toString()),
       hasMore: metadata.hasMore,
       approxBytes: 0,
       metadataCursor: metadata.cursor,
@@ -2073,19 +2078,27 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
       : eventMode === "backfill"
         ? parseBackfillCursor(body.backfillCursor) ?? initialBackfillCursor(await currentEventHighWater())
         : null;
-  const [legacyRows, v2Rows] =
+  const legacyRowsPromise =
+    legacyReadEnabled && eventMode === "forward"
+      ? listLegacyEventsForSync(readableCursor.legacy, fetchLimit)
+      : legacyReadEnabled
+        ? listLegacyEventsForBackfill(initialBackfill!.before.legacy, initialBackfill!.ceiling.legacy, fetchLimit)
+        : Promise.resolve([] as any[]);
+  const v2RowsPromise =
     eventMode === "forward"
-      ? await Promise.all([listLegacyEventsForSync(cursor.legacy, fetchLimit), listV2EventsForSync(sql, cursor.v2, fetchLimit)])
-      : await Promise.all([
-          listLegacyEventsForBackfill(initialBackfill!.before.legacy, initialBackfill!.ceiling.legacy, fetchLimit),
-          listV2EventsForBackfill(sql, initialBackfill!.before.v2, initialBackfill!.ceiling.v2, fetchLimit),
-        ]);
+      ? listV2EventsForSync(sql, readableCursor.v2, fetchLimit)
+      : listV2EventsForBackfill(sql, initialBackfill!.before.v2, initialBackfill!.ceiling.v2, fetchLimit);
+  const [legacyRows, v2Rows] = await Promise.all([legacyRowsPromise, v2RowsPromise]);
 
   const events = [];
   let approxBytes = 2;
   let budgetStopped = false;
-  let nextLegacyCursor = eventMode === "recent" ? (highWater ?? cursor).legacy.toString() : cursor.legacy.toString();
-  let nextV2Cursor = eventMode === "recent" ? (highWater ?? cursor).v2.toString() : cursor.v2.toString();
+  let nextLegacyCursor = legacyReadEnabled
+    ? eventMode === "recent"
+      ? (highWater ?? readableCursor).legacy.toString()
+      : readableCursor.legacy.toString()
+    : "0";
+  let nextV2Cursor = eventMode === "recent" ? (highWater ?? readableCursor).v2.toString() : readableCursor.v2.toString();
   let nextBackfill = initialBackfill;
 
   for (const row of legacyRows) {
@@ -2123,7 +2136,7 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
       : false;
   const hasMore = eventMode === "forward" ? budgetStopped || legacyRows.length === fetchLimit || v2Rows.length === fetchLimit : false;
   const sessionIds = [...new Set(events.map((event) => event.sessionDbId))];
-  const legacySessionIds = sessionIds.filter((id) => !isV2SessionId(id));
+  const legacySessionIds = legacyReadEnabled ? sessionIds.filter((id) => !isV2SessionId(id)) : [];
   const v2SessionIds = new Set(sessionIds.filter(isV2SessionId));
   const [legacySessions, v2Sessions] = await Promise.all([
     legacySessionIds.length ? getSessionsMeta(legacySessionIds) : [],
@@ -2191,8 +2204,11 @@ function mapLegacySyncEvent(row: any) {
 }
 
 async function currentEventHighWater(): Promise<EventCursor> {
+  const legacyRowsPromise = legacyReadEnabled
+    ? sql`select coalesce(max(id), 0)::text as id from session_events`
+    : Promise.resolve([{ id: "0" }]);
   const [legacyRows, v2Rows] = await Promise.all([
-    sql`select coalesce(max(id), 0)::text as id from session_events`,
+    legacyRowsPromise,
     sql`
       select coalesce(max(e.id), 0)::text as id
       from agent_normalized_events e
@@ -2287,7 +2303,7 @@ async function syncMetadata(body: SyncRequest): Promise<{
   const page = rows.slice(0, limit);
   const hasMore = rows.length > limit;
   const hostIds = new Set(page.filter((row) => row.kind === "h").map((row) => row.id));
-  const legacySessionIds = page.filter((row) => row.kind === "l").map((row) => row.id);
+  const legacySessionIds = legacyReadEnabled ? page.filter((row) => row.kind === "l").map((row) => row.id) : [];
   const v2SourceFileIds = page.filter((row) => row.kind === "v").map((row) => row.id);
 
   const [legacySessions, v2Sessions] = await Promise.all([
@@ -2314,34 +2330,55 @@ async function syncFullMetadata(): Promise<{
 }
 
 async function listMetadataChangeKeys(cursor: MetadataChangeKey, limit: number): Promise<MetadataChangeKey[]> {
-  const rows = await sql`
-    with changes as (
-      select 'h'::text as kind, a.id::text as row_id, a.last_seen_at as changed_at
-      from agents a
-      where (a.last_seen_at, 'h'::text, a.id::text) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
-      union all
-      select 'l'::text as kind, s.id::text as row_id, greatest(s.last_seen_at, coalesce(s.deleted_at, s.last_seen_at)) as changed_at
-      from chat_sessions s
-      where (
-        greatest(s.last_seen_at, coalesce(s.deleted_at, s.last_seen_at)),
-        'l'::text,
-        s.id::text
-      ) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
-      union all
-      select 'v'::text as kind, f.id::text as row_id, greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)) as changed_at
-      from agent_source_files f
-      where f.source_kind = 'conversation'
-        and (
-          greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)),
-          'v'::text,
-          f.id::text
-        ) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
-    )
-    select kind, row_id, changed_at
-    from changes
-    order by changed_at asc, kind asc, row_id asc
-    limit ${limit}
-  `;
+  const rows = legacyReadEnabled
+    ? await sql`
+        with changes as (
+          select 'h'::text as kind, a.id::text as row_id, a.last_seen_at as changed_at
+          from agents a
+          where (a.last_seen_at, 'h'::text, a.id::text) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
+          union all
+          select 'l'::text as kind, s.id::text as row_id, greatest(s.last_seen_at, coalesce(s.deleted_at, s.last_seen_at)) as changed_at
+          from chat_sessions s
+          where (
+            greatest(s.last_seen_at, coalesce(s.deleted_at, s.last_seen_at)),
+            'l'::text,
+            s.id::text
+          ) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
+          union all
+          select 'v'::text as kind, f.id::text as row_id, greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)) as changed_at
+          from agent_source_files f
+          where f.source_kind = 'conversation'
+            and (
+              greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)),
+              'v'::text,
+              f.id::text
+            ) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
+        )
+        select kind, row_id, changed_at
+        from changes
+        order by changed_at asc, kind asc, row_id asc
+        limit ${limit}
+      `
+    : await sql`
+        with changes as (
+          select 'h'::text as kind, a.id::text as row_id, a.last_seen_at as changed_at
+          from agents a
+          where (a.last_seen_at, 'h'::text, a.id::text) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
+          union all
+          select 'v'::text as kind, f.id::text as row_id, greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)) as changed_at
+          from agent_source_files f
+          where f.source_kind = 'conversation'
+            and (
+              greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)),
+              'v'::text,
+              f.id::text
+            ) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
+        )
+        select kind, row_id, changed_at
+        from changes
+        order by changed_at asc, kind asc, row_id asc
+        limit ${limit}
+      `;
   return rows.map((row: any) => ({
     kind: row.kind,
     id: String(row.row_id),
@@ -2350,23 +2387,38 @@ async function listMetadataChangeKeys(cursor: MetadataChangeKey, limit: number):
 }
 
 async function currentMetadataCursor() {
-  const rows = await sql`
-    with changes as (
-      select 'h'::text as kind, a.id::text as row_id, a.last_seen_at as changed_at
-      from agents a
-      union all
-      select 'l'::text as kind, s.id::text as row_id, greatest(s.last_seen_at, coalesce(s.deleted_at, s.last_seen_at)) as changed_at
-      from chat_sessions s
-      union all
-      select 'v'::text as kind, f.id::text as row_id, greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)) as changed_at
-      from agent_source_files f
-      where f.source_kind = 'conversation'
-    )
-    select kind, row_id, changed_at
-    from changes
-    order by changed_at desc, kind desc, row_id desc
-    limit 1
-  `;
+  const rows = legacyReadEnabled
+    ? await sql`
+        with changes as (
+          select 'h'::text as kind, a.id::text as row_id, a.last_seen_at as changed_at
+          from agents a
+          union all
+          select 'l'::text as kind, s.id::text as row_id, greatest(s.last_seen_at, coalesce(s.deleted_at, s.last_seen_at)) as changed_at
+          from chat_sessions s
+          union all
+          select 'v'::text as kind, f.id::text as row_id, greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)) as changed_at
+          from agent_source_files f
+          where f.source_kind = 'conversation'
+        )
+        select kind, row_id, changed_at
+        from changes
+        order by changed_at desc, kind desc, row_id desc
+        limit 1
+      `
+    : await sql`
+        with changes as (
+          select 'h'::text as kind, a.id::text as row_id, a.last_seen_at as changed_at
+          from agents a
+          union all
+          select 'v'::text as kind, f.id::text as row_id, greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)) as changed_at
+          from agent_source_files f
+          where f.source_kind = 'conversation'
+        )
+        select kind, row_id, changed_at
+        from changes
+        order by changed_at desc, kind desc, row_id desc
+        limit 1
+      `;
   if (!rows.length) return formatMetadataCursor(initialMetadataCursor());
   return formatMetadataCursor({ kind: rows[0].kind, id: String(rows[0].row_id), at: metadataTimestampString(rows[0].changed_at) });
 }

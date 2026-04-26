@@ -2,6 +2,7 @@ import type { HostInfo, SessionEvent, SessionInfo, SessionPayload, SyncResponse 
 
 const DB_NAME = "chatview-cache";
 const DB_VERSION = 4;
+const CURRENT_SESSION_PREFIX = "v2:";
 
 type StoreName =
   | "meta"
@@ -106,10 +107,13 @@ export async function loadHosts(): Promise<HostInfo[]> {
 export async function loadSessions(): Promise<SessionInfo[]> {
   const db = await openCacheDb();
   const sessions = await request<SessionInfo[]>(db.transaction("sessions").objectStore("sessions").getAll());
-  return sessions.sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
+  return sessions
+    .filter((session) => isCurrentSessionId(session.id))
+    .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
 }
 
 export async function loadSessionEvents(sessionDbId: string): Promise<SessionEvent[]> {
+  if (!isCurrentSessionId(sessionDbId)) return [];
   const db = await openCacheDb();
   const index = db.transaction("events").objectStore("events").index("sessionDbId");
   const events = await request<SessionEvent[]>(index.getAll(IDBKeyRange.only(sessionDbId)));
@@ -130,11 +134,12 @@ export async function applySync(
   const sessions = tx.objectStore("sessions");
   const events = tx.objectStore("events");
   const meta = tx.objectStore("meta");
+  const currentSessions = payload.sessions.filter((session) => isCurrentSessionId(session.id));
   const liveHostIds = new Set(payload.hosts.map((host) => host.agentId));
-  const liveSessionIds = new Set(payload.sessions.filter((session) => !session.deletedAt).map((session) => session.id));
+  const liveSessionIds = new Set(currentSessions.filter((session) => !session.deletedAt).map((session) => session.id));
 
   for (const host of payload.hosts) hosts.put(host);
-  for (const session of payload.sessions) {
+  for (const session of currentSessions) {
     if (session.deletedAt) {
       sessions.delete(session.id);
       queueDeleteEventsForSession(events, session.id);
@@ -157,7 +162,9 @@ export async function applySync(
       cursor.continue();
     };
   }
-  for (const event of payload.events) events.put(event);
+  for (const event of payload.events) {
+    if (isCurrentSessionId(event.sessionDbId)) events.put(event);
+  }
   if (options.storeEventCursor !== false) meta.put({ key: "syncCursor", value: payload.cursor });
   if (payload.backfillCursor) meta.put({ key: "backfillCursor", value: payload.backfillCursor });
   if (payload.metadataCursor) meta.put({ key: "metadataCursor", value: payload.metadataCursor });
@@ -172,10 +179,11 @@ export async function cacheShell(hostsInput: HostInfo[], sessionsInput: SessionI
   const hosts = tx.objectStore("hosts");
   const sessions = tx.objectStore("sessions");
   const events = tx.objectStore("events");
+  const currentSessions = sessionsInput.filter((session) => isCurrentSessionId(session.id));
   const liveHostIds = new Set(hostsInput.map((host) => host.agentId));
-  const liveSessionIds = new Set(sessionsInput.filter((session) => !session.deletedAt).map((session) => session.id));
+  const liveSessionIds = new Set(currentSessions.filter((session) => !session.deletedAt).map((session) => session.id));
   for (const host of hostsInput) hosts.put(host);
-  for (const session of sessionsInput) {
+  for (const session of currentSessions) {
     if (session.deletedAt) {
       sessions.delete(session.id);
       queueDeleteEventsForSession(events, session.id);
@@ -212,6 +220,7 @@ function queueDeleteMissingHosts(hosts: IDBObjectStore, liveHostIds: Set<string>
 }
 
 export async function cacheSessionPayload(payload: SessionPayload) {
+  if (!isCurrentSessionId(payload.session.id)) return;
   const db = await openCacheDb();
   const tx = db.transaction(["sessions", "events"] satisfies StoreName[], "readwrite");
   const sessions = tx.objectStore("sessions");
@@ -220,6 +229,10 @@ export async function cacheSessionPayload(payload: SessionPayload) {
   sessions.put(payload.session);
   for (const event of payload.events) events.put(event);
   await transactionDone(tx);
+}
+
+function isCurrentSessionId(id: string) {
+  return id.startsWith(CURRENT_SESSION_PREFIX);
 }
 
 export async function loadYDocUpdate(docId: string): Promise<CachedYDoc | undefined> {
