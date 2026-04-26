@@ -182,6 +182,7 @@ export async function handleAgentInventory(req: Request, sql: any) {
 
   return {
     ok: true,
+    agentId: agent.agentId,
     acceptedFiles,
     deletedFiles,
     fileIds,
@@ -334,6 +335,7 @@ export async function handleAgentAppend(req: Request, sql: any) {
 
   return {
     ok: true,
+    agentId: agent.agentId,
     sourceFileId,
     acceptedChunks,
     acceptedEvents,

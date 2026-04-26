@@ -60,11 +60,13 @@ export function sessionActivityDateLabel(session: SessionInfo) {
 }
 
 export function sessionActivityTitle(session: SessionInfo) {
+  const sourceModified = formatDateTime(sourceModifiedTimestamp(session));
   const lastSeen = formatDateTime(session.lastSeenAt);
   const firstSeen = formatDateTime(session.firstSeenAt);
   const sourceDate = formatDateTime(timestampFromPath(session.sourcePath));
   return [
-    lastSeen ? `Last changed: ${lastSeen}` : null,
+    sourceModified ? `Source changed: ${sourceModified}` : null,
+    lastSeen ? `Last synced: ${lastSeen}` : null,
     firstSeen ? `First seen: ${firstSeen}` : null,
     sourceDate ? `Source date: ${sourceDate}` : null,
   ]
@@ -73,7 +75,7 @@ export function sessionActivityTitle(session: SessionInfo) {
 }
 
 export function sessionActivityTimestamp(session: SessionInfo) {
-  return session.lastSeenAt || timestampFromPath(session.sourcePath);
+  return sourceModifiedTimestamp(session) || session.lastSeenAt || timestampFromPath(session.sourcePath);
 }
 
 export function sessionArchiveLabel(session: SessionInfo) {
@@ -119,6 +121,12 @@ function timestampFromPath(path: string) {
   const match = path.match(/rollout-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})/);
   if (!match) return null;
   return `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}`;
+}
+
+function sourceModifiedTimestamp(session: SessionInfo) {
+  if (!session.id.startsWith("v2:")) return null;
+  if (!Number.isFinite(session.mtimeMs) || session.mtimeMs <= 0) return null;
+  return new Date(session.mtimeMs).toISOString();
 }
 
 function relativeTime(value?: string | null, now = Date.now()) {

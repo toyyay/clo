@@ -198,7 +198,7 @@ export function SettingsModal({
               Refresh
             </button>
             <button className="icon-button" onClick={onResetIndexedDb} disabled={loading}>
-              Reset IndexedDB
+              Reset all local data
             </button>
             <button className="icon-button" onClick={onClearCaches} disabled={loading}>
               Clear caches

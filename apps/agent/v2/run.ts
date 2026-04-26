@@ -144,14 +144,14 @@ export async function scanAndUploadAgentV2(options: AgentV2RunOptions): Promise<
     identity,
     fetchImpl: options.fetchImpl,
   });
-  const shouldUploadInventory = deletedInventoryFiles.length > 0 || plan.chunks.length > 0;
+  const shouldUploadInventory = deletedInventoryFiles.length > 0;
   if (shouldUploadInventory) {
     await uploadAgentV2Inventory({
       backendUrl: options.backendUrl,
       token: options.token,
       inventoryPath: options.inventoryPath,
       identity,
-      activeFiles: files,
+      activeFiles: [],
       deletedFiles: deletedInventoryFiles,
       fetchImpl: options.fetchImpl,
     });
@@ -179,7 +179,7 @@ export async function scanAndUploadAgentV2(options: AgentV2RunOptions): Promise<
     roots,
     fileCount: files.length,
     pendingRecordCount: countPendingRecords(batches),
-    inventoryFileCount: shouldUploadInventory ? files.length : 0,
+    inventoryFileCount: 0,
     deletedInventoryFileCount: shouldUploadInventory ? deletedInventoryFiles.length : 0,
     plannedChunkCount: plan.chunks.length,
     uploadedChunkCount: plan.chunks.length,

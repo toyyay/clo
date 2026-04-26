@@ -97,7 +97,8 @@ export function SessionSidebar({
     writeTreePrefs(treePrefs);
   }, [treePrefs]);
 
-  const isOpen = useCallback((key: string) => treePrefs.open?.[key] ?? true, [treePrefs.open]);
+  const hasQuery = query.trim().length > 0;
+  const isOpen = useCallback((key: string) => (hasQuery ? true : treePrefs.open?.[key] ?? true), [hasQuery, treePrefs.open]);
   const toggleOpen = useCallback((key: string) => {
     setTreePrefs((current) => ({ ...current, open: { ...current.open, [key]: !(current.open?.[key] ?? true) } }));
   }, []);

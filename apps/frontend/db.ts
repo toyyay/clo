@@ -208,13 +208,10 @@ function queueDeleteMissingHosts(hosts: IDBObjectStore, liveHostIds: Set<string>
 
 export async function cacheSessionPayload(payload: SessionPayload) {
   const db = await openCacheDb();
-  const deleteTx = db.transaction("events", "readwrite");
-  queueDeleteEventsForSession(deleteTx.objectStore("events"), payload.session.id);
-  await transactionDone(deleteTx);
-
   const tx = db.transaction(["sessions", "events"] satisfies StoreName[], "readwrite");
   const sessions = tx.objectStore("sessions");
   const events = tx.objectStore("events");
+  queueDeleteEventsForSession(events, payload.session.id);
   sessions.put(payload.session);
   for (const event of payload.events) events.put(event);
   await transactionDone(tx);

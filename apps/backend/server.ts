@@ -49,6 +49,7 @@ import {
   mergeHostLists,
   mergeSessionLists,
   parseV2SessionId,
+  v2SessionId,
 } from "./v2-read-model";
 import { envFlag, envPositiveInteger, envValue } from "../../packages/shared/env";
 import { prepareDatabase, sql, toId, toNumber } from "./db";
@@ -318,8 +319,32 @@ Bun.serve<{ docIds: Set<string> }>({
       return downloadAgentArchiveResponse(req, agentToken);
     },
     "/api/agent/v1/hello": async (req: Request) => handleAgentV1(req, () => handleAgentHello(req, sql)),
-    "/api/agent/v1/inventory": async (req: Request) => handleAgentV1(req, () => handleAgentInventory(req, sql)),
-    "/api/agent/v1/append": async (req: Request) => handleAgentV1(req, () => handleAgentAppend(req, sql)),
+    "/api/agent/v1/inventory": async (req: Request) =>
+      handleAgentV1(req, async () => {
+        const result = await handleAgentInventory(req, sql);
+        if (result.acceptedFiles || result.deletedFiles) {
+          publish({
+            type: "ingest",
+            agentId: result.agentId,
+            sessionIds: result.fileIds.map(v2SessionId),
+            acceptedEvents: 0,
+          });
+        }
+        return result;
+      }),
+    "/api/agent/v1/append": async (req: Request) =>
+      handleAgentV1(req, async () => {
+        const result = await handleAgentAppend(req, sql);
+        if (result.acceptedEvents) {
+          publish({
+            type: "ingest",
+            agentId: result.agentId,
+            sessionIds: result.sourceFileId ? [v2SessionId(result.sourceFileId)] : [],
+            acceptedEvents: result.acceptedEvents,
+          });
+        }
+        return result;
+      }),
     "/api/app/settings": async (req: Request) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;

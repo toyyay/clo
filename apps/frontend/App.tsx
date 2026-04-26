@@ -41,6 +41,7 @@ import { parseRoute, useRoute, type RoutePanel } from "./router";
 import { sessionDisplayTitle } from "./session-utils";
 import { SessionSidebar } from "./session-sidebar";
 import { SettingsModal } from "./settings-modal";
+import { openIngestStream } from "./stream";
 import {
   clampSidebarWidth,
   DEFAULT_SIDEBAR_WIDTH,
@@ -93,6 +94,7 @@ export function App() {
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState("");
   const syncing = useRef(false);
+  const pendingSync = useRef<SyncNowOptions | null>(null);
   const sidebarRef = useRef<HTMLElement | null>(null);
   const activeRef = useRef<SessionInfo | null>(null);
   const eventStateRef = useRef<EventState>({ sessionId: null, events: [] });
@@ -211,13 +213,21 @@ export function App() {
         ["auth"],
       ).catch(() => {});
     } catch (error) {
-      setAuthState("anonymous");
-      setAuthError("Could not reach the auth endpoint.");
+      const cachedSessions = await loadSessions().catch(() => []);
+      if (cachedSessions.length && navigator.onLine === false) {
+        setAuthConfigured(true);
+        setAuthState("authenticated");
+        setAuthError("");
+        setStatusText("Offline cache");
+      } else {
+        setAuthState("anonymous");
+        setAuthError("Could not reach the auth endpoint.");
+      }
       void logClientEvent(
-        "error",
+        cachedSessions.length && navigator.onLine === false ? "warn" : "error",
         "auth.status.failed",
         error instanceof Error ? error.message : String(error),
-        { durationMs: Math.round(performance.now() - started), error },
+        { durationMs: Math.round(performance.now() - started), cachedSessions: cachedSessions.length, online: navigator.onLine, error },
         ["auth"],
       ).catch(() => {});
       console.error(error);
@@ -357,9 +367,9 @@ export function App() {
       setSessionEvents(null, []);
       setActive(null);
       setDraft("");
-      navigateRoute({}, { replace: true });
+      navigateRoute({ panel: "settings" }, { replace: true });
       await refreshSettings();
-      setSettingsMessage("IndexedDB cache reset");
+      setSettingsMessage("Local data reset");
     } catch (error) {
       setSettingsMessage(error instanceof Error ? error.message : "Could not reset IndexedDB");
     } finally {
@@ -453,7 +463,10 @@ export function App() {
 
   const syncNow = useCallback(async (options: SyncNowOptions = {}) => {
     if (!isAuthenticated) return;
-    if (syncing.current) return;
+    if (syncing.current) {
+      pendingSync.current = mergeSyncOptions(pendingSync.current, options);
+      return;
+    }
     const silent = options.silent === true;
     const metadataOnly = options.metadataOnly !== false;
     syncing.current = true;
@@ -594,6 +607,9 @@ export function App() {
     } finally {
       syncing.current = false;
       void flushClientLogs().catch(() => {});
+      const pending = pendingSync.current;
+      pendingSync.current = null;
+      if (pending) window.setTimeout(() => void syncNow(pending), 0);
     }
   }, [isAuthenticated, navigateRoute, refreshCache, setActiveSession, setSessionEvents]);
 
@@ -760,19 +776,39 @@ export function App() {
 
   useEffect(() => {
     if (!isAuthenticated) return;
-    const socket = openYjsSocket(async (docId, update) => {
-      const doc = yDocs.current.get(docId);
-      if (doc) {
-        Y.applyUpdate(doc, update, "remote");
-        await persistDraftDoc(docId, doc);
-        if (activeYDocId.current === docId) setDraft(getDraft(doc));
-      } else {
-        await mergeCachedDraftUpdate(docId, update);
-      }
-    });
-    ySocket.current = socket;
+    let disposed = false;
+    let reconnectTimer: number | null = null;
+
+    const connect = () => {
+      if (disposed) return;
+      const socket = openYjsSocket(async (docId, update) => {
+        const doc = yDocs.current.get(docId);
+        if (doc) {
+          Y.applyUpdate(doc, update, "remote");
+          await persistDraftDoc(docId, doc);
+          if (activeYDocId.current === docId) setDraft(getDraft(doc));
+        } else {
+          await mergeCachedDraftUpdate(docId, update);
+        }
+      });
+      ySocket.current = socket;
+
+      socket.addEventListener("open", () => {
+        const warmIds = sessionsRef.current.slice(0, 20).map((session) => docIdForSession(session.id));
+        subscribeYjsSocket(socket, [...new Set([...yDocs.current.keys(), ...warmIds])]);
+      });
+      socket.addEventListener("close", () => {
+        if (ySocket.current === socket) ySocket.current = null;
+        if (!disposed) reconnectTimer = window.setTimeout(connect, 1500);
+      });
+      socket.addEventListener("error", () => socket.close());
+    };
+
+    connect();
     return () => {
-      socket.close();
+      disposed = true;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      ySocket.current?.close();
       ySocket.current = null;
     };
   }, [isAuthenticated]);
@@ -954,6 +990,8 @@ export function App() {
     return () => {
       disposed = true;
       cleanup?.();
+      if (activeYDocId.current === docId) activeYDocId.current = null;
+      yDocs.current.delete(docId);
     };
   }, [activeId, isAuthenticated, scheduleYjsPush]);
 
@@ -972,6 +1010,29 @@ export function App() {
       window.clearInterval(id);
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("online", onOnline);
+    };
+  }, [isAuthenticated, syncNow]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    let timer: number | null = null;
+    const close = openIngestStream(
+      (message) => {
+        if (!message.sessionIds.length && !message.acceptedEvents) return;
+        if (document.hidden) return;
+        if (timer !== null) window.clearTimeout(timer);
+        timer = window.setTimeout(() => {
+          timer = null;
+          void syncNow({ silent: true, metadataOnly: true });
+        }, 300);
+      },
+      () => {
+        void logClientEvent("warn", "stream.ingest.error", "ingest stream disconnected", { online: navigator.onLine }, ["sync", "stream"]).catch(() => {});
+      },
+    );
+    return () => {
+      if (timer !== null) window.clearTimeout(timer);
+      close();
     };
   }, [isAuthenticated, syncNow]);
 
@@ -1129,4 +1190,11 @@ export function App() {
       )}
     </div>
   );
+}
+
+function mergeSyncOptions(current: SyncNowOptions | null, next: SyncNowOptions): SyncNowOptions {
+  return {
+    silent: current ? current.silent === true && next.silent === true : next.silent === true,
+    metadataOnly: current?.metadataOnly === false || next.metadataOnly === false ? false : true,
+  };
 }
