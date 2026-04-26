@@ -1,6 +1,6 @@
 # Chatview
 
-Status: this is still a work-in-progress deployment target. No production data is expected to live in this repo yet, and it is fine to rebuild or wipe pre-prod database state while the schema and deploy flow are still settling.
+Status: this is still a work-in-progress deployment target. The public `https://clo.vf.lc` server is staging/development infrastructure, even though some infrastructure names still say `prod`. In project chat, "production" often means this staging deploy. It is fine to rebuild, redeploy, break, or wipe staging database state while the schema and deploy flow are still settling.
 
 Chatview is a local-first viewer for Claude Code, Codex, and Gemini JSONL history collected from multiple machines.
 
@@ -102,6 +102,12 @@ bun run dev:local:agent
 
 Frontend is served by the backend at `http://localhost:3737`.
 
+## Remote Staging
+
+The remote deploy at `https://clo.vf.lc` is the shared staging server. The SSH/deploy target and some files may use the name `prod` for historical reasons, but this is not a protected production environment.
+
+Use this staging server for fast iteration, UI checks, schema changes, and deploy flow testing. It can be rebuilt or reset when needed, and no real production data should be assumed there.
+
 ## iPhone Media Imports
 
 The import endpoint is `POST /api/imports/media` with `?token=...` or `Authorization: Bearer ...`.
@@ -145,4 +151,4 @@ It writes `~/Library/LaunchAgents/com.chatview.agent.plist` and prints the `laun
 
 The frontend is already IndexedDB-backed and works from cached data after the shell has loaded once. A prepared service worker lives at `apps/frontend/service-worker.js`, but the app does not register it yet.
 
-The next step is to add an explicit production asset build and enable service worker registration behind a small feature flag.
+Service worker/PWA activation is intentionally deferred for now so normal web deploys remain simple during active staging development.

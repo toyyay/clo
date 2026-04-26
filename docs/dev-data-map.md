@@ -2,13 +2,13 @@
 
 Snapshot date: 2026-04-26
 
-This document summarizes the real dev/staging data behind `https://clo.vf.lc`. The SSH/deploy target is named `prod`, but for this project it is the develop/staging VPS. Raw exports and agent analysis files live under local `data/dev-prod-2026-04-26/`, which is intentionally ignored by git.
+This document summarizes the real dev/staging data behind `https://clo.vf.lc`. The SSH/deploy target is named `prod`, but for this project it is the development/staging VPS. In project conversation, "production" usually means this remote staging deploy unless explicitly stated otherwise. Raw exports and agent analysis files live under local `data/dev-prod-2026-04-26/`, which is intentionally ignored by git; the `dev-prod` name is historical and still refers to staging data.
 
 No conversation content is reproduced here. The downloaded raw samples were treated as untrusted data, with long strings truncated before subagent analysis.
 
 ## Where The Data Lives
 
-Remote dev server:
+Remote staging/development server:
 
 - Deploy directory: `/root/clo`
 - App data directory: `/root/clo/data`
