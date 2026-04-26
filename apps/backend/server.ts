@@ -2755,13 +2755,33 @@ function validateBatch(body: IngestBatchRequest) {
 }
 
 function stream(req: Request) {
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
+  let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+  const close = () => {
+    if (streamController) streamClients.delete(streamController);
+    if (heartbeat !== null) {
+      clearInterval(heartbeat);
+      heartbeat = null;
+    }
+    streamController = null;
+  };
   const readable = new ReadableStream<Uint8Array>({
     start(controller) {
+      streamController = controller;
       streamClients.add(controller);
       controller.enqueue(encoder.encode(": connected\n\n"));
-      req.signal.addEventListener("abort", () => streamClients.delete(controller), { once: true });
+      heartbeat = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode(": ping\n\n"));
+        } catch {
+          close();
+        }
+      }, 25_000);
+      req.signal.addEventListener("abort", close, { once: true });
     },
-    cancel() {},
+    cancel() {
+      close();
+    },
   });
 
   return new Response(readable, {

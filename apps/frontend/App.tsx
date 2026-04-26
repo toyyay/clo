@@ -104,6 +104,7 @@ export function App() {
   const [settingsMessage, setSettingsMessage] = useState("");
   const syncing = useRef(false);
   const pendingSync = useRef<SyncNowOptions | null>(null);
+  const pendingIngest = useRef(false);
   const backfillTimer = useRef<number | null>(null);
   const sidebarRef = useRef<HTMLElement | null>(null);
   const activeRef = useRef<SessionInfo | null>(null);
@@ -244,6 +245,50 @@ export function App() {
       return { sessionId, events: nextEvents };
     });
   }, []);
+
+  const refreshActiveSessionEvents = useCallback(async (sessionId: string, reason: string, cachedEvents: number, expectedEvents: number) => {
+    if (navigator.onLine === false) return false;
+    const readStarted = performance.now();
+    void logClientEvent(
+      "debug",
+      "read.session_events.start",
+      null,
+      { sessionId, cachedEvents, expectedEvents, reason },
+      ["read", "session"],
+    ).catch(() => {});
+    markServerAttempt();
+    const payload = await fetchSessionEvents(sessionId);
+    if (activeRef.current?.id !== sessionId) return false;
+    markServerReachable();
+    const sessionForCache = payload.session ?? activeRef.current;
+    if (payload.session) setActiveSession(payload.session);
+    setSessionEvents(sessionId, payload.events);
+    if (sessionForCache) {
+      void cacheSessionPayload({ session: sessionForCache, events: payload.events }).catch((cacheError) => {
+        void logClientEvent(
+          "warn",
+          "cache.session_write.failed",
+          cacheError instanceof Error ? cacheError.message : String(cacheError),
+          { sessionId, events: payload.events.length, error: cacheError },
+          ["cache", "session"],
+        ).catch(() => {});
+      });
+    }
+    void logClientEvent(
+      "info",
+      "read.session_events.complete",
+      null,
+      {
+        sessionId,
+        source: payload.source,
+        events: payload.events.length,
+        durationMs: Math.round(performance.now() - readStarted),
+        reason,
+      },
+      ["read", "session"],
+    ).catch(() => {});
+    return true;
+  }, [markServerAttempt, markServerReachable, setActiveSession, setSessionEvents]);
 
   const checkAuth = useCallback(async () => {
     const started = performance.now();
@@ -604,11 +649,33 @@ export function App() {
           if (parseRoute().chatId === current.id) navigateRoute({}, { replace: true });
           console.warn("active session no longer available", current.id);
         } else if (metadataOnly) {
+          const loadedEvents = eventStateRef.current.sessionId === current.id ? eventStateRef.current.events.length : 0;
+          const activeMetadataChanged = !shallowEqualObject(current, fresh);
           setActiveSession(fresh);
+          if (
+            navigator.onLine !== false &&
+            (fresh.eventCount > loadedEvents || (activeMetadataChanged && loadedEvents > 0 && fresh.eventCount >= loadedEvents))
+          ) {
+            try {
+              await refreshActiveSessionEvents(current.id, "metadata_changed", loadedEvents, fresh.eventCount);
+            } catch (error) {
+              markServerError(error);
+              void logClientEvent(
+                "warn",
+                "read.session_events.metadata_refresh_failed",
+                error instanceof Error ? error.message : String(error),
+                { sessionId: current.id, cachedEvents: loadedEvents, expectedEvents: fresh.eventCount, error },
+                ["read", "session", "sync"],
+              ).catch(() => {});
+            }
+          }
         } else if (result.touchedSessionIds.includes(current.id)) {
-          const loadedSessionId = current.id;
-          const nextEvents = await loadSessionEvents(loadedSessionId);
-          if (activeRef.current?.id === loadedSessionId) setSessionEvents(loadedSessionId, nextEvents);
+          await refreshActiveSessionEvents(
+            current.id,
+            "sync_touched_session",
+            eventStateRef.current.sessionId === current.id ? eventStateRef.current.events.length : 0,
+            fresh.eventCount,
+          );
         }
       }
       const durationMs = Math.round(performance.now() - started);
@@ -1005,7 +1072,19 @@ export function App() {
         if (cachedEvents.length && !hasLiveEvents) setSessionEvents(loadForSessionId, cachedEvents);
         const expectedEvents = activeRef.current?.eventCount ?? 0;
         if (cachedEvents.length && cachedEvents.length < expectedEvents) {
-          void syncNow({ silent: true, metadataOnly: false, eventMode: "backfill" });
+          void syncNow({ silent: true, metadataOnly: false, eventMode: "forward" });
+          try {
+            await refreshActiveSessionEvents(loadForSessionId, "cache_behind_metadata", cachedEvents.length, expectedEvents);
+          } catch (error) {
+            markServerError(error);
+            void logClientEvent(
+              "warn",
+              "read.session_events.cache_behind_refresh_failed",
+              error instanceof Error ? error.message : String(error),
+              { sessionId: loadForSessionId, cachedEvents: cachedEvents.length, expectedEvents, error },
+              ["read", "session", "sync"],
+            ).catch(() => {});
+          }
           return;
         }
         if (hasLiveEvents && currentEvents.events.length >= expectedEvents && expectedEvents > 0) {
@@ -1032,44 +1111,7 @@ export function App() {
           return;
         }
 
-        const readStarted = performance.now();
-        void logClientEvent(
-          "debug",
-          "read.session_events.start",
-          null,
-          { sessionId: loadForSessionId, cachedEvents: cachedEvents.length, expectedEvents },
-          ["read", "session"],
-        ).catch(() => {});
-        markServerAttempt();
-        const payload = await fetchSessionEvents(loadForSessionId);
-        if (disposed || activeRef.current?.id !== loadForSessionId) return;
-        markServerReachable();
-        const sessionForCache = payload.session ?? activeRef.current;
-        if (payload.session) setActiveSession(payload.session);
-        setSessionEvents(loadForSessionId, payload.events);
-        if (sessionForCache) {
-          void cacheSessionPayload({ session: sessionForCache, events: payload.events }).catch((cacheError) => {
-            void logClientEvent(
-              "warn",
-              "cache.session_write.failed",
-              cacheError instanceof Error ? cacheError.message : String(cacheError),
-              { sessionId: loadForSessionId, events: payload.events.length, error: cacheError },
-              ["cache", "session"],
-            ).catch(() => {});
-          });
-        }
-        void logClientEvent(
-          "info",
-          "read.session_events.complete",
-          null,
-          {
-            sessionId: loadForSessionId,
-            source: payload.source,
-            events: payload.events.length,
-            durationMs: Math.round(performance.now() - readStarted),
-          },
-          ["read", "session"],
-        ).catch(() => {});
+        await refreshActiveSessionEvents(loadForSessionId, "open_session", cachedEvents.length, expectedEvents);
       })
       .catch((error) => {
         markServerError(error);
@@ -1092,6 +1134,7 @@ export function App() {
     markServerAttempt,
     markServerError,
     markServerReachable,
+    refreshActiveSessionEvents,
     setActiveSession,
     setSessionEvents,
     syncNow,
@@ -1142,10 +1185,21 @@ export function App() {
       if (!document.hidden) syncNow({ silent: true, metadataOnly: true });
     }, 5000);
     const onVisible = () => {
-      if (!document.hidden) syncNow({ silent: true, metadataOnly: true });
+      if (document.hidden) return;
+      if (pendingIngest.current) {
+        pendingIngest.current = false;
+        void syncNow({ silent: true, metadataOnly: false, eventMode: "forward" });
+      }
+      void syncNow({ silent: true, metadataOnly: true });
     };
     document.addEventListener("visibilitychange", onVisible);
-    const onOnline = () => syncNow({ silent: true, metadataOnly: true });
+    const onOnline = () => {
+      if (pendingIngest.current) {
+        pendingIngest.current = false;
+        void syncNow({ silent: true, metadataOnly: false, eventMode: "forward" });
+      }
+      void syncNow({ silent: true, metadataOnly: true });
+    };
     window.addEventListener("online", onOnline);
     return () => {
       window.clearInterval(id);
@@ -1160,10 +1214,13 @@ export function App() {
     const close = openIngestStream(
       (message) => {
         if (!message.sessionIds.length && !message.acceptedEvents) return;
+        pendingIngest.current = true;
         if (document.hidden) return;
         if (timer !== null) window.clearTimeout(timer);
         timer = window.setTimeout(() => {
           timer = null;
+          pendingIngest.current = false;
+          if (message.sessionIds.length) void syncNow({ silent: true, metadataOnly: true });
           void syncNow({ silent: true, metadataOnly: false, eventMode: "forward" });
         }, 300);
       },
@@ -1356,9 +1413,25 @@ function mergeSyncEventMode(current?: SyncNowOptions["eventMode"], next?: SyncNo
 function sameSessionEvents(a: SessionEvent[], b: SessionEvent[]) {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i += 1) {
-    if (a[i].id !== b[i].id || a[i].lineNo !== b[i].lineNo || a[i].offset !== b[i].offset) return false;
+    if (
+      a[i].id !== b[i].id ||
+      a[i].lineNo !== b[i].lineNo ||
+      a[i].offset !== b[i].offset ||
+      a[i].eventType !== b[i].eventType ||
+      a[i].role !== b[i].role ||
+      a[i].createdAt !== b[i].createdAt ||
+      a[i].ingestedAt !== b[i].ingestedAt ||
+      !sameRawValue(a[i].raw, b[i].raw)
+    ) {
+      return false;
+    }
   }
   return true;
+}
+
+function sameRawValue(a: unknown, b: unknown) {
+  if (a === b) return true;
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 function errorMessage(error: unknown) {
