@@ -62,6 +62,14 @@ function openRouterStatusLabel(settings: AppSettingsInfo | null) {
   return "missing";
 }
 
+function openRouterSummary(settings: AppSettingsInfo | null) {
+  const openRouter = settings?.openRouter;
+  const configured = openRouter?.configured ? "configured" : "not configured";
+  const model = openRouter?.model ?? "unknown model";
+  const reasoning = openRouter?.reasoningEffort ?? "medium";
+  return `${configured} / ${model} / ${reasoning}`;
+}
+
 function ModalFrame({
   title,
   children,
@@ -166,34 +174,34 @@ export function SettingsModal({
           <div className="section-title">OpenRouter</div>
           <div className={`service-status ${openRouterStatusLabel(settings)}`}>
             <span>{openRouterStatusLabel(settings)}</span>
-            <b>{openRouter?.message ?? "OPENROUTER_API_KEY is not configured"}</b>
-          </div>
-          <div className="kv-grid">
-            <span>Configured</span>
-            <b>{openRouter?.configured ? "yes" : "no"}</b>
-            <span>Model</span>
-            <b>{openRouter?.model ?? "unknown"}</b>
-            <span>Reasoning</span>
-            <b>{openRouter?.reasoningEffort ?? "medium"}</b>
-            <span>Key label</span>
-            <b>{openRouterKey?.label ?? (openRouter?.configured ? "unknown" : "missing")}</b>
-            <span>Limit remaining</span>
-            <b>{openRouterReady ? formatLimit(openRouterKey?.limitRemaining) : "not available"}</b>
-            <span>Usage</span>
-            <b>{openRouterReady ? formatNumber(openRouterKey?.usage) : "not available"}</b>
-            <span>Rate limit</span>
             <b>
-              {typeof openRouterKey?.rateLimit?.requests === "number" && openRouterKey.rateLimit.requests > 0
-                ? `${openRouterKey.rateLimit.requests.toLocaleString()} / ${openRouterKey.rateLimit.interval ?? "window"}`
-                : "not available"}
+              {openRouter?.message ?? "OPENROUTER_API_KEY is not configured"}
+              <small>{openRouterSummary(settings)}</small>
             </b>
-            <span>Checked</span>
-            <b>{formatDate(openRouter?.checkedAt)}</b>
           </div>
-          <div className="settings-actions">
+          <div className="settings-actions settings-actions-tight">
             <button className="icon-button" onClick={onCheckOpenRouter} disabled={loading}>
               Check OpenRouter
             </button>
+            <details className="settings-details">
+              <summary>Details</summary>
+              <div className="kv-grid kv-grid-compact">
+                <span>Key</span>
+                <b>{openRouterKey?.label ?? (openRouter?.configured ? "unknown" : "missing")}</b>
+                <span>Limit</span>
+                <b>{openRouterReady ? formatLimit(openRouterKey?.limitRemaining) : "not available"}</b>
+                <span>Usage</span>
+                <b>{openRouterReady ? formatNumber(openRouterKey?.usage) : "not available"}</b>
+                <span>Rate</span>
+                <b>
+                  {typeof openRouterKey?.rateLimit?.requests === "number" && openRouterKey.rateLimit.requests > 0
+                    ? `${openRouterKey.rateLimit.requests.toLocaleString()} / ${openRouterKey.rateLimit.interval ?? "window"}`
+                    : "not available"}
+                </b>
+                <span>Checked</span>
+                <b>{formatDate(openRouter?.checkedAt)}</b>
+              </div>
+            </details>
           </div>
         </div>
 
@@ -205,7 +213,7 @@ export function SettingsModal({
               <b>Group chats by project</b>
             </span>
           </label>
-          <div className="kv-grid">
+          <div className="kv-grid kv-grid-compact">
             <span>Sidebar width</span>
             <b>{sidebarWidth}px</b>
           </div>
@@ -232,7 +240,7 @@ export function SettingsModal({
               aria-label="Retention days"
             />
           </label>
-          <div className="kv-grid">
+          <div className="kv-grid kv-grid-compact">
             <span>Local window</span>
             <b>
               {formatCacheRecords(cacheStats)} / {formatBytes(cacheStats?.storageUsageBytes)}
@@ -247,7 +255,7 @@ export function SettingsModal({
 
         <div className="settings-section">
           <div className="section-title">Muted</div>
-          <div className="kv-grid">
+          <div className="kv-grid kv-grid-compact">
             <span>Sources</span>
             <b>
               {mutedSummary.device.toLocaleString()} devices / {mutedSummary.provider.toLocaleString()} providers / {mutedSummary.session.toLocaleString()} chats
@@ -280,7 +288,7 @@ export function SettingsModal({
 
         <div className="settings-section">
           <div className="section-title">Cache</div>
-          <div className="kv-grid">
+          <div className="kv-grid kv-grid-compact">
             <span>Storage</span>
             <b>
               {formatBytes(cacheStats?.storageUsageBytes)} / {formatBytes(cacheStats?.storageQuotaBytes)}

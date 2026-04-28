@@ -2,12 +2,12 @@
 html, body, #root { height: 100%; margin: 0; }
 :root {
   color-scheme: light;
-  --bg: #f6f7f9;
+  --bg: #f5f6f7;
   --panel: #ffffff;
-  --panel-2: #f0f2f5;
-  --text: #17191d;
-  --muted: #68707d;
-  --line: #dfe3e8;
+  --panel-2: #eef0f2;
+  --text: #101215;
+  --muted: #4e5661;
+  --line: #c8cdd3;
   --accent: #0b66d0;
   --accent-soft: #e8f1ff;
   --danger: #c93f3f;
@@ -143,7 +143,7 @@ pre {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  background: color-mix(in srgb, var(--panel) 96%, transparent);
   border-bottom: 1px solid var(--line);
   backdrop-filter: blur(14px);
 }
@@ -609,6 +609,74 @@ body.resizing-sidebar {
 }
 @media (hover: none), (pointer: coarse) {
   .tree-action {
+    opacity: 1;
+  }
+}
+
+@media (monochrome), (prefers-contrast: more), (update: slow) {
+  :root {
+    --bg: #f7f7f7;
+    --panel: #ffffff;
+    --panel-2: #f3f3f3;
+    --text: #050505;
+    --muted: #303030;
+    --line: #8f8f8f;
+    --accent: #000000;
+    --accent-soft: #eeeeee;
+    --danger: #000000;
+    --shadow: none;
+  }
+  :root[data-theme="dark"] {
+    --bg: #f7f7f7;
+    --panel: #ffffff;
+    --panel-2: #f3f3f3;
+    --text: #050505;
+    --muted: #303030;
+    --line: #8f8f8f;
+    --accent: #000000;
+    --accent-soft: #eeeeee;
+    --danger: #000000;
+    --shadow: none;
+  }
+  body {
+    background: #f7f7f7;
+  }
+  .topbar,
+  .chat-head {
+    background: var(--panel);
+    backdrop-filter: none;
+  }
+  .modal-backdrop {
+    background: rgba(255, 255, 255, 0.94);
+  }
+  .modal-panel,
+  .sidebar,
+  .main,
+  .bubble,
+  .detail,
+  .url-row,
+  .toggle-row,
+  .settings-range,
+  .service-status,
+  .icon-button,
+  .search,
+  .composer textarea {
+    box-shadow: none;
+    border-color: var(--line);
+  }
+  .sync-dot,
+  .archive-dot {
+    outline: 1px solid var(--text);
+  }
+  .build-badge,
+  .muted-text,
+  .tree-meta,
+  .tree-time,
+  .chat-date,
+  .chat-source,
+  .active-inline,
+  .sync-detail {
+    color: var(--muted);
     opacity: 1;
   }
 }
@@ -1108,10 +1176,10 @@ body.resizing-sidebar {
   display: grid;
   place-items: center;
   padding: 18px;
-  background: rgba(0, 0, 0, 0.35);
+  background: rgba(0, 0, 0, 0.28);
 }
 .modal-panel {
-  width: min(920px, 100%);
+  width: min(760px, 100%);
   max-height: min(82vh, 820px);
   display: flex;
   flex-direction: column;
@@ -1136,7 +1204,7 @@ body.resizing-sidebar {
 .modal-body {
   min-height: 0;
   overflow-y: auto;
-  padding: 10px;
+  padding: 8px 10px;
 }
 .compact-button {
   min-height: 28px;
@@ -1145,28 +1213,28 @@ body.resizing-sidebar {
 }
 .settings-section {
   display: grid;
-  gap: 8px;
-  padding: 10px 0;
+  gap: 6px;
+  padding: 8px 0;
   border-bottom: 1px solid var(--line);
 }
 .settings-section:first-child { padding-top: 0; }
 .settings-section:last-child { border-bottom: 0; }
 .section-title {
-  color: var(--muted);
-  font-size: 12px;
+  color: var(--text);
+  font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
 }
 .url-list {
   display: grid;
-  gap: 6px;
+  gap: 4px;
 }
 .url-row {
   display: grid;
   grid-template-columns: minmax(120px, 190px) minmax(0, 1fr) auto;
-  gap: 8px;
+  gap: 6px;
   align-items: center;
-  padding: 7px;
+  padding: 5px 6px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--panel-2);
@@ -1199,9 +1267,13 @@ body.resizing-sidebar {
 .kv-grid {
   display: grid;
   grid-template-columns: minmax(110px, auto) minmax(0, 1fr);
-  gap: 5px 10px;
+  gap: 4px 10px;
   align-items: start;
-  font-size: 13px;
+  font-size: 12px;
+}
+.kv-grid-compact {
+  grid-template-columns: minmax(76px, auto) minmax(0, 1fr);
+  gap: 3px 8px;
 }
 .kv-grid span { color: var(--muted); }
 .kv-grid b {
@@ -1212,18 +1284,19 @@ body.resizing-sidebar {
 .service-status {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
-  gap: 8px;
+  gap: 7px;
   align-items: center;
-  padding: 7px;
+  padding: 5px 6px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--panel-2);
-  font-size: 13px;
+  font-size: 12px;
 }
 .service-status span {
-  min-width: 70px;
-  padding: 2px 6px;
-  border-radius: 999px;
+  min-width: 58px;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
   text-align: center;
   font-size: 11px;
   font-weight: 700;
@@ -1232,7 +1305,14 @@ body.resizing-sidebar {
 }
 .service-status b {
   min-width: 0;
+  display: grid;
+  gap: 1px;
   overflow-wrap: anywhere;
+  font-weight: 600;
+}
+.service-status small {
+  color: var(--muted);
+  font-size: 11px;
   font-weight: 600;
 }
 .service-status.ready span { color: #1a6e36; }
@@ -1246,15 +1326,38 @@ body.resizing-sidebar {
   flex-wrap: wrap;
   gap: 6px;
 }
+.settings-actions-tight {
+  align-items: flex-start;
+  gap: 5px;
+}
+.settings-details {
+  min-width: min(100%, 300px);
+}
+.settings-details summary {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.settings-details[open] summary {
+  margin-bottom: 5px;
+  background: var(--panel-2);
+}
 .toggle-row {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 7px;
+  gap: 7px;
+  padding: 5px 6px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--panel-2);
-  font-size: 13px;
+  font-size: 12px;
 }
 .toggle-row input {
   width: 16px;
@@ -1264,13 +1367,13 @@ body.resizing-sidebar {
 .settings-range {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 74px;
-  gap: 7px 10px;
+  gap: 5px 8px;
   align-items: center;
-  padding: 7px;
+  padding: 5px 6px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--panel-2);
-  font-size: 13px;
+  font-size: 12px;
 }
 .settings-range span {
   grid-column: 1 / -1;
@@ -1289,7 +1392,7 @@ body.resizing-sidebar {
 }
 .settings-range input[type="number"] {
   width: 74px;
-  min-height: 30px;
+  min-height: 28px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--panel);
@@ -1300,9 +1403,9 @@ body.resizing-sidebar {
   font-weight: 700;
 }
 .modal-message {
-  margin-top: 8px;
+  margin-top: 4px;
   color: var(--accent);
-  font-size: 13px;
+  font-size: 12px;
 }
 .modal-error {
   color: var(--danger);
