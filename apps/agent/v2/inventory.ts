@@ -2,7 +2,7 @@ import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, relative, sep } from "node:path";
 import { matchesPolicyPath } from "../../../packages/sync-core";
-import type { AppendJsonlCursor, InventoryFile, ProviderKind, SyncRootConfig } from "./types";
+import type { AppendJsonlCursor, InventoryFile, InventoryScanResult, ProviderKind, SyncRootConfig } from "./types";
 
 const DEFAULT_PROVIDER_ROOTS: Record<ProviderKind, string> = {
   claude: join(homedir(), ".claude", "projects"),
@@ -18,48 +18,87 @@ export function defaultSyncRoots(): SyncRootConfig[] {
 }
 
 export async function scanInventory(roots: SyncRootConfig[], globalIgnorePatterns: string[] = []): Promise<InventoryFile[]> {
+  return (await scanInventoryWithStatus(roots, globalIgnorePatterns)).files;
+}
+
+export async function scanInventoryWithStatus(
+  roots: SyncRootConfig[],
+  globalIgnorePatterns: string[] = [],
+): Promise<InventoryScanResult> {
   const files: InventoryFile[] = [];
+  const rootScans: InventoryScanResult["roots"] = [];
 
   for (const root of roots) {
-    const rootStat = await stat(root.rootPath).catch(() => undefined);
-    if (!rootStat?.isDirectory()) continue;
+    let rootStat: Awaited<ReturnType<typeof stat>>;
+    try {
+      rootStat = await stat(root.rootPath);
+    } catch (error) {
+      rootScans.push({
+        provider: root.provider,
+        rootPath: root.rootPath,
+        authoritative: false,
+        reason: isNodeError(error) && error.code === "ENOENT" ? "missing" : "read_error",
+      });
+      continue;
+    }
+    if (!rootStat.isDirectory()) {
+      rootScans.push({
+        provider: root.provider,
+        rootPath: root.rootPath,
+        authoritative: false,
+        reason: "not_directory",
+      });
+      continue;
+    }
 
     const ignorePatterns = [...globalIgnorePatterns, ...(root.ignorePatterns ?? [])];
-    await walkRoot(root, root.rootPath, ignorePatterns, files);
+    const authoritative = await walkRoot(root, root.rootPath, ignorePatterns, files);
+    rootScans.push({
+      provider: root.provider,
+      rootPath: root.rootPath,
+      authoritative,
+      reason: authoritative ? "ok" : "read_error",
+    });
   }
 
   files.sort((a, b) => a.sourcePath.localeCompare(b.sourcePath));
-  return files;
+  return { files, roots: rootScans };
 }
 
-async function walkRoot(root: SyncRootConfig, dir: string, ignorePatterns: string[], out: InventoryFile[]) {
+async function walkRoot(root: SyncRootConfig, dir: string, ignorePatterns: string[], out: InventoryFile[]): Promise<boolean> {
   let entries;
   try {
     entries = await readdir(dir, { withFileTypes: true });
   } catch {
-    return;
+    return false;
   }
 
+  let complete = true;
   for (const entry of entries) {
     const sourcePath = join(dir, entry.name);
     const relativePath = relative(root.rootPath, sourcePath).split(sep).join("/");
     if (matchesIgnore(entry.name, ignorePatterns, relativePath, sourcePath)) continue;
     if (entry.isDirectory()) {
-      await walkRoot(root, sourcePath, ignorePatterns, out);
+      complete = (await walkRoot(root, sourcePath, ignorePatterns, out)) && complete;
       continue;
     }
     if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
 
     const fileStat = await stat(sourcePath).catch(() => undefined);
-    if (!fileStat?.isFile()) continue;
+    if (!fileStat?.isFile()) {
+      complete = false;
+      continue;
+    }
     out.push(inventoryFileForPath(root, sourcePath, relativePath, fileStat.size, fileStat.mtimeMs, fileStat.dev, fileStat.ino));
   }
+  return complete;
 }
 
 export function missingInventoryFilesFromCursors(
   cursors: Record<string, AppendJsonlCursor>,
   roots: SyncRootConfig[],
   activeFiles: InventoryFile[],
+  options: { allowLegacyTombstones?: boolean } = {},
 ): InventoryFile[] {
   const activeSourcePaths = new Set(activeFiles.map((file) => file.sourcePath));
   const missing: InventoryFile[] = [];
@@ -70,11 +109,17 @@ export function missingInventoryFilesFromCursors(
     const root = roots.find((candidate) => relativePathWithinRoot(candidate.rootPath, sourcePath) != null);
     const file = root
       ? inventoryFileForRootPath(root, sourcePath, cursor)
-      : legacyInventoryFileForSourcePath(sourcePath, cursor);
+      : options.allowLegacyTombstones
+        ? legacyInventoryFileForSourcePath(sourcePath, cursor)
+        : null;
     if (file) missing.push(file);
   }
 
   return missing.sort((a, b) => a.sourcePath.localeCompare(b.sourcePath));
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }
 
 export function matchesIgnore(name: string, patterns: string[], relativePath = name, sourcePath = relativePath): boolean {

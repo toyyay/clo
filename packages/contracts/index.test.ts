@@ -34,12 +34,24 @@ const agent: AgentV2Identity = {
   platform: "darwin",
   arch: "arm64",
   version: "test",
+  runtimeId: "runtime-test",
+  pid: 123,
+  startedAt: now,
 };
 
 describe("agent v1 sync contracts", () => {
   test("validates the production hello request and response envelope", () => {
     const request: AgentHelloRequest = {
       agent,
+      runtime: {
+        runtimeId: agent.runtimeId,
+        pid: agent.pid,
+        startedAt: agent.startedAt,
+        takeover: true,
+      },
+      control: {
+        takeover: true,
+      },
       capabilities: {
         inventory: true,
         appendJsonlCursors: true,
@@ -53,6 +65,21 @@ describe("agent v1 sync contracts", () => {
       protocol: CHAT_SYNC_PROTOCOL,
       serverTime: now,
       agentId: agent.agentId,
+      runtimeId: agent.runtimeId,
+      control: {
+        action: "continue",
+        activeRuntimes: [
+          {
+            runtimeId: "old-runtime",
+            agentId: "agent-old",
+            hostname: "workstation",
+            pid: 122,
+            startedAt: now,
+            lastSeenAt: now,
+            status: "shutdown",
+          },
+        ],
+      },
       policy,
     };
 

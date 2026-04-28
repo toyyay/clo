@@ -31,6 +31,7 @@ import {
   type OpenRouterReasoningEffort,
 } from "../../packages/shared/types";
 import { downloadAgentArchiveResponse } from "./agent-download";
+import { cloAgentBundleResponse, cloInstallScriptResponse, cloManifestResponse, cloRunnerResponse } from "./clo-bootstrap";
 import { handleClientLogRequest, listAppLogs, logBackendEvent, logBackendRequestEvent } from "./app-logs";
 import {
   handleAgentAppend,
@@ -207,24 +208,25 @@ Bun.serve<{ docIds: Set<string> }>({
     "/api/hosts": async (req: Request) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;
-      return json(await listReadableHosts());
+      const cutoff = retentionCutoffFromRequest(req);
+      return json(await listReadableHosts(cutoff));
     },
     "/api/sessions": async (req: Request) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;
       const url = new URL(req.url);
-      return json(await listReadableSessions(url.searchParams.get("agentId") ?? undefined));
+      return json(await listReadableSessions(url.searchParams.get("agentId") ?? undefined, retentionCutoffFromRequest(req)));
     },
     "/api/v2/hosts": async (req: Request) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;
-      return json(await listReadableHosts());
+      return json(await listReadableHosts(retentionCutoffFromRequest(req)));
     },
     "/api/v2/sessions": async (req: Request) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;
       const url = new URL(req.url);
-      return json(await listReadableSessions(url.searchParams.get("agentId") ?? undefined));
+      return json(await listReadableSessions(url.searchParams.get("agentId") ?? undefined, retentionCutoffFromRequest(req)));
     },
     "/api/v2/sessions/:id/events": async (req: Request & { params?: { id?: string } }) => {
       const auth = requireWebAuth(req);
@@ -233,7 +235,7 @@ Bun.serve<{ docIds: Set<string> }>({
       const fallbackId = new URL(req.url).pathname.match(/^\/api\/v2\/sessions\/([^/]+)\/events$/)?.[1];
       const id = decodeURIComponent(req.params?.id ?? fallbackId ?? "");
       if (!id) return text("missing id", 400);
-      const payload = await getReadableSession(id);
+      const payload = await getReadableSession(id, retentionCutoffFromRequest(req));
       void logBackendRequestEvent({
         level: payload ? "info" : "warn",
         event: payload ? "session.events.result" : "session.events.missing",
@@ -257,7 +259,7 @@ Bun.serve<{ docIds: Set<string> }>({
       const url = new URL(req.url);
       const id = url.searchParams.get("id");
       if (!id) return text("missing id", 400);
-      const payload = await getReadableSession(id);
+      const payload = await getReadableSession(id, retentionCutoffFromRequest(req));
       return payload ? json(payload) : text("session not found", 404);
     },
     "/api/sync": async (req: Request) => {
@@ -351,7 +353,44 @@ Bun.serve<{ docIds: Set<string> }>({
       if (auth) return auth;
       return downloadAgentArchiveResponse(req, agentToken);
     },
-    "/api/agent/v1/hello": async (req: Request) => handleAgentV1(req, () => handleAgentHello(req, sql)),
+    "/clo/manifest": async (req: Request) => cloManifestResponse(req, agentToken),
+    "/clo/clo-agent.js": async (req: Request) => cloAgentBundleResponse(req, agentToken),
+    "/clo/clo.js": async (req: Request) => cloRunnerResponse(req),
+    "/clo/install.sh": (req: Request) => cloInstallScriptResponse(req),
+    "/api/agent/runtimes": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      if (req.method !== "GET") return text("method not allowed", 405);
+      return json(await listAgentRuntimes(req));
+    },
+    "/api/agent/runtimes/:runtimeId/shutdown": async (req: Request & { params?: { runtimeId?: string } }) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      if (req.method !== "POST") return text("method not allowed", 405);
+      const fallbackId = new URL(req.url).pathname.match(/^\/api\/agent\/runtimes\/([^/]+)\/shutdown$/)?.[1];
+      const runtimeId = decodeURIComponent(req.params?.runtimeId ?? fallbackId ?? "");
+      if (!runtimeId) return text("missing runtimeId", 400);
+      const result = await requestAgentRuntimeShutdown(runtimeId, req);
+      return json(result.body, result.status);
+    },
+    "/api/agent/v1/hello": async (req: Request) =>
+      handleAgentV1(req, async () => {
+        const result = await handleAgentHello(req, sql);
+        void logBackendRequestEvent({
+          level: result.control?.action === "shutdown" ? "warn" : "info",
+          event: "agent.hello",
+          message: "registered agent hello",
+          tags: ["agent", "control"],
+          context: {
+            agentId: result.agentId,
+            runtimeId: result.runtimeId ?? null,
+            controlAction: result.control?.action ?? null,
+            controlReason: result.control?.reason ?? null,
+            activeRuntimes: result.control?.activeRuntimes ?? [],
+          },
+        }, req);
+        return result;
+      }),
     "/api/agent/v1/inventory": async (req: Request) =>
       handleAgentV1(req, async () => {
         const result = await handleAgentInventory(req, sql);
@@ -526,6 +565,71 @@ function text(value: string, status = 200) {
   return new Response(value, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 }
 
+async function listAgentRuntimes(req: Request) {
+  const url = new URL(req.url);
+  const hostname = url.searchParams.get("hostname");
+  const activeOnly = url.searchParams.get("active") !== "false";
+  const rows = await sql`
+    select runtime_id, agent_id, hostname, pid, started_at, process_started_at, last_seen_at, status,
+           takeover, shutdown_requested_at, shutdown_reason, replaced_by_runtime_id
+    from agent_runtimes
+    where (${hostname}::text is null or hostname = ${hostname})
+      and (${activeOnly}::boolean is false or status = 'active')
+    order by last_seen_at desc
+    limit 200
+  `;
+  return { runtimes: rows.map(mapAgentRuntimeRow) };
+}
+
+async function requestAgentRuntimeShutdown(runtimeId: string, req: Request): Promise<{ status: number; body: unknown }> {
+  const body = (await req.json().catch(() => ({}))) as { reason?: unknown };
+  const reason = typeof body.reason === "string" && body.reason.trim()
+    ? body.reason.trim().slice(0, 500)
+    : "shutdown requested from server";
+  const rows = await sql`
+    update agent_runtimes
+    set status = 'shutdown',
+        shutdown_requested_at = coalesce(shutdown_requested_at, now()),
+        shutdown_reason = ${reason},
+        updated_at = now()
+    where runtime_id = ${runtimeId}
+    returning runtime_id, agent_id, hostname, pid, started_at, process_started_at, last_seen_at, status,
+              takeover, shutdown_requested_at, shutdown_reason, replaced_by_runtime_id
+  `;
+  if (!rows[0]) return { status: 404, body: { ok: false, error: "runtime not found" } };
+
+  const runtime = mapAgentRuntimeRow(rows[0]);
+  void logBackendRequestEvent({
+    level: "warn",
+    event: "agent.runtime.shutdown_requested",
+    message: "requested agent runtime shutdown",
+    tags: ["agent", "control"],
+    context: runtime,
+  }, req);
+  return { status: 200, body: { ok: true, runtime } };
+}
+
+function mapAgentRuntimeRow(row: any) {
+  return {
+    runtimeId: row.runtime_id,
+    agentId: row.agent_id,
+    hostname: row.hostname,
+    pid: row.pid == null ? null : Number(row.pid),
+    startedAt: dateString(row.started_at),
+    processStartedAt: dateString(row.process_started_at),
+    lastSeenAt: dateString(row.last_seen_at),
+    status: row.status,
+    takeover: Boolean(row.takeover),
+    shutdownRequestedAt: dateString(row.shutdown_requested_at),
+    shutdownReason: row.shutdown_reason ?? null,
+    replacedByRuntimeId: row.replaced_by_runtime_id ?? null,
+  };
+}
+
+function dateString(value: unknown) {
+  return value instanceof Date ? value.toISOString() : typeof value === "string" ? value : null;
+}
+
 async function handleAgentV1(req: Request, handler: () => Promise<unknown>) {
   if (req.method !== "POST") return text("method not allowed", 405);
   if (!isAuthorized(req)) return text("unauthorized", 401);
@@ -535,6 +639,7 @@ async function handleAgentV1(req: Request, handler: () => Promise<unknown>) {
   } catch (error) {
     const message = error instanceof Error ? error.message : "bad request";
     const status = isSyncEngineHttpError(error) ? error.status : 500;
+    if (isSyncEngineHttpError(error) && error.payload) return json(error.payload, status);
     return text(message, status);
   }
 }
@@ -1875,25 +1980,26 @@ function sha256Hex(bytes: Uint8Array) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-async function listReadableHosts(): Promise<HostInfo[]> {
-  if (!legacyReadEnabled) return listV2Hosts(sql);
-  const [legacyHosts, v2Hosts] = await Promise.all([listHosts(), listV2Hosts(sql)]);
+async function listReadableHosts(cutoffIso?: string | null): Promise<HostInfo[]> {
+  if (!legacyReadEnabled) return listV2Hosts(sql, cutoffIso);
+  const [legacyHosts, v2Hosts] = await Promise.all([listHosts(cutoffIso), listV2Hosts(sql, cutoffIso)]);
   return mergeHostLists(legacyHosts, v2Hosts);
 }
 
-async function listReadableSessions(agentId?: string): Promise<SessionInfo[]> {
-  if (!legacyReadEnabled) return listV2Sessions(sql, agentId);
-  const [legacySessions, v2Sessions] = await Promise.all([listSessions(agentId), listV2Sessions(sql, agentId)]);
+async function listReadableSessions(agentId?: string, cutoffIso?: string | null): Promise<SessionInfo[]> {
+  if (!legacyReadEnabled) return listV2Sessions(sql, agentId, { cutoffIso });
+  const [legacySessions, v2Sessions] = await Promise.all([listSessions(agentId, cutoffIso), listV2Sessions(sql, agentId, { cutoffIso })]);
   return mergeSessionLists(legacySessions, v2Sessions);
 }
 
-async function getReadableSession(id: string): Promise<SessionPayload | null> {
-  if (isV2SessionId(id)) return getV2Session(sql, id);
+async function getReadableSession(id: string, cutoffIso?: string | null): Promise<SessionPayload | null> {
+  if (isV2SessionId(id)) return getV2Session(sql, id, { cutoffIso });
   if (!legacyReadEnabled) return null;
-  return getSession(id);
+  return getSession(id, cutoffIso);
 }
 
-async function listHosts(): Promise<HostInfo[]> {
+async function listHosts(cutoffIso?: string | null): Promise<HostInfo[]> {
+  const cutoff = cutoffIso ?? null;
   const rows = await sql`
     select
       a.id,
@@ -1907,8 +2013,12 @@ async function listHosts(): Promise<HostInfo[]> {
       count(distinct s.id) as session_count,
       count(e.id) as event_count
     from agents a
-    left join chat_sessions s on s.agent_id = a.id
-    left join session_events e on e.session_db_id = s.id
+    left join chat_sessions s
+      on s.agent_id = a.id
+      and (${cutoff}::timestamptz is null or s.last_seen_at >= ${cutoff}::timestamptz)
+    left join session_events e
+      on e.session_db_id = s.id
+      and (${cutoff}::timestamptz is null or e.occurred_at >= ${cutoff}::timestamptz)
     group by a.id
     order by a.last_seen_at desc
   `;
@@ -1927,7 +2037,8 @@ async function listHosts(): Promise<HostInfo[]> {
   }));
 }
 
-async function listSessions(agentId?: string): Promise<SessionInfo[]> {
+async function listSessions(agentId?: string, cutoffIso?: string | null): Promise<SessionInfo[]> {
+  const cutoff = cutoffIso ?? null;
   const rows = agentId
     ? await sql`
         select
@@ -1959,9 +2070,12 @@ async function listSessions(agentId?: string): Promise<SessionInfo[]> {
         from chat_sessions s
         join agents a on a.id = s.agent_id
         join projects p on p.id = s.project_id
-        left join session_events e on e.session_db_id = s.id
+        left join session_events e
+          on e.session_db_id = s.id
+          and (${cutoff}::timestamptz is null or e.occurred_at >= ${cutoff}::timestamptz)
         where s.agent_id = ${agentId}
           and s.deleted_at is null
+          and (${cutoff}::timestamptz is null or s.last_seen_at >= ${cutoff}::timestamptz)
         group by s.id, a.hostname, p.project_key, p.display_name
         order by s.last_seen_at desc
       `
@@ -1995,8 +2109,11 @@ async function listSessions(agentId?: string): Promise<SessionInfo[]> {
         from chat_sessions s
         join agents a on a.id = s.agent_id
         join projects p on p.id = s.project_id
-        left join session_events e on e.session_db_id = s.id
+        left join session_events e
+          on e.session_db_id = s.id
+          and (${cutoff}::timestamptz is null or e.occurred_at >= ${cutoff}::timestamptz)
         where s.deleted_at is null
+          and (${cutoff}::timestamptz is null or s.last_seen_at >= ${cutoff}::timestamptz)
         group by s.id, a.hostname, p.project_key, p.display_name
         order by s.last_seen_at desc
       `;
@@ -2004,9 +2121,10 @@ async function listSessions(agentId?: string): Promise<SessionInfo[]> {
   return rows.map(mapSession);
 }
 
-async function getSessionsMeta(ids: string[]): Promise<SessionInfo[]> {
+async function getSessionsMeta(ids: string[], cutoffIso?: string | null): Promise<SessionInfo[]> {
   const uniqueIds = [...new Set(ids.map(String).filter((id) => /^\d+$/.test(id)))];
   if (!uniqueIds.length) return [];
+  const cutoff = cutoffIso ?? null;
   const rows = await sql`
     select
       s.id,
@@ -2037,8 +2155,11 @@ async function getSessionsMeta(ids: string[]): Promise<SessionInfo[]> {
     from chat_sessions s
     join agents a on a.id = s.agent_id
     join projects p on p.id = s.project_id
-    left join session_events e on e.session_db_id = s.id
+    left join session_events e
+      on e.session_db_id = s.id
+      and (${cutoff}::timestamptz is null or e.occurred_at >= ${cutoff}::timestamptz)
     where s.id = any(${postgresBigintArrayLiteral(uniqueIds)}::bigint[])
+      and (${cutoff}::timestamptz is null or s.last_seen_at >= ${cutoff}::timestamptz or s.deleted_at >= ${cutoff}::timestamptz)
     group by s.id, a.hostname, p.project_key, p.display_name
   `;
   const byId = new Map(rows.map((row: any) => [toId(row.id), mapSession(row)] as const));
@@ -2049,7 +2170,8 @@ function postgresBigintArrayLiteral(values: string[]) {
   return `{${values.join(",")}}`;
 }
 
-async function getSession(id: string): Promise<SessionPayload | null> {
+async function getSession(id: string, cutoffIso?: string | null): Promise<SessionPayload | null> {
+  const cutoff = cutoffIso ?? null;
   const sessionRows = await sql`
     select
       s.id,
@@ -2080,8 +2202,11 @@ async function getSession(id: string): Promise<SessionPayload | null> {
     from chat_sessions s
     join agents a on a.id = s.agent_id
     join projects p on p.id = s.project_id
-    left join session_events e on e.session_db_id = s.id
+    left join session_events e
+      on e.session_db_id = s.id
+      and (${cutoff}::timestamptz is null or e.occurred_at >= ${cutoff}::timestamptz)
     where s.id = ${id}
+      and (${cutoff}::timestamptz is null or s.last_seen_at >= ${cutoff}::timestamptz)
     group by s.id, a.hostname, p.project_key, p.display_name
   `;
 
@@ -2091,6 +2216,7 @@ async function getSession(id: string): Promise<SessionPayload | null> {
     select id, source_line_no, source_offset, event_type, role, occurred_at, ingested_at, raw
     from session_events
     where session_db_id = ${id}
+      and (${cutoff}::timestamptz is null or occurred_at >= ${cutoff}::timestamptz)
     order by source_line_no asc
   `;
 
@@ -2114,8 +2240,9 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
   const limitBytes = clamp(Math.floor(body.limitBytes ?? 2 * 1024 * 1024), 64 * 1024, 16 * 1024 * 1024);
   const cursor = parseSyncCursor(body.cursor);
   const readableCursor = legacyReadEnabled ? cursor : { legacy: 0n, v2: cursor.v2 };
+  const cutoff = retentionCutoffFromDays(body.lookbackDays);
   if (body.metadataOnly) {
-    const metadata = await syncMetadata(body);
+    const metadata = await syncMetadata(body, cutoff);
     const response: SyncResponse = {
       cursor: formatSyncCursor(readableCursor.legacy.toString(), readableCursor.v2.toString()),
       hasMore: metadata.hasMore,
@@ -2143,14 +2270,14 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
         : null;
   const legacyRowsPromise =
     legacyReadEnabled && eventMode === "forward"
-      ? listLegacyEventsForSync(readableCursor.legacy, fetchLimit)
+      ? listLegacyEventsForSync(readableCursor.legacy, fetchLimit, cutoff)
       : legacyReadEnabled
-        ? listLegacyEventsForBackfill(initialBackfill!.before.legacy, initialBackfill!.ceiling.legacy, fetchLimit)
+        ? listLegacyEventsForBackfill(initialBackfill!.before.legacy, initialBackfill!.ceiling.legacy, fetchLimit, cutoff)
         : Promise.resolve([] as any[]);
   const v2RowsPromise =
     eventMode === "forward"
-      ? listV2EventsForSync(sql, readableCursor.v2, fetchLimit)
-      : listV2EventsForBackfill(sql, initialBackfill!.before.v2, initialBackfill!.ceiling.v2, fetchLimit);
+      ? listV2EventsForSync(sql, readableCursor.v2, fetchLimit, cutoff)
+      : listV2EventsForBackfill(sql, initialBackfill!.before.v2, initialBackfill!.ceiling.v2, fetchLimit, cutoff);
   const [legacyRows, v2Rows] = await Promise.all([legacyRowsPromise, v2RowsPromise]);
 
   const events = [];
@@ -2186,8 +2313,9 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
         break;
       }
       events.push(event);
-      if (eventMode === "forward") nextV2Cursor = toId(row.id);
-      else if (nextBackfill) nextBackfill = advanceBackfillCursor(nextBackfill, "v2", BigInt(toId(row.id)));
+      const v2CursorValue = BigInt(toId(row.sync_revision ?? row.id));
+      if (eventMode === "forward") nextV2Cursor = v2CursorValue.toString();
+      else if (nextBackfill) nextBackfill = advanceBackfillCursor(nextBackfill, "v2", v2CursorValue);
       approxBytes += eventBytes;
     }
   }
@@ -2202,12 +2330,12 @@ async function sync(body: SyncRequest): Promise<SyncResponse> {
   const legacySessionIds = legacyReadEnabled ? sessionIds.filter((id) => !isV2SessionId(id)) : [];
   const v2SessionIds = new Set(sessionIds.filter(isV2SessionId));
   const [legacySessions, v2Sessions] = await Promise.all([
-    legacySessionIds.length ? getSessionsMeta(legacySessionIds) : [],
-    v2SessionIds.size ? getV2SessionsMeta(sql, [...v2SessionIds].map((id) => parseV2SessionId(id)).filter((id): id is string => Boolean(id))) : [],
+    legacySessionIds.length ? getSessionsMeta(legacySessionIds, cutoff) : [],
+    v2SessionIds.size ? getV2SessionsMeta(sql, [...v2SessionIds].map((id) => parseV2SessionId(id)).filter((id): id is string => Boolean(id)), { cutoffIso: cutoff }) : [],
   ]);
   const sessions = [...legacySessions, ...v2Sessions];
 
-  const hosts = await listReadableHosts();
+  const hosts = await listReadableHosts(cutoff);
   const response: SyncResponse = {
     cursor: nextCursor,
     hasMore,
@@ -2231,22 +2359,26 @@ function syncEventMode(body: SyncRequest): EventSyncMode {
   return "forward";
 }
 
-async function listLegacyEventsForSync(cursor: bigint, limit: number) {
+async function listLegacyEventsForSync(cursor: bigint, limit: number, cutoffIso?: string | null) {
+  const cutoff = cutoffIso ?? null;
   return await sql`
     select id, session_db_id, source_line_no, source_offset, event_type, role, occurred_at, ingested_at, raw
     from session_events
     where id > ${cursor}
+      and (${cutoff}::timestamptz is null or occurred_at >= ${cutoff}::timestamptz)
     order by id asc
     limit ${limit}
   `;
 }
 
-async function listLegacyEventsForBackfill(before: bigint, ceiling: bigint, limit: number) {
+async function listLegacyEventsForBackfill(before: bigint, ceiling: bigint, limit: number, cutoffIso?: string | null) {
+  const cutoff = cutoffIso ?? null;
   return await sql`
     select id, session_db_id, source_line_no, source_offset, event_type, role, occurred_at, ingested_at, raw
     from session_events
     where id < ${before}
       and id <= ${ceiling}
+      and (${cutoff}::timestamptz is null or occurred_at >= ${cutoff}::timestamptz)
     order by id desc
     limit ${limit}
   `;
@@ -2272,11 +2404,11 @@ async function currentEventHighWater(): Promise<EventCursor> {
     : Promise.resolve([{ id: "0" }]);
   const [legacyRows, v2Rows] = await Promise.all([
     legacyRowsPromise,
-    sql`
-      select coalesce(max(e.id), 0)::text as id
-      from agent_normalized_events e
-      join agent_source_files f on f.id = e.source_file_id
-      where e.source_generation = f.current_generation
+	    sql`
+	      select coalesce(max(e.sync_revision), 0)::text as id
+	      from agent_normalized_events e
+	      join agent_source_files f on f.id = e.source_file_id
+	      where e.source_generation = f.current_generation
         and f.source_kind = 'conversation'
         and f.deleted_at is null
     `,
@@ -2344,10 +2476,10 @@ type MetadataMode = "full" | "delta";
 type MetadataChangeKey = {
   kind: "" | "h" | "l" | "v";
   id: string;
-  at: string;
+  seq: bigint;
 };
 
-async function syncMetadata(body: SyncRequest): Promise<{
+async function syncMetadata(body: SyncRequest, cutoffIso?: string | null): Promise<{
   mode: MetadataMode;
   full: boolean;
   hasMore: boolean;
@@ -2359,7 +2491,7 @@ async function syncMetadata(body: SyncRequest): Promise<{
   const mode: MetadataMode = requestedMode ?? (body.metadataCursor ? "delta" : "full");
   const parsedCursor = body.metadataCursor ? parseMetadataCursor(body.metadataCursor) : null;
 
-  if (mode === "full" || !parsedCursor) return syncFullMetadata();
+  if (mode === "full" || !parsedCursor) return syncFullMetadata(cutoffIso);
 
   const limit = clamp(Math.floor(body.metadataLimit ?? 500), 50, 2000);
   const rows = await listMetadataChangeKeys(parsedCursor, limit + 1);
@@ -2370,16 +2502,16 @@ async function syncMetadata(body: SyncRequest): Promise<{
   const v2SourceFileIds = page.filter((row) => row.kind === "v").map((row) => row.id);
 
   const [legacySessions, v2Sessions] = await Promise.all([
-    legacySessionIds.length ? getSessionsMeta(legacySessionIds) : Promise.resolve([]),
-    v2SourceFileIds.length ? getV2SessionsMeta(sql, v2SourceFileIds, { includeDeleted: true }) : Promise.resolve([]),
+    legacySessionIds.length ? getSessionsMeta(legacySessionIds, cutoffIso) : Promise.resolve([]),
+    v2SourceFileIds.length ? getV2SessionsMeta(sql, v2SourceFileIds, { includeDeleted: true, cutoffIso }) : Promise.resolve([]),
   ]);
   for (const session of [...legacySessions, ...v2Sessions]) hostIds.add(session.agentId);
-  const hosts = hostIds.size ? (await listReadableHosts()).filter((host) => hostIds.has(host.agentId)) : [];
+  const hosts = hostIds.size ? (await listReadableHosts(cutoffIso)).filter((host) => hostIds.has(host.agentId)) : [];
   const cursor = page.length ? formatMetadataCursor(page[page.length - 1]) : formatMetadataCursor(parsedCursor);
   return { mode, full: false, hasMore, cursor, hosts, sessions: [...legacySessions, ...v2Sessions] };
 }
 
-async function syncFullMetadata(): Promise<{
+async function syncFullMetadata(cutoffIso?: string | null): Promise<{
   mode: MetadataMode;
   full: boolean;
   hasMore: boolean;
@@ -2388,106 +2520,94 @@ async function syncFullMetadata(): Promise<{
   sessions: SessionInfo[];
 }> {
   const cursor = await currentMetadataCursor();
-  const [hosts, sessions] = await Promise.all([listReadableHosts(), listReadableSessions()]);
+  const [hosts, sessions] = await Promise.all([listReadableHosts(cutoffIso), listReadableSessions(undefined, cutoffIso)]);
   return { mode: "full", full: true, hasMore: false, cursor, hosts, sessions };
 }
 
 async function listMetadataChangeKeys(cursor: MetadataChangeKey, limit: number): Promise<MetadataChangeKey[]> {
   const rows = legacyReadEnabled
     ? await sql`
-        with changes as (
-          select 'h'::text as kind, a.id::text as row_id, a.last_seen_at as changed_at
-          from agents a
-          where (a.last_seen_at, 'h'::text, a.id::text) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
-          union all
-          select 'l'::text as kind, s.id::text as row_id, greatest(s.last_seen_at, coalesce(s.deleted_at, s.last_seen_at)) as changed_at
-          from chat_sessions s
-          where (
-            greatest(s.last_seen_at, coalesce(s.deleted_at, s.last_seen_at)),
-            'l'::text,
-            s.id::text
-          ) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
-          union all
-          select 'v'::text as kind, f.id::text as row_id, greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)) as changed_at
-          from agent_source_files f
-          where f.source_kind = 'conversation'
-            and (
-              greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)),
-              'v'::text,
-              f.id::text
-            ) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
-        )
-        select kind, row_id, changed_at
-        from changes
-        order by changed_at asc, kind asc, row_id asc
-        limit ${limit}
-      `
-    : await sql`
-        with changes as (
-          select 'h'::text as kind, a.id::text as row_id, a.last_seen_at as changed_at
-          from agents a
-          where (a.last_seen_at, 'h'::text, a.id::text) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
-          union all
-          select 'v'::text as kind, f.id::text as row_id, greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)) as changed_at
-          from agent_source_files f
-          where f.source_kind = 'conversation'
-            and (
-              greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)),
-              'v'::text,
-              f.id::text
-            ) > (${cursor.at}::timestamptz, ${cursor.kind}, ${cursor.id})
-        )
-        select kind, row_id, changed_at
-        from changes
-        order by changed_at asc, kind asc, row_id asc
-        limit ${limit}
-      `;
+	        with changes as (
+	          select 'h'::text as kind, a.id::text as row_id, a.metadata_revision as change_seq
+	          from agents a
+	          where (a.metadata_revision, 'h'::text, a.id::text) > (${cursor.seq}::bigint, ${cursor.kind}, ${cursor.id})
+	          union all
+	          select 'l'::text as kind, s.id::text as row_id, s.metadata_revision as change_seq
+	          from chat_sessions s
+	          where (s.metadata_revision, 'l'::text, s.id::text) > (${cursor.seq}::bigint, ${cursor.kind}, ${cursor.id})
+	          union all
+	          select 'v'::text as kind, f.id::text as row_id, f.metadata_revision as change_seq
+	          from agent_source_files f
+	          where f.source_kind = 'conversation'
+	            and (f.metadata_revision, 'v'::text, f.id::text) > (${cursor.seq}::bigint, ${cursor.kind}, ${cursor.id})
+	        )
+	        select kind, row_id, change_seq
+	        from changes
+	        order by change_seq asc, kind asc, row_id asc
+	        limit ${limit}
+	      `
+	    : await sql`
+	        with changes as (
+	          select 'h'::text as kind, a.id::text as row_id, a.metadata_revision as change_seq
+	          from agents a
+	          where (a.metadata_revision, 'h'::text, a.id::text) > (${cursor.seq}::bigint, ${cursor.kind}, ${cursor.id})
+	          union all
+	          select 'v'::text as kind, f.id::text as row_id, f.metadata_revision as change_seq
+	          from agent_source_files f
+	          where f.source_kind = 'conversation'
+	            and (f.metadata_revision, 'v'::text, f.id::text) > (${cursor.seq}::bigint, ${cursor.kind}, ${cursor.id})
+	        )
+	        select kind, row_id, change_seq
+	        from changes
+	        order by change_seq asc, kind asc, row_id asc
+	        limit ${limit}
+	      `;
   return rows.map((row: any) => ({
     kind: row.kind,
     id: String(row.row_id),
-    at: metadataTimestampString(row.changed_at),
+    seq: BigInt(String(row.change_seq ?? "0")),
   }));
 }
 
 async function currentMetadataCursor() {
   const rows = legacyReadEnabled
     ? await sql`
-        with changes as (
-          select 'h'::text as kind, a.id::text as row_id, a.last_seen_at as changed_at
-          from agents a
-          union all
-          select 'l'::text as kind, s.id::text as row_id, greatest(s.last_seen_at, coalesce(s.deleted_at, s.last_seen_at)) as changed_at
-          from chat_sessions s
-          union all
-          select 'v'::text as kind, f.id::text as row_id, greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)) as changed_at
-          from agent_source_files f
-          where f.source_kind = 'conversation'
-        )
-        select kind, row_id, changed_at
-        from changes
-        order by changed_at desc, kind desc, row_id desc
-        limit 1
-      `
-    : await sql`
-        with changes as (
-          select 'h'::text as kind, a.id::text as row_id, a.last_seen_at as changed_at
-          from agents a
-          union all
-          select 'v'::text as kind, f.id::text as row_id, greatest(f.last_seen_at, coalesce(f.deleted_at, f.last_seen_at)) as changed_at
-          from agent_source_files f
-          where f.source_kind = 'conversation'
-        )
-        select kind, row_id, changed_at
-        from changes
-        order by changed_at desc, kind desc, row_id desc
-        limit 1
-      `;
+	        with changes as (
+	          select 'h'::text as kind, a.id::text as row_id, a.metadata_revision as change_seq
+	          from agents a
+	          union all
+	          select 'l'::text as kind, s.id::text as row_id, s.metadata_revision as change_seq
+	          from chat_sessions s
+	          union all
+	          select 'v'::text as kind, f.id::text as row_id, f.metadata_revision as change_seq
+	          from agent_source_files f
+	          where f.source_kind = 'conversation'
+	        )
+	        select kind, row_id, change_seq
+	        from changes
+	        order by change_seq desc, kind desc, row_id desc
+	        limit 1
+	      `
+	    : await sql`
+	        with changes as (
+	          select 'h'::text as kind, a.id::text as row_id, a.metadata_revision as change_seq
+	          from agents a
+	          union all
+	          select 'v'::text as kind, f.id::text as row_id, f.metadata_revision as change_seq
+	          from agent_source_files f
+	          where f.source_kind = 'conversation'
+	        )
+	        select kind, row_id, change_seq
+	        from changes
+	        order by change_seq desc, kind desc, row_id desc
+	        limit 1
+	      `;
   if (!rows.length) return formatMetadataCursor(initialMetadataCursor());
-  return formatMetadataCursor({ kind: rows[0].kind, id: String(rows[0].row_id), at: metadataTimestampString(rows[0].changed_at) });
+  return formatMetadataCursor({ kind: rows[0].kind, id: String(rows[0].row_id), seq: BigInt(String(rows[0].change_seq ?? "0")) });
 }
 
 function initialMetadataCursor(): MetadataChangeKey {
-  return { at: "1970-01-01T00:00:00.000Z", kind: "", id: "" };
+  return { seq: 0n, kind: "", id: "" };
 }
 
 function parseMetadataCursor(value: string | undefined): MetadataChangeKey | null {
@@ -2495,35 +2615,31 @@ function parseMetadataCursor(value: string | undefined): MetadataChangeKey | nul
   try {
     const parsed = JSON.parse(Buffer.from(value.slice("meta:".length), "base64url").toString("utf8"));
     if (!parsed || typeof parsed !== "object") return null;
-    const at = normalizeMetadataCursorTimestamp(parsed.at);
+    const seq = metadataCursorSeq(parsed.seq);
     const kind: MetadataChangeKey["kind"] | null =
-      parsed.kind === "h" || parsed.kind === "l" || parsed.kind === "v" ? parsed.kind : null;
+      parsed.kind === "" || parsed.kind === "h" || parsed.kind === "l" || parsed.kind === "v" ? parsed.kind : null;
     const id = typeof parsed.id === "string" ? parsed.id : "";
-    if (!at || !kind || !id) return null;
-    return { at, kind, id };
+    if (seq == null || kind == null) return null;
+    return { seq, kind, id };
   } catch {
     return null;
   }
 }
 
-function normalizeMetadataCursorTimestamp(value: unknown) {
-  if (value instanceof Date) return value.toISOString();
-  if (typeof value !== "string" || !value) return null;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
-}
-
-function metadataTimestampString(value: unknown) {
-  if (value instanceof Date) return value.toISOString();
-  if (typeof value === "string") {
-    const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
-  }
-  return String(value);
+function metadataCursorSeq(value: unknown) {
+  if (typeof value !== "string" && typeof value !== "number" && typeof value !== "bigint") return null;
+  const text = String(value);
+  return /^\d+$/.test(text) ? BigInt(text) : null;
 }
 
 function formatMetadataCursor(cursor: MetadataChangeKey) {
-  return `meta:${Buffer.from(JSON.stringify(cursor)).toString("base64url")}`;
+  return `meta:${Buffer.from(
+    JSON.stringify({
+      kind: cursor.kind,
+      id: cursor.id,
+      seq: cursor.seq.toString(),
+    }),
+  ).toString("base64url")}`;
 }
 
 function parseSyncCursor(value: string | undefined): { legacy: bigint; v2: bigint } {
@@ -2532,6 +2648,18 @@ function parseSyncCursor(value: string | undefined): { legacy: bigint; v2: bigin
   if (compound) return { legacy: BigInt(compound[1]), v2: BigInt(compound[2]) };
   if (/^\d+$/.test(value)) return { legacy: BigInt(value), v2: 0n };
   return { legacy: 0n, v2: 0n };
+}
+
+function retentionCutoffFromRequest(req: Request) {
+  const url = new URL(req.url);
+  return retentionCutoffFromDays(url.searchParams.get("lookbackDays"));
+}
+
+function retentionCutoffFromDays(value: unknown) {
+  const days = Number(value);
+  if (!Number.isFinite(days) || days <= 0) return null;
+  const clampedDays = clamp(Math.round(days), 1, 180);
+  return new Date(Date.now() - clampedDays * 24 * 60 * 60 * 1000).toISOString();
 }
 
 function formatSyncCursor(legacy: unknown, v2: unknown) {
@@ -2581,7 +2709,7 @@ async function ingestBatch(body: IngestBatchRequest): Promise<IngestBatchRespons
   for (const session of body.sessions) {
     const accepted = await sql.transaction(async (tx: any) => {
       await tx`
-        insert into agents (id, hostname, platform, arch, version, source_root, last_seen_at)
+        insert into agents (id, hostname, platform, arch, version, source_root, metadata_revision, last_seen_at)
         values (
           ${body.agent.agentId},
           ${body.agent.hostname},
@@ -2589,6 +2717,7 @@ async function ingestBatch(body: IngestBatchRequest): Promise<IngestBatchRespons
           ${body.agent.arch},
           ${body.agent.version},
           ${body.agent.sourceRoot},
+          nextval('sync_metadata_revision_seq'),
           now()
         )
         on conflict (id) do update set
@@ -2597,6 +2726,15 @@ async function ingestBatch(body: IngestBatchRequest): Promise<IngestBatchRespons
           arch = excluded.arch,
           version = excluded.version,
           source_root = excluded.source_root,
+          metadata_revision = case
+            when agents.hostname is distinct from excluded.hostname
+              or agents.platform is distinct from excluded.platform
+              or agents.arch is distinct from excluded.arch
+              or agents.version is distinct from excluded.version
+              or agents.source_root is distinct from excluded.source_root
+            then nextval('sync_metadata_revision_seq')
+            else agents.metadata_revision
+          end,
           last_seen_at = now()
       `;
 
@@ -2632,10 +2770,11 @@ async function ingestBatch(body: IngestBatchRequest): Promise<IngestBatchRespons
           git_repo_root,
           git_branch,
           git_commit,
-          git_dirty,
-          git_remote_url,
-          deleted_at
-        )
+	          git_dirty,
+	          git_remote_url,
+	          metadata_revision,
+	          deleted_at
+	        )
         values (
           ${body.agent.agentId},
           ${projectId},
@@ -2653,11 +2792,12 @@ async function ingestBatch(body: IngestBatchRequest): Promise<IngestBatchRespons
           ${file.symlinkTarget ?? null},
           ${git.repoRoot ?? null},
           ${git.branch ?? null},
-          ${git.commit ?? null},
-          ${git.dirty ?? null},
-          ${git.remoteUrl ?? null},
-          case when ${session.deleted ?? false}::boolean then now() else null end
-        )
+	          ${git.commit ?? null},
+	          ${git.dirty ?? null},
+	          ${git.remoteUrl ?? null},
+	          nextval('sync_metadata_revision_seq'),
+	          case when ${session.deleted ?? false}::boolean then now() else null end
+	        )
         on conflict (agent_id, session_id) do update set
           project_id = excluded.project_id,
           source_path = excluded.source_path,
@@ -2673,12 +2813,13 @@ async function ingestBatch(body: IngestBatchRequest): Promise<IngestBatchRespons
           symlink_target = coalesce(excluded.symlink_target, chat_sessions.symlink_target),
           git_repo_root = coalesce(excluded.git_repo_root, chat_sessions.git_repo_root),
           git_branch = coalesce(excluded.git_branch, chat_sessions.git_branch),
-          git_commit = coalesce(excluded.git_commit, chat_sessions.git_commit),
-          git_dirty = coalesce(excluded.git_dirty, chat_sessions.git_dirty),
-          git_remote_url = coalesce(excluded.git_remote_url, chat_sessions.git_remote_url),
-          deleted_at = case
-            when excluded.deleted_at is not null then excluded.deleted_at
-            else chat_sessions.deleted_at
+	          git_commit = coalesce(excluded.git_commit, chat_sessions.git_commit),
+	          git_dirty = coalesce(excluded.git_dirty, chat_sessions.git_dirty),
+	          git_remote_url = coalesce(excluded.git_remote_url, chat_sessions.git_remote_url),
+	          metadata_revision = nextval('sync_metadata_revision_seq'),
+	          deleted_at = case
+	            when excluded.deleted_at is not null then excluded.deleted_at
+	            else chat_sessions.deleted_at
           end
         returning id
       `;
@@ -2777,8 +2918,19 @@ async function syncYjs(body: YjsSyncRequest): Promise<YjsSyncResponse> {
   return { docs };
 }
 
-async function readYjsDocument(docId: string): Promise<{ update: Uint8Array; updatedAt: string } | null> {
-  const rows = await sql`
+async function readYjsDocument(
+  docId: string,
+  runner: any = sql,
+  options: { forUpdate?: boolean } = {},
+): Promise<{ update: Uint8Array; updatedAt: string } | null> {
+  const rows = options.forUpdate
+    ? await runner`
+    select update, updated_at
+    from yjs_documents
+    where doc_id = ${docId}
+    for update
+  `
+    : await runner`
     select update, updated_at
     from yjs_documents
     where doc_id = ${docId}
@@ -2791,21 +2943,30 @@ async function readYjsDocument(docId: string): Promise<{ update: Uint8Array; upd
 }
 
 async function mergeYjsUpdate(docId: string, update: Uint8Array, sessionDbId?: string) {
-  const current = await readYjsDocument(docId);
-  const merged = current ? Y.mergeUpdates([current.update, update]) : update;
-  const legacySessionDbId = numericSessionDbId(sessionDbId);
-  await sql`
-    insert into yjs_documents (doc_id, session_db_id, update, updated_at)
-    values (${docId}, ${legacySessionDbId}, ${Buffer.from(merged)}, now())
-    on conflict (doc_id) do update set
-      session_db_id = coalesce(excluded.session_db_id, yjs_documents.session_db_id),
-      update = excluded.update,
-      updated_at = now()
-  `;
+  await sql.transaction(async (tx: any) => {
+    await tx`select pg_advisory_xact_lock(hashtextextended(${docId}, 3737))`;
+    const current = await readYjsDocument(docId, tx, { forUpdate: true });
+    const merged = current ? Y.mergeUpdates([current.update, update]) : update;
+    const legacySessionDbId = numericSessionDbId(sessionDbId);
+    const sourceFileId = v2YjsSourceFileId(sessionDbId);
+    await tx`
+      insert into yjs_documents (doc_id, session_db_id, source_file_id, update, updated_at)
+      values (${docId}, ${legacySessionDbId}, ${sourceFileId}, ${Buffer.from(merged)}, now())
+      on conflict (doc_id) do update set
+        session_db_id = coalesce(excluded.session_db_id, yjs_documents.session_db_id),
+        source_file_id = coalesce(excluded.source_file_id, yjs_documents.source_file_id),
+        update = excluded.update,
+        updated_at = now()
+    `;
+  });
 }
 
 function numericSessionDbId(value?: string) {
   return value && /^\d+$/.test(value) ? value : null;
+}
+
+function v2YjsSourceFileId(value?: string) {
+  return value ? parseV2SessionId(value) : null;
 }
 
 function validateBatch(body: IngestBatchRequest) {

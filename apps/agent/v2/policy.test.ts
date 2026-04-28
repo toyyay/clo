@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { fetchServerSyncPolicy, normalizeServerPolicy } from "./policy";
+import { AgentRuntimeRejectedError, AgentShutdownRequestedError, fetchServerSyncPolicy, normalizeServerPolicy } from "./policy";
 import type { AgentV2Identity } from "./types";
 
 const identity: AgentV2Identity = {
@@ -8,6 +8,9 @@ const identity: AgentV2Identity = {
   platform: "darwin",
   arch: "arm64",
   version: "test",
+  runtimeId: "runtime-test",
+  pid: 123,
+  startedAt: "2026-04-25T10:00:00.000Z",
 };
 
 describe("agent-v2 policy", () => {
@@ -17,6 +20,7 @@ describe("agent-v2 policy", () => {
       backendUrl: "http://example.test/",
       token: "token",
       identity,
+      takeover: true,
       fetchImpl: (async (url) => {
         seenUrls.push(String(url));
         return Response.json({
@@ -41,6 +45,73 @@ describe("agent-v2 policy", () => {
     expect(policy.maxUploadLines).toBe(12);
     expect(policy.scanRoots).toEqual(["claude", "codex"]);
     expect(policy.ignorePatterns).toEqual(["auth.json"]);
+  });
+
+  test("sends runtime takeover intent to the hello endpoint", async () => {
+    let body: any;
+    await fetchServerSyncPolicy({
+      backendUrl: "http://example.test",
+      token: "token",
+      identity,
+      takeover: true,
+      fetchImpl: (async (_url, init) => {
+        body = JSON.parse(String(init?.body));
+        return Response.json({ policy: { enabled: true, uploadsEnabled: false } });
+      }) as typeof fetch,
+    });
+
+    expect(body.agent.runtimeId).toBe("runtime-test");
+    expect(body.runtime).toMatchObject({
+      runtimeId: "runtime-test",
+      pid: 123,
+      startedAt: "2026-04-25T10:00:00.000Z",
+      takeover: true,
+    });
+    expect(body.control).toEqual({ takeover: true });
+  });
+
+  test("rejects duplicate active runtimes instead of falling back to defaults", async () => {
+    await expect(
+      fetchServerSyncPolicy({
+        backendUrl: "http://example.test",
+        token: "token",
+        identity,
+        fetchImpl: (async () =>
+          Response.json(
+            {
+              ok: false,
+              control: {
+                action: "reject",
+                reason: "host already has an active agent runtime",
+                activeRuntimes: [{ runtimeId: "other", hostname: "workstation", pid: 456 }],
+              },
+            },
+            { status: 409 },
+          )) as unknown as typeof fetch,
+      }),
+    ).rejects.toBeInstanceOf(AgentRuntimeRejectedError);
+  });
+
+  test("turns server shutdown control into a stop signal", async () => {
+    await expect(
+      fetchServerSyncPolicy({
+        backendUrl: "http://example.test",
+        token: "token",
+        identity,
+        fetchImpl: (async () =>
+          Response.json({
+            ok: true,
+            control: {
+              action: "shutdown",
+              reason: "replaced by newer runtime",
+            },
+            policy: {
+              enabled: true,
+              uploadsEnabled: true,
+            },
+          })) as unknown as typeof fetch,
+      }),
+    ).rejects.toBeInstanceOf(AgentShutdownRequestedError);
   });
 
   test("normalizes protocol-shaped backend policies", () => {

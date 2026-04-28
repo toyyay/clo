@@ -241,33 +241,45 @@ describe("v2 read model helpers", () => {
 
     expect(calls).toHaveLength(1);
     expect(normalizeSql(calls[0].text)).toContain("where f.id = ? and f.source_kind = 'conversation' and f.deleted_at is null");
-    expect(calls[0].values).toEqual(["42"]);
+    expect(calls[0].values).toEqual([null, null, "42", null, null]);
   });
 
-  test("sync v2 event query keeps ordinals stable before cursor filtering", async () => {
+  test("sync v2 event query uses durable sync revisions", async () => {
     const { calls, sql } = recordingSql();
 
     await listV2EventsForSync(sql, 10n, 25);
 
     expect(calls).toHaveLength(1);
     const text = normalizeSql(calls[0].text);
-    expect(text.indexOf("row_number() over")).toBeLessThan(text.indexOf("where visible.id > ?"));
+    expect(text).not.toContain("row_number() over");
+    expect(text).toContain("and e.sync_revision > ?");
+    expect(text).toContain("order by e.sync_revision asc, e.id asc");
     expect(text).toContain("and f.source_kind = 'conversation' and f.deleted_at is null");
-    expect(calls[0].values).toEqual([10n, 25]);
+    expect(calls[0].values).toEqual([10n, null, null, 25]);
   });
 
-  test("backfill v2 event query walks older ids without changing ordinal visibility", async () => {
+  test("backfill v2 event query walks older sync revisions", async () => {
     const { calls, sql } = recordingSql();
 
     await listV2EventsForBackfill(sql, 100n, 150n, 25);
 
     expect(calls).toHaveLength(1);
     const text = normalizeSql(calls[0].text);
-    expect(text.indexOf("row_number() over")).toBeLessThan(text.indexOf("where visible.id < ?"));
-    expect(text).toContain("where visible.id < ? and visible.id <= ?");
+    expect(text).not.toContain("row_number() over");
+    expect(text).toContain("and e.sync_revision < ? and e.sync_revision <= ?");
     expect(text).toContain("and f.source_kind = 'conversation' and f.deleted_at is null");
-    expect(text).toContain("order by visible.id desc");
-    expect(calls[0].values).toEqual([100n, 150n, 25]);
+    expect(text).toContain("order by e.sync_revision desc, e.id desc");
+    expect(calls[0].values).toEqual([100n, 150n, null, null, 25]);
+  });
+
+  test("v2 event sync can be limited to a frontend retention window", async () => {
+    const { calls, sql } = recordingSql();
+
+    await listV2EventsForSync(sql, 10n, 25, "2026-04-13T00:00:00.000Z");
+
+    const text = normalizeSql(calls[0].text);
+    expect(text).toContain("coalesce(e.occurred_at, e.created_at) >= ?::timestamptz");
+    expect(calls[0].values).toEqual([10n, "2026-04-13T00:00:00.000Z", "2026-04-13T00:00:00.000Z", 25]);
   });
 
   test("v2 metadata lookup can return deleted tombstones for delta sync", async () => {

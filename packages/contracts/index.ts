@@ -95,6 +95,9 @@ export type AgentDescriptor = {
   arch?: string;
   version?: string;
   sourceRoot?: string;
+  runtimeId?: string;
+  pid?: number;
+  startedAt?: string;
 };
 
 export type AgentCapabilities = {
@@ -107,7 +110,41 @@ export type AgentCapabilities = {
 
 export type AgentHelloRequest = {
   agent: AgentDescriptor;
+  runtime?: {
+    runtimeId?: string;
+    id?: string;
+    processId?: string;
+    pid?: number;
+    startedAt?: string;
+    processStartedAt?: string;
+    takeover?: boolean;
+    killExisting?: boolean;
+    killAll?: boolean;
+    [key: string]: unknown;
+  };
+  control?: {
+    takeover?: boolean;
+    killExisting?: boolean;
+    killAll?: boolean;
+    [key: string]: unknown;
+  };
   capabilities?: AgentCapabilities;
+};
+
+export type AgentRuntimeInfo = {
+  runtimeId: string;
+  agentId: string;
+  hostname: string;
+  pid: number | null;
+  startedAt: string | null;
+  lastSeenAt: string;
+  status: string;
+};
+
+export type AgentRuntimeControl = {
+  action: "continue" | "shutdown" | "reject";
+  reason?: string;
+  activeRuntimes?: AgentRuntimeInfo[];
 };
 
 export type AgentHelloResponse = {
@@ -115,6 +152,8 @@ export type AgentHelloResponse = {
   protocol: typeof CHAT_SYNC_PROTOCOL;
   serverTime: string;
   agentId: string;
+  runtimeId?: string;
+  control?: AgentRuntimeControl;
   policy: ServerSyncPolicy;
 };
 
@@ -577,10 +616,14 @@ export function validateAgentDescriptor(input: unknown): ValidationResult<AgentD
   if (!isRecord(input)) return fail("agent", "expected object");
   const agentId = validateString(input.agentId, "agent.agentId");
   if (!agentId.ok) return agentId;
-  for (const field of ["hostname", "platform", "arch", "version", "sourceRoot"] as const) {
+  for (const field of ["hostname", "platform", "arch", "version", "sourceRoot", "runtimeId"] as const) {
     const result = validateOptionalString(input[field], `agent.${field}`);
     if (!result.ok) return result;
   }
+  const pid = validateOptionalPositiveInteger(input.pid, "agent.pid");
+  if (!pid.ok) return pid;
+  const startedAt = validateOptionalIsoString(input.startedAt, "agent.startedAt");
+  if (!startedAt.ok) return startedAt;
   return ok(input as AgentDescriptor);
 }
 
@@ -597,10 +640,44 @@ export function validateAgentCapabilities(input: unknown): ValidationResult<Agen
   return ok(input as AgentCapabilities);
 }
 
+function validateAgentRuntime(input: unknown, path: string): ValidationResult<AgentHelloRequest["runtime"] | undefined> {
+  if (input === undefined) return ok(undefined);
+  if (!isRecord(input)) return fail(path, "expected object");
+  for (const field of ["runtimeId", "id", "processId"] as const) {
+    const result = validateOptionalString(input[field], `${path}.${field}`);
+    if (!result.ok) return result;
+  }
+  const pid = validateOptionalPositiveInteger(input.pid, `${path}.pid`);
+  if (!pid.ok) return pid;
+  for (const field of ["startedAt", "processStartedAt"] as const) {
+    const result = validateOptionalIsoString(input[field], `${path}.${field}`);
+    if (!result.ok) return result;
+  }
+  for (const field of ["takeover", "killExisting", "killAll"] as const) {
+    const result = validateOptionalBoolean(input[field], `${path}.${field}`);
+    if (!result.ok) return result;
+  }
+  return ok(input as AgentHelloRequest["runtime"]);
+}
+
+function validateAgentControl(input: unknown, path: string): ValidationResult<AgentHelloRequest["control"] | undefined> {
+  if (input === undefined) return ok(undefined);
+  if (!isRecord(input)) return fail(path, "expected object");
+  for (const field of ["takeover", "killExisting", "killAll"] as const) {
+    const result = validateOptionalBoolean(input[field], `${path}.${field}`);
+    if (!result.ok) return result;
+  }
+  return ok(input as AgentHelloRequest["control"]);
+}
+
 export function validateAgentHelloRequest(input: unknown): ValidationResult<AgentHelloRequest> {
   if (!isRecord(input)) return fail("hello", "expected object");
   const agent = validateAgentDescriptor(input.agent);
   if (!agent.ok) return agent;
+  const runtime = validateAgentRuntime(input.runtime, "hello.runtime");
+  if (!runtime.ok) return runtime;
+  const control = validateAgentControl(input.control, "hello.control");
+  if (!control.ok) return control;
   if (input.capabilities !== undefined) {
     const capabilities = validateAgentCapabilities(input.capabilities);
     if (!capabilities.ok) return capabilities;
@@ -748,9 +825,51 @@ export function validateAgentHelloResponse(input: unknown): ValidationResult<Age
   if (!serverTime.ok || serverTime.value === undefined) return fail("helloResponse.serverTime", "expected parseable date-time string");
   const agentId = validateString(input.agentId, "helloResponse.agentId");
   if (!agentId.ok) return agentId;
+  const runtimeId = validateOptionalString(input.runtimeId, "helloResponse.runtimeId");
+  if (!runtimeId.ok) return runtimeId;
+  if (input.control !== undefined) {
+    const control = validateAgentRuntimeControl(input.control, "helloResponse.control");
+    if (!control.ok) return control;
+  }
   const policy = validateServerSyncPolicy(input.policy);
   if (!policy.ok) return policy;
   return ok(input as AgentHelloResponse);
+}
+
+function validateAgentRuntimeControl(input: unknown, path: string): ValidationResult<AgentRuntimeControl> {
+  if (!isRecord(input)) return fail(path, "expected object");
+  if (input.action !== "continue" && input.action !== "shutdown" && input.action !== "reject") {
+    return fail(`${path}.action`, "expected continue, shutdown, or reject");
+  }
+  const reason = validateOptionalString(input.reason, `${path}.reason`);
+  if (!reason.ok) return reason;
+  if (input.activeRuntimes !== undefined) {
+    if (!Array.isArray(input.activeRuntimes)) return fail(`${path}.activeRuntimes`, "expected array");
+    for (let index = 0; index < input.activeRuntimes.length; index += 1) {
+      const runtime = validateAgentRuntimeInfo(input.activeRuntimes[index], `${path}.activeRuntimes[${index}]`);
+      if (!runtime.ok) return runtime;
+    }
+  }
+  return ok(input as AgentRuntimeControl);
+}
+
+function validateAgentRuntimeInfo(input: unknown, path: string): ValidationResult<AgentRuntimeInfo> {
+  if (!isRecord(input)) return fail(path, "expected object");
+  for (const field of ["runtimeId", "agentId", "hostname", "lastSeenAt", "status"] as const) {
+    const result = validateString(input[field], `${path}.${field}`);
+    if (!result.ok) return result;
+  }
+  if (input.pid !== null) {
+    const pid = validateOptionalPositiveInteger(input.pid, `${path}.pid`);
+    if (!pid.ok || pid.value === undefined) return fail(`${path}.pid`, "expected positive integer or null");
+  }
+  if (input.startedAt !== null) {
+    const startedAt = validateOptionalIsoString(input.startedAt, `${path}.startedAt`);
+    if (!startedAt.ok || startedAt.value === undefined) return fail(`${path}.startedAt`, "expected parseable date-time string or null");
+  }
+  const lastSeenAt = validateOptionalIsoString(input.lastSeenAt, `${path}.lastSeenAt`);
+  if (!lastSeenAt.ok || lastSeenAt.value === undefined) return fail(`${path}.lastSeenAt`, "expected parseable date-time string");
+  return ok(input as AgentRuntimeInfo);
 }
 
 function validateAgentSourceFileAt(

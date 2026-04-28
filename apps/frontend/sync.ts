@@ -1,5 +1,6 @@
 import type { HostInfo, SessionEvent, SessionInfo, SessionPayload, SyncResponse } from "../../packages/shared/types";
-import { applySync, getMeta } from "./db";
+import { applySync, deleteMeta, getMeta, setMeta } from "./db";
+import { clampRetentionDays } from "./storage-prefs";
 
 export const READ_API_ENDPOINTS = {
   sync: "/api/sync",
@@ -50,8 +51,11 @@ export type PullOptions = {
   timeoutMs?: number;
   metadataOnly?: boolean;
   eventMode?: "forward" | "recent" | "backfill";
+  lookbackDays?: number;
   onProgress?: (progress: PullProgress) => void;
 };
+
+type SyncEventMode = NonNullable<PullOptions["eventMode"]>;
 
 export class SyncAuthError extends Error {
   status: number;
@@ -76,6 +80,27 @@ export function metadataPruneMode(payload: Pick<SyncResponse, "metadataFull" | "
   return payload.metadataFull === true || (payload.metadataMode !== "delta" && !previousMetadataCursor) ? "full-shell" : "none";
 }
 
+export function eventModeForPull(options: {
+  metadataOnly: boolean;
+  requestedEventMode?: SyncEventMode;
+  storedCursor?: string;
+  backfillCursor?: string;
+  backfillHasMore?: boolean;
+}): SyncEventMode | undefined {
+  if (options.metadataOnly) return undefined;
+  if (options.requestedEventMode === "recent" && shouldResumeBackfill(options.backfillCursor, options.backfillHasMore)) {
+    return "backfill";
+  }
+  if (!options.requestedEventMode && !options.storedCursor && shouldResumeBackfill(options.backfillCursor, options.backfillHasMore)) {
+    return "backfill";
+  }
+  return options.requestedEventMode ?? (options.storedCursor ? "forward" : "recent");
+}
+
+function shouldResumeBackfill(backfillCursor: string | undefined, backfillHasMore: boolean | undefined) {
+  return Boolean(backfillCursor) && backfillHasMore !== false;
+}
+
 class ReadApiError extends Error {
   status: number;
   body: string;
@@ -91,6 +116,12 @@ async function readJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (!response.ok) throw new ReadApiError(url, response.status, await response.text());
   return (await response.json()) as T;
+}
+
+function withLookback(url: string, lookbackDays?: number) {
+  if (lookbackDays === undefined) return url;
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}lookbackDays=${encodeURIComponent(String(clampRetentionDays(lookbackDays)))}`;
 }
 
 function shouldFallBackToLegacy(error: unknown) {
@@ -123,6 +154,7 @@ async function fetchBatch(
   metadataCursor?: string,
   eventMode?: "forward" | "recent" | "backfill",
   backfillCursor?: string,
+  lookbackDays?: number,
 ): Promise<SyncResponse> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -131,7 +163,7 @@ async function fetchBatch(
     const response = await fetch(READ_API_ENDPOINTS.sync, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ cursor, limitBytes, metadataOnly, metadataCursor, metadataMode, eventMode, backfillCursor }),
+      body: JSON.stringify({ cursor, limitBytes, metadataOnly, metadataCursor, metadataMode, eventMode, backfillCursor, lookbackDays }),
       signal: controller.signal,
     });
     if (!response.ok) {
@@ -148,12 +180,12 @@ async function fetchBatch(
   }
 }
 
-export async function fetchSessionMetadata(): Promise<SessionMetadataPayload> {
+export async function fetchSessionMetadata(lookbackDays?: number): Promise<SessionMetadataPayload> {
   if (preferredReadApi !== "legacy") {
     try {
       const [hosts, sessions] = await Promise.all([
-        readJson<HostInfo[]>(READ_API_ENDPOINTS.v2Hosts),
-        readJson<SessionInfo[]>(READ_API_ENDPOINTS.v2Sessions),
+        readJson<HostInfo[]>(withLookback(READ_API_ENDPOINTS.v2Hosts, lookbackDays)),
+        readJson<SessionInfo[]>(withLookback(READ_API_ENDPOINTS.v2Sessions, lookbackDays)),
       ]);
       rememberReadApi("v2");
       return { hosts, sessions, source: "v2" };
@@ -162,18 +194,19 @@ export async function fetchSessionMetadata(): Promise<SessionMetadataPayload> {
     }
   }
   const [hosts, sessions] = await Promise.all([
-    readJson<HostInfo[]>(READ_API_ENDPOINTS.legacyHosts),
-    readJson<SessionInfo[]>(READ_API_ENDPOINTS.legacySessions),
+    readJson<HostInfo[]>(withLookback(READ_API_ENDPOINTS.legacyHosts, lookbackDays)),
+    readJson<SessionInfo[]>(withLookback(READ_API_ENDPOINTS.legacySessions, lookbackDays)),
   ]);
   rememberReadApi("legacy");
   return { hosts, sessions, source: "legacy" };
 }
 
-export async function fetchSessionEvents(sessionId: string): Promise<SessionEventsPayload> {
+export async function fetchSessionEvents(sessionId: string, init?: RequestInit, lookbackDays?: number): Promise<SessionEventsPayload> {
   if (preferredReadApi !== "legacy") {
     try {
       const payload = await readJson<SessionPayload | SessionEvent[] | { session?: SessionInfo; events?: SessionEvent[] }>(
-        READ_API_ENDPOINTS.v2SessionEvents(sessionId),
+        withLookback(READ_API_ENDPOINTS.v2SessionEvents(sessionId), lookbackDays),
+        init,
       );
       rememberReadApi("v2");
       return normalizeSessionEventsPayload(payload, "v2");
@@ -181,7 +214,7 @@ export async function fetchSessionEvents(sessionId: string): Promise<SessionEven
       if (!shouldFallBackToLegacy(error)) throw error;
     }
   }
-  const payload = await readJson<SessionPayload>(READ_API_ENDPOINTS.legacySession(sessionId));
+  const payload = await readJson<SessionPayload>(withLookback(READ_API_ENDPOINTS.legacySession(sessionId), lookbackDays), init);
   rememberReadApi("legacy");
   return normalizeSessionEventsPayload(payload, "legacy");
 }
@@ -191,12 +224,27 @@ export async function pullUpdates(options: PullOptions = {}): Promise<PullResult
   const maxBatches = Math.max(1, options.maxBatches ?? DEFAULT_MAX_BATCHES);
   const timeoutMs = Math.max(1000, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const metadataOnly = options.metadataOnly !== false;
+  const lookbackDays = options.lookbackDays === undefined ? undefined : clampRetentionDays(options.lookbackDays);
   const onProgress = options.onProgress;
   const storedCursor = await getMeta<string>("syncCursor");
   let cursor = storedCursor ?? "0";
   let backfillCursor = await getMeta<string>("backfillCursor");
-  const eventMode = metadataOnly ? undefined : options.eventMode ?? (storedCursor ? "forward" : "recent");
-  let metadataCursor = await getMeta<string>("metadataCursor");
+  let storedBackfillHasMore = await getMeta<boolean>("backfillHasMore");
+  const storedLookbackDays = await getMeta<number>("lookbackDays");
+  const lookbackChanged = lookbackDays !== undefined && storedLookbackDays !== lookbackDays;
+  if (lookbackChanged) {
+    backfillCursor = undefined;
+    storedBackfillHasMore = false;
+    await Promise.all([deleteMeta("metadataCursor"), deleteMeta("backfillCursor"), setMeta("backfillHasMore", false), setMeta("lookbackDays", lookbackDays)]);
+  }
+  const eventMode = eventModeForPull({
+    metadataOnly,
+    requestedEventMode: options.eventMode,
+    storedCursor,
+    backfillCursor,
+    backfillHasMore: storedBackfillHasMore,
+  });
+  let metadataCursor = lookbackChanged ? undefined : await getMeta<string>("metadataCursor");
   let events = 0;
   let batches = 0;
   let hasMore = false;
@@ -210,7 +258,7 @@ export async function pullUpdates(options: PullOptions = {}): Promise<PullResult
     const previousCursor = cursor;
     const previousMetadataCursor = metadataCursor;
     const previousBackfillCursor = backfillCursor;
-    const payload = await fetchBatch(previousCursor, limitBytes, timeoutMs, metadataOnly, metadataCursor, eventMode, backfillCursor);
+    const payload = await fetchBatch(previousCursor, limitBytes, timeoutMs, metadataOnly, metadataCursor, eventMode, backfillCursor, lookbackDays);
     const nextHasMore = metadataOnly
       ? payload.metadataHasMore === true || payload.hasMore === true
       : eventMode === "backfill"

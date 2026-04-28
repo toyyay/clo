@@ -1,7 +1,7 @@
 import type { HostInfo, SessionEvent, SessionInfo, SessionPayload, SyncResponse } from "../../packages/shared/types";
 
 const DB_NAME = "chatview-cache-v3";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const CURRENT_SESSION_PREFIX = "v3:";
 const DB_OPEN_TIMEOUT_MS = 4000;
 
@@ -11,14 +11,27 @@ type StoreName =
   | "sessions"
   | "events"
   | "ydocs"
+  | "yjsOutbox"
   | "audioRecordings"
   | "audioChunks"
   | "clientLogs";
 
 export type CachedYDoc = {
   docId: string;
+  sessionDbId?: string;
   update: string;
   updatedAt: string;
+  dirty?: boolean;
+  lastSyncAt?: string;
+  lastSyncError?: string | null;
+};
+
+export type QueuedYjsUpdate = {
+  id: string;
+  docId: string;
+  sessionDbId: string;
+  update: string;
+  createdAt: string;
 };
 
 export type CacheStats = {
@@ -65,6 +78,11 @@ export function openCacheDb() {
         events.createIndex("sessionDbId", "sessionDbId");
       }
       if (!db.objectStoreNames.contains("ydocs")) db.createObjectStore("ydocs", { keyPath: "docId" });
+      if (!db.objectStoreNames.contains("yjsOutbox")) {
+        const outbox = db.createObjectStore("yjsOutbox", { keyPath: "id" });
+        outbox.createIndex("createdAt", "createdAt");
+        outbox.createIndex("docId", "docId");
+      }
       if (!db.objectStoreNames.contains("audioRecordings")) {
         const recordings = db.createObjectStore("audioRecordings", { keyPath: "id" });
         recordings.createIndex("status", "status");
@@ -115,6 +133,13 @@ export async function setMeta<T>(key: string, value: T) {
   const db = await openCacheDb();
   const tx = db.transaction("meta", "readwrite");
   tx.objectStore("meta").put({ key, value });
+  await transactionDone(tx);
+}
+
+export async function deleteMeta(key: string) {
+  const db = await openCacheDb();
+  const tx = db.transaction("meta", "readwrite");
+  tx.objectStore("meta").delete(key);
   await transactionDone(tx);
 }
 
@@ -190,6 +215,9 @@ export async function applySync(
   }
   if (options.storeEventCursor !== false) meta.put({ key: "syncCursor", value: payload.cursor });
   if (payload.backfillCursor) meta.put({ key: "backfillCursor", value: payload.backfillCursor });
+  if (payload.backfillCursor || payload.backfillHasMore !== undefined) {
+    meta.put({ key: "backfillHasMore", value: payload.backfillHasMore === true });
+  }
   if (payload.metadataCursor) meta.put({ key: "metadataCursor", value: payload.metadataCursor });
   meta.put({ key: "lastSyncAt", value: new Date().toISOString() });
 
@@ -228,6 +256,39 @@ export async function cacheShell(hostsInput: HostInfo[], sessionsInput: SessionI
       cursor.continue();
     };
   }
+  await transactionDone(tx);
+}
+
+export async function pruneCacheBefore(cutoffIso: string) {
+  const cutoffTime = Date.parse(cutoffIso);
+  if (!Number.isFinite(cutoffTime)) return;
+  const db = await openCacheDb();
+  const tx = db.transaction(["sessions", "events"] satisfies StoreName[], "readwrite");
+  const sessions = tx.objectStore("sessions");
+  const events = tx.objectStore("events");
+
+  const sessionCursor = sessions.openCursor();
+  sessionCursor.onsuccess = () => {
+    const cursor = sessionCursor.result;
+    if (!cursor) return;
+    const session = cursor.value as SessionInfo;
+    if (Date.parse(session.lastSeenAt) < cutoffTime) {
+      sessions.delete(cursor.primaryKey);
+      queueDeleteEventsForSession(events, session.id);
+    }
+    cursor.continue();
+  };
+
+  const eventCursor = events.openCursor();
+  eventCursor.onsuccess = () => {
+    const cursor = eventCursor.result;
+    if (!cursor) return;
+    const event = cursor.value as SessionEvent;
+    const eventTime = Date.parse(event.createdAt ?? event.ingestedAt);
+    if (Number.isFinite(eventTime) && eventTime < cutoffTime) events.delete(cursor.primaryKey);
+    cursor.continue();
+  };
+
   await transactionDone(tx);
 }
 
@@ -272,10 +333,94 @@ export async function loadYDocUpdate(docId: string): Promise<CachedYDoc | undefi
   return request<CachedYDoc | undefined>(db.transaction("ydocs").objectStore("ydocs").get(docId));
 }
 
-export async function saveYDocUpdate(docId: string, update: string) {
+export async function saveYDocUpdate(
+  docId: string,
+  update: string,
+  options: { sessionDbId?: string; dirty?: boolean; lastSyncAt?: string; lastSyncError?: string | null } = {},
+) {
   const db = await openCacheDb();
   const tx = db.transaction("ydocs", "readwrite");
-  tx.objectStore("ydocs").put({ docId, update, updatedAt: new Date().toISOString() } satisfies CachedYDoc);
+  const store = tx.objectStore("ydocs");
+  const current = await request<CachedYDoc | undefined>(store.get(docId));
+  store.put({
+    ...current,
+    docId,
+    sessionDbId: options.sessionDbId ?? current?.sessionDbId,
+    update,
+    updatedAt: new Date().toISOString(),
+    dirty: options.dirty ?? current?.dirty ?? false,
+    lastSyncAt: options.lastSyncAt ?? current?.lastSyncAt,
+    lastSyncError: options.lastSyncError === undefined ? current?.lastSyncError : options.lastSyncError,
+  } satisfies CachedYDoc);
+  await transactionDone(tx);
+}
+
+export async function markYDocDirty(docId: string, sessionDbId: string, update?: string) {
+  const db = await openCacheDb();
+  const tx = db.transaction("ydocs", "readwrite");
+  const store = tx.objectStore("ydocs");
+  const current = await request<CachedYDoc | undefined>(store.get(docId));
+  store.put({
+    ...current,
+    docId,
+    sessionDbId,
+    update: update ?? current?.update ?? "",
+    updatedAt: new Date().toISOString(),
+    dirty: true,
+    lastSyncError: null,
+  } satisfies CachedYDoc);
+  await transactionDone(tx);
+}
+
+export async function listDirtyYDocs(limit = 100): Promise<CachedYDoc[]> {
+  const db = await openCacheDb();
+  const docs = await request<CachedYDoc[]>(db.transaction("ydocs").objectStore("ydocs").getAll());
+  return docs
+    .filter((doc) => doc.dirty && doc.update && doc.sessionDbId)
+    .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
+    .slice(0, Math.max(1, limit));
+}
+
+export async function enqueueYjsOutboxUpdate(input: { docId: string; sessionDbId: string; update: string }) {
+  const db = await openCacheDb();
+  const tx = db.transaction("yjsOutbox", "readwrite");
+  const row: QueuedYjsUpdate = {
+    id: newQueueId(),
+    docId: input.docId,
+    sessionDbId: input.sessionDbId,
+    update: input.update,
+    createdAt: new Date().toISOString(),
+  };
+  tx.objectStore("yjsOutbox").put(row);
+  await transactionDone(tx);
+  return row;
+}
+
+export async function loadYjsOutboxUpdates(limit = 100): Promise<QueuedYjsUpdate[]> {
+  const db = await openCacheDb();
+  const index = db.transaction("yjsOutbox").objectStore("yjsOutbox").index("createdAt");
+  return new Promise((resolve, reject) => {
+    const rows: QueuedYjsUpdate[] = [];
+    const cursorRequest = index.openCursor();
+    cursorRequest.onerror = () => reject(cursorRequest.error);
+    cursorRequest.onsuccess = () => {
+      const cursor = cursorRequest.result;
+      if (!cursor || rows.length >= limit) {
+        resolve(rows);
+        return;
+      }
+      rows.push(cursor.value as QueuedYjsUpdate);
+      cursor.continue();
+    };
+  });
+}
+
+export async function deleteYjsOutboxUpdates(ids: string[]) {
+  if (!ids.length) return;
+  const db = await openCacheDb();
+  const tx = db.transaction("yjsOutbox", "readwrite");
+  const outbox = tx.objectStore("yjsOutbox");
+  for (const id of ids) outbox.delete(id);
   await transactionDone(tx);
 }
 
@@ -287,6 +432,7 @@ export async function loadCacheStats(): Promise<CacheStats> {
     "sessions",
     "events",
     "ydocs",
+    "yjsOutbox",
     "audioRecordings",
     "audioChunks",
     "clientLogs",
@@ -342,6 +488,13 @@ function request<T>(req: IDBRequest<T>): Promise<T> {
     req.onerror = () => reject(req.error);
     req.onsuccess = () => resolve(req.result);
   });
+}
+
+function newQueueId() {
+  const random = typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2);
+  return `${Date.now().toString(36)}-${random}`;
 }
 
 function queueDeleteEventsForSession(events: IDBObjectStore, sessionId: string) {

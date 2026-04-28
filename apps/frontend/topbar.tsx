@@ -1,6 +1,8 @@
 import type { SessionInfo } from "../../packages/shared/types";
 import type { SyncHealth, SyncState } from "./app-types";
+import { InterfacePrefsPopover } from "./interface-prefs-popover";
 import { relativeActivityLabel } from "./session-utils";
+import type { InterfacePrefs } from "./storage-prefs";
 
 type TopbarProps = {
   active: SessionInfo | null;
@@ -9,7 +11,13 @@ type TopbarProps = {
   syncHealth: SyncHealth;
   now: number;
   theme: "light" | "dark";
+  interfacePrefs: InterfacePrefs;
+  interfacePrefsOpen: boolean;
   onToggleSidebar: () => void;
+  onToggleInterfacePrefs: () => void;
+  onCloseInterfacePrefs: () => void;
+  onInterfacePrefsChange: (patch: Partial<InterfacePrefs>) => void;
+  onResetInterfacePrefs: () => void;
   onOpenAudio: () => void;
   onOpenSettings: () => void;
   onSync: () => void;
@@ -24,7 +32,13 @@ export function Topbar({
   syncHealth,
   now,
   theme,
+  interfacePrefs,
+  interfacePrefsOpen,
   onToggleSidebar,
+  onToggleInterfacePrefs,
+  onCloseInterfacePrefs,
+  onInterfacePrefsChange,
+  onResetInterfacePrefs,
   onOpenAudio,
   onOpenSettings,
   onSync,
@@ -58,6 +72,14 @@ export function Topbar({
         </div>
       </div>
       <div className="top-actions">
+        <InterfacePrefsPopover
+          open={interfacePrefsOpen}
+          prefs={interfacePrefs}
+          onToggle={onToggleInterfacePrefs}
+          onClose={onCloseInterfacePrefs}
+          onChange={onInterfacePrefsChange}
+          onReset={onResetInterfacePrefs}
+        />
         <button className="icon-button" onClick={onOpenAudio} title="Uploaded audio">
           Audio
         </button>

@@ -65,6 +65,30 @@ type SyncAgent = {
   sourceRoot?: string | null;
 };
 
+type AgentRuntime = {
+  runtimeId: string;
+  pid: number | null;
+  startedAt: string | null;
+  takeover: boolean;
+  metadata: Record<string, unknown>;
+};
+
+type AgentRuntimeControl = {
+  action: "continue" | "shutdown" | "reject";
+  reason?: string;
+  activeRuntimes?: AgentRuntimeInfo[];
+};
+
+type AgentRuntimeInfo = {
+  runtimeId: string;
+  agentId: string;
+  hostname: string;
+  pid: number | null;
+  startedAt: string | null;
+  lastSeenAt: string;
+  status: string;
+};
+
 type SourceFileInput = {
   sourcePath: string;
   provider: string;
@@ -131,10 +155,12 @@ export type RawChunkStoragePlan = {
 
 export class SyncEngineHttpError extends Error {
   status: number;
+  payload?: unknown;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, payload?: unknown) {
     super(message);
     this.status = status;
+    this.payload = payload;
   }
 }
 
@@ -145,13 +171,17 @@ export function isSyncEngineHttpError(error: unknown): error is SyncEngineHttpEr
 export async function handleAgentHello(req: Request, sql: any) {
   const body = await readJsonObject(req, syncEnginePolicy.requestLimits.helloBytes);
   const agent = normalizeAgent(body.agent);
+  const runtime = normalizeAgentRuntime(body, agent);
   await upsertAgent(sql, agent);
+  const control = runtime ? await registerAgentRuntime(sql, agent, runtime) : null;
 
   return {
     ok: true,
     protocol: syncEnginePolicy.protocol,
     serverTime: new Date().toISOString(),
     agentId: agent.agentId,
+    ...(runtime ? { runtimeId: runtime.runtimeId } : {}),
+    ...(control ? { control } : {}),
     policy: buildSyncPolicy(body),
   };
 }
@@ -159,8 +189,10 @@ export async function handleAgentHello(req: Request, sql: any) {
 export async function handleAgentInventory(req: Request, sql: any) {
   const body = await readJsonObject(req, syncEnginePolicy.requestLimits.inventoryBytes);
   const agent = normalizeAgent(body.agent);
+  const runtime = normalizeAgentRuntime(body, agent);
   const files = normalizeInventoryFiles(body);
   await upsertAgent(sql, agent);
+  await assertRuntimeMayUpload(sql, agent, runtime);
 
   let acceptedFiles = 0;
   let deletedFiles = 0;
@@ -193,7 +225,9 @@ export async function handleAgentInventory(req: Request, sql: any) {
 export async function handleAgentAppend(req: Request, sql: any) {
   const body = await readJsonObject(req, syncEnginePolicy.requestLimits.appendBytes);
   const { agent, source, chunks, cursor } = normalizeAppendRequest(body, { includeRawPayload: true });
+  const runtime = normalizeAgentRuntime(body, agent);
   await upsertAgent(sql, agent);
+  await assertRuntimeMayUpload(sql, agent, runtime);
 
   let acceptedChunks = 0;
   let acceptedEvents = 0;
@@ -323,7 +357,9 @@ export async function handleAgentAppend(req: Request, sql: any) {
             content_sha256 = coalesce(excluded.content_sha256, agent_normalized_events.content_sha256),
             metadata = agent_normalized_events.metadata || excluded.metadata,
             redaction = agent_normalized_events.redaction || excluded.redaction,
-            normalized = excluded.normalized
+            normalized = excluded.normalized,
+            sync_revision = nextval('sync_event_revision_seq'),
+            updated_at = now()
         `;
         acceptedEvents++;
       }
@@ -495,6 +531,181 @@ function normalizeAgent(value: unknown): SyncAgent {
     arch: optionalString(agent.arch, { max: 80 }),
     version: optionalString(agent.version, { max: 120 }),
     sourceRoot: optionalString(agent.sourceRoot, { max: 4096 }),
+  };
+}
+
+function normalizeAgentRuntime(body: Record<string, unknown>, agent: SyncAgent): AgentRuntime | null {
+  const agentValue = isPlainObject(body.agent) ? body.agent : {};
+  const runtimeValue = isPlainObject(body.runtime)
+    ? body.runtime
+    : isPlainObject(agentValue.runtime)
+      ? agentValue.runtime
+      : optionalString(agentValue.runtimeId, { max: 160 })
+        ? agentValue
+        : null;
+  if (!runtimeValue) return null;
+
+  const runtimeId =
+    optionalString(runtimeValue.runtimeId, { max: 160 }) ??
+    optionalString(runtimeValue.id, { max: 160 }) ??
+    optionalString(runtimeValue.processId, { max: 160 });
+  if (!runtimeId) throw new SyncEngineHttpError(400, "runtime.runtimeId is required");
+
+  const control = isPlainObject(body.control) ? body.control : {};
+  const takeover =
+    runtimeValue.takeover === true ||
+    runtimeValue.killExisting === true ||
+    runtimeValue.killAll === true ||
+    control.takeover === true ||
+    control.killExisting === true ||
+    control.killAll === true;
+  const pid = optionalProcessPid(runtimeValue.pid, "runtime.pid");
+  const startedAt = optionalTimestamp(runtimeValue.startedAt ?? runtimeValue.processStartedAt);
+  const metadata = limitMetadata(
+    redactMetadata({
+      ...runtimeValue,
+      runtimeId,
+      pid,
+      startedAt,
+      takeover,
+      agentId: agent.agentId,
+    }),
+    "runtime.metadata",
+  );
+
+  return {
+    runtimeId,
+    pid,
+    startedAt,
+    takeover,
+    metadata,
+  };
+}
+
+async function assertRuntimeMayUpload(sql: any, agent: SyncAgent, runtime: AgentRuntime | null) {
+  if (!runtime) return;
+  const control = await registerAgentRuntime(sql, agent, runtime);
+  if (control.action !== "shutdown") return;
+  throw new SyncEngineHttpError(409, "agent runtime shutdown requested", {
+    ok: false,
+    error: "agent runtime shutdown requested",
+    control,
+  });
+}
+
+async function registerAgentRuntime(sql: any, agent: SyncAgent, runtime: AgentRuntime): Promise<AgentRuntimeControl> {
+  return await sql.transaction(async (tx: any) => {
+    const activeRows = await tx`
+      select runtime_id, agent_id, hostname, pid, started_at, last_seen_at, status
+      from agent_runtimes
+      where hostname = ${agent.hostname}
+        and runtime_id <> ${runtime.runtimeId}
+        and status = 'active'
+        and shutdown_requested_at is null
+        and last_seen_at > now() - interval '30 seconds'
+      order by last_seen_at desc
+    `;
+    const activeRuntimes = activeRows.map(mapRuntimeInfo);
+
+    if (activeRuntimes.length && !runtime.takeover) {
+      throw new SyncEngineHttpError(409, "agent runtime already active for host", {
+        ok: false,
+        error: "agent runtime already active for host",
+        control: {
+          action: "reject",
+          reason: "host already has an active agent runtime",
+          activeRuntimes,
+        },
+      });
+    }
+
+    if (activeRuntimes.length && runtime.takeover) {
+      await tx`
+        update agent_runtimes
+        set status = 'shutdown',
+            shutdown_requested_at = now(),
+            shutdown_reason = ${`replaced by ${runtime.runtimeId}`},
+            replaced_by_runtime_id = ${runtime.runtimeId},
+            updated_at = now()
+        where hostname = ${agent.hostname}
+          and runtime_id <> ${runtime.runtimeId}
+          and status = 'active'
+          and shutdown_requested_at is null
+      `;
+    }
+
+    const currentRows = await tx`
+      select shutdown_requested_at, shutdown_reason
+      from agent_runtimes
+      where runtime_id = ${runtime.runtimeId}
+      limit 1
+    `;
+    const currentShutdown = currentRows[0]?.shutdown_requested_at;
+    const currentShutdownReason = currentRows[0]?.shutdown_reason;
+
+    await tx`
+      insert into agent_runtimes (
+        runtime_id,
+        agent_id,
+        hostname,
+        pid,
+        started_at,
+        process_started_at,
+        last_seen_at,
+        status,
+        takeover,
+        metadata,
+        updated_at
+      )
+      values (
+        ${runtime.runtimeId},
+        ${agent.agentId},
+        ${agent.hostname},
+        ${runtime.pid},
+        ${runtime.startedAt},
+        ${runtime.startedAt},
+        now(),
+        ${currentShutdown ? "shutdown" : "active"},
+        ${runtime.takeover},
+        ${runtime.metadata}::jsonb,
+        now()
+      )
+      on conflict (runtime_id) do update set
+        agent_id = excluded.agent_id,
+        hostname = excluded.hostname,
+        pid = coalesce(excluded.pid, agent_runtimes.pid),
+        started_at = coalesce(excluded.started_at, agent_runtimes.started_at),
+        process_started_at = coalesce(excluded.process_started_at, agent_runtimes.process_started_at),
+        last_seen_at = now(),
+        takeover = excluded.takeover,
+        metadata = agent_runtimes.metadata || excluded.metadata,
+        updated_at = now()
+    `;
+
+    if (currentShutdown) {
+      return {
+        action: "shutdown",
+        reason: currentShutdownReason ?? "shutdown requested by server",
+        activeRuntimes,
+      };
+    }
+
+    return {
+      action: "continue",
+      ...(activeRuntimes.length ? { reason: "replaced active runtimes", activeRuntimes } : {}),
+    };
+  });
+}
+
+function mapRuntimeInfo(row: any): AgentRuntimeInfo {
+  return {
+    runtimeId: row.runtime_id,
+    agentId: row.agent_id,
+    hostname: row.hostname,
+    pid: row.pid == null ? null : Number(row.pid),
+    startedAt: row.started_at ?? null,
+    lastSeenAt: row.last_seen_at,
+    status: row.status,
   };
 }
 
@@ -863,14 +1074,32 @@ function safePathPart(value: string) {
 
 async function upsertAgent(sql: any, agent: SyncAgent) {
   await sql`
-    insert into agents (id, hostname, platform, arch, version, source_root, last_seen_at)
-    values (${agent.agentId}, ${agent.hostname}, ${agent.platform}, ${agent.arch}, ${agent.version}, ${agent.sourceRoot}, now())
+    insert into agents (id, hostname, platform, arch, version, source_root, metadata_revision, last_seen_at)
+    values (
+      ${agent.agentId},
+      ${agent.hostname},
+      ${agent.platform},
+      ${agent.arch},
+      ${agent.version},
+      ${agent.sourceRoot},
+      nextval('sync_metadata_revision_seq'),
+      now()
+    )
     on conflict (id) do update set
       hostname = excluded.hostname,
       platform = coalesce(excluded.platform, agents.platform),
       arch = coalesce(excluded.arch, agents.arch),
       version = coalesce(excluded.version, agents.version),
       source_root = coalesce(excluded.source_root, agents.source_root),
+      metadata_revision = case
+        when agents.hostname is distinct from excluded.hostname
+          or agents.platform is distinct from coalesce(excluded.platform, agents.platform)
+          or agents.arch is distinct from coalesce(excluded.arch, agents.arch)
+          or agents.version is distinct from coalesce(excluded.version, agents.version)
+          or agents.source_root is distinct from coalesce(excluded.source_root, agents.source_root)
+        then nextval('sync_metadata_revision_seq')
+        else agents.metadata_revision
+      end,
       last_seen_at = now()
   `;
 }
@@ -895,6 +1124,7 @@ async function upsertSourceFile(sql: any, agentId: string, file: SourceFileInput
       git,
       metadata,
       redaction,
+      metadata_revision,
       deleted_at,
       last_seen_at
     )
@@ -916,6 +1146,7 @@ async function upsertSourceFile(sql: any, agentId: string, file: SourceFileInput
       ${file.git}::jsonb,
       ${file.metadata}::jsonb,
       ${file.redaction}::jsonb,
+      nextval('sync_metadata_revision_seq'),
       case when ${file.deleted}::boolean then now() else null end,
       now()
     )
@@ -935,7 +1166,13 @@ async function upsertSourceFile(sql: any, agentId: string, file: SourceFileInput
       git = agent_source_files.git || excluded.git,
       metadata = agent_source_files.metadata || excluded.metadata,
       redaction = agent_source_files.redaction || excluded.redaction,
-      deleted_at = excluded.deleted_at,
+      metadata_revision = nextval('sync_metadata_revision_seq'),
+      deleted_at = case
+        when excluded.deleted_at is not null then excluded.deleted_at
+        when agent_source_files.deleted_at is null then null
+        when excluded.current_generation > agent_source_files.current_generation then null
+        else agent_source_files.deleted_at
+      end,
       last_seen_at = now()
     returning id
   `;
@@ -1018,6 +1255,16 @@ function optionalNonNegativeInteger(value: unknown, label: string) {
     throw new SyncEngineHttpError(400, `${label} must be a non-negative integer`);
   }
   return value;
+}
+
+function optionalProcessPid(value: unknown, label: string) {
+  if (value == null) return null;
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    const parsed = Number(value.trim());
+    if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return value;
+  throw new SyncEngineHttpError(400, `${label} must be a positive integer`);
 }
 
 function optionalPositiveInteger(value: unknown, label: string) {

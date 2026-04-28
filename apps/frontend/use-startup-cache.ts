@@ -15,6 +15,7 @@ type StartupCacheOptions = {
   authState: AuthState;
   canShowLocalApp: boolean;
   isAuthenticated: boolean;
+  retentionDays: number;
   checkAuth: () => Promise<void>;
   refreshCache: (options?: { apply?: boolean }) => Promise<CachedShell>;
   setAuthState: Dispatch<SetStateAction<AuthState>>;
@@ -33,6 +34,7 @@ export function useStartupCache({
   authState,
   canShowLocalApp,
   isAuthenticated,
+  retentionDays,
   checkAuth,
   refreshCache,
   setAuthState,
@@ -103,7 +105,7 @@ export function useStartupCache({
           { durationMs: Math.round(performance.now() - started), fallback: "read-api-metadata" },
           ["cache", "startup"],
         ).catch(() => {});
-        const shell = await withTimeout(fetchSessionMetadata(), 10000, "server chat list read timed out");
+        const shell = await withTimeout(fetchSessionMetadata(retentionDays), 10000, "server chat list read timed out");
         if (disposed) return shell;
         setHosts((current) => (sameEntityList(current, shell.hosts, (host) => host.agentId) ? current : shell.hosts));
         setSessions((current) => (sameEntityList(current, shell.sessions, (session) => session.id) ? current : shell.sessions));

@@ -130,6 +130,7 @@ export type SyncRequest = {
   metadataLimit?: number;
   limitBytes?: number;
   metadataOnly?: boolean;
+  lookbackDays?: number;
 };
 
 export type SyncResponse = {

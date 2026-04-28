@@ -8,6 +8,26 @@ export const PROVIDER_FILTER_STORAGE_KEY = "chatview:provider-filter";
 export const DEVICE_FILTER_STORAGE_KEY = "chatview:device-filter";
 export const PROJECT_FILTER_STORAGE_KEY = "chatview:project-filter";
 export const SIDEBAR_TREE_STORAGE_KEY = "chatview:sidebar-tree";
+export const INTERFACE_PREFS_STORAGE_KEY = "chatview:interface-prefs";
+export const INTERFACE_PREFS_BEFORE_CHANGE_EVENT = "chatview:before-interface-prefs-change";
+export const RETENTION_DAYS_STORAGE_KEY = "chatview:retention-days";
+export const DEFAULT_RETENTION_DAYS = 15;
+export const MIN_RETENTION_DAYS = 1;
+export const MAX_RETENTION_DAYS = 180;
+
+export type InterfacePrefs = {
+  uiScale: number;
+  chatScale: number;
+  density: number;
+  chatWidth: number;
+};
+
+export const DEFAULT_INTERFACE_PREFS: InterfacePrefs = {
+  uiScale: 1,
+  chatScale: 1,
+  density: 1,
+  chatWidth: 920,
+};
 
 export function readLocalStorageString(key: string, fallback: string) {
   try {
@@ -32,6 +52,29 @@ export function readLocalStorageBoolean(key: string, fallback: boolean) {
   return fallback;
 }
 
+export function clampInterfacePrefs(value: Partial<InterfacePrefs>): InterfacePrefs {
+  return {
+    uiScale: clampNumber(value.uiScale, 0.88, 1.22, DEFAULT_INTERFACE_PREFS.uiScale),
+    chatScale: clampNumber(value.chatScale, 0.9, 1.36, DEFAULT_INTERFACE_PREFS.chatScale),
+    density: clampNumber(value.density, 0.82, 1.22, DEFAULT_INTERFACE_PREFS.density),
+    chatWidth: Math.round(clampNumber(value.chatWidth, 680, 1120, DEFAULT_INTERFACE_PREFS.chatWidth)),
+  };
+}
+
+export function readInterfacePrefs() {
+  try {
+    const raw = localStorage.getItem(INTERFACE_PREFS_STORAGE_KEY);
+    if (!raw) return DEFAULT_INTERFACE_PREFS;
+    return clampInterfacePrefs(JSON.parse(raw) as Partial<InterfacePrefs>);
+  } catch {
+    return DEFAULT_INTERFACE_PREFS;
+  }
+}
+
+export function writeInterfacePrefs(value: InterfacePrefs) {
+  writeLocalStorageValue(INTERFACE_PREFS_STORAGE_KEY, JSON.stringify(clampInterfacePrefs(value)));
+}
+
 export function sidebarWidthLimit() {
   const viewportLimit = typeof window === "undefined" ? MAX_SIDEBAR_WIDTH : Math.max(MIN_SIDEBAR_WIDTH, window.innerWidth - 28);
   return Math.min(MAX_SIDEBAR_WIDTH, viewportLimit);
@@ -45,4 +88,24 @@ export function clampSidebarWidth(value: number) {
 export function readSidebarWidth() {
   const value = Number(readLocalStorageString(SIDEBAR_WIDTH_STORAGE_KEY, String(DEFAULT_SIDEBAR_WIDTH)));
   return clampSidebarWidth(value);
+}
+
+export function clampRetentionDays(value: unknown) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return DEFAULT_RETENTION_DAYS;
+  return Math.round(Math.min(MAX_RETENTION_DAYS, Math.max(MIN_RETENTION_DAYS, number)));
+}
+
+export function readRetentionDays() {
+  return clampRetentionDays(readLocalStorageString(RETENTION_DAYS_STORAGE_KEY, String(DEFAULT_RETENTION_DAYS)));
+}
+
+export function writeRetentionDays(value: number) {
+  writeLocalStorageValue(RETENTION_DAYS_STORAGE_KEY, String(clampRetentionDays(value)));
+}
+
+function clampNumber(value: unknown, min: number, max: number, fallback: number) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, number));
 }

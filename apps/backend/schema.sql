@@ -1,3 +1,6 @@
+create sequence if not exists sync_metadata_revision_seq;
+create sequence if not exists sync_event_revision_seq;
+
 create table if not exists agents (
   id text primary key,
   hostname text not null,
@@ -5,6 +8,7 @@ create table if not exists agents (
   arch text,
   version text,
   source_root text,
+  metadata_revision bigint not null default nextval('sync_metadata_revision_seq'),
   created_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now()
 );
@@ -40,6 +44,7 @@ create table if not exists chat_sessions (
   git_dirty boolean,
   git_remote_url text,
   deleted_at timestamptz,
+  metadata_revision bigint not null default nextval('sync_metadata_revision_seq'),
   first_seen_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now(),
   unique (agent_id, session_id)
@@ -81,9 +86,16 @@ create index if not exists idx_sessions_git_commit
 create index if not exists idx_events_line_sha256
   on session_events (line_sha256) where line_sha256 is not null;
 
+create index if not exists idx_agents_metadata_revision
+  on agents (metadata_revision asc, id asc);
+
+create index if not exists idx_chat_sessions_metadata_revision
+  on chat_sessions (metadata_revision asc, id asc);
+
 create table if not exists yjs_documents (
   doc_id text primary key,
   session_db_id bigint references chat_sessions(id) on delete set null,
+  source_file_id bigint,
   update bytea not null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -91,6 +103,9 @@ create table if not exists yjs_documents (
 
 create index if not exists idx_yjs_documents_session
   on yjs_documents (session_db_id);
+
+create index if not exists idx_yjs_documents_source_file
+  on yjs_documents (source_file_id);
 
 create table if not exists import_tokens (
   id bigserial primary key,
@@ -282,6 +297,7 @@ create table if not exists agent_source_files (
   git jsonb not null default '{}'::jsonb,
   metadata jsonb not null default '{}'::jsonb,
   redaction jsonb not null default '{}'::jsonb,
+  metadata_revision bigint not null default nextval('sync_metadata_revision_seq'),
   first_seen_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now(),
   deleted_at timestamptz,
@@ -296,6 +312,9 @@ create index if not exists idx_agent_source_files_provider
 
 create index if not exists idx_agent_source_files_content_sha
   on agent_source_files (content_sha256) where content_sha256 is not null;
+
+create index if not exists idx_agent_source_files_metadata_revision
+  on agent_source_files (metadata_revision asc, id asc);
 
 create table if not exists agent_sync_cursors (
   id bigserial primary key,
@@ -367,7 +386,9 @@ create table if not exists agent_normalized_events (
   metadata jsonb not null default '{}'::jsonb,
   redaction jsonb not null default '{}'::jsonb,
   normalized jsonb not null default '{}'::jsonb,
-  created_at timestamptz not null default now()
+  sync_revision bigint not null default nextval('sync_event_revision_seq'),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
 );
 
 create unique index if not exists idx_agent_normalized_events_uid
@@ -382,3 +403,33 @@ create index if not exists idx_agent_normalized_events_type
 
 create index if not exists idx_agent_normalized_events_created
   on agent_normalized_events (created_at desc);
+
+create index if not exists idx_agent_normalized_events_sync_revision
+  on agent_normalized_events (sync_revision asc, id asc);
+
+create table if not exists agent_runtimes (
+  runtime_id text primary key,
+  agent_id text not null references agents(id) on delete cascade,
+  hostname text not null,
+  pid integer,
+  started_at timestamptz,
+  process_started_at timestamptz,
+  last_seen_at timestamptz not null default now(),
+  status text not null default 'active',
+  takeover boolean not null default false,
+  shutdown_requested_at timestamptz,
+  shutdown_reason text,
+  replaced_by_runtime_id text,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists idx_agent_runtimes_host_seen
+  on agent_runtimes (hostname, last_seen_at desc);
+
+create index if not exists idx_agent_runtimes_agent_seen
+  on agent_runtimes (agent_id, last_seen_at desc);
+
+create index if not exists idx_agent_runtimes_status
+  on agent_runtimes (status, last_seen_at desc);

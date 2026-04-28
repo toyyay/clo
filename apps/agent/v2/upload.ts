@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { normalizeTranscriptRecord } from "../../../packages/parsers";
 import type { AgentNormalizedEventInput } from "../../../packages/contracts";
-import type { AgentV2Identity, InventoryFile, UploadChunk } from "./types";
+import type { AgentV2Identity, InventoryFile, UploadChunk, UploadDiagnosticEvent } from "./types";
 
 export type AgentV1AppendRequest = {
   agent: AgentV2Identity;
@@ -62,6 +62,7 @@ export type AgentV1AppendRequest = {
     contentType: "application/x-ndjson";
     metadata: {
       generation: number;
+      diagnosticCount?: number;
     };
     events: AgentNormalizedEventInput[];
   }>;
@@ -141,8 +142,12 @@ export function buildAgentV1AppendRequest(agent: AgentV2Identity, chunk: UploadC
         contentType: "application/x-ndjson",
         metadata: {
           generation,
+          ...(chunk.diagnostics?.length ? { diagnosticCount: chunk.diagnostics.length } : {}),
         },
-        events: chunk.records.map((record) => normalizeRecord(chunk, record)),
+        events: [
+          ...chunk.records.map((record) => normalizeRecord(chunk, record)),
+          ...(chunk.diagnostics ?? []).map((diagnostic) => normalizeDiagnosticEvent(chunk, diagnostic)),
+        ],
       },
     ],
   };
@@ -246,6 +251,53 @@ function normalizeRecord(chunk: UploadChunk, record: UploadChunk["records"][numb
     sourceLineNo: record.lineNo,
     sourceOffset: record.offset,
     normalized: event,
+  };
+}
+
+function normalizeDiagnosticEvent(chunk: UploadChunk, diagnostic: UploadDiagnosticEvent): AgentNormalizedEventInput {
+  const generation = chunk.generation ?? 1;
+  const source = {
+    provider: chunk.provider,
+    sourcePath: chunk.logicalId,
+    lineNo: diagnostic.lineNo,
+    byteOffset: diagnostic.offset,
+    rawType: "agent_diagnostic",
+    rawKind: diagnostic.reason,
+  };
+  const data = {
+    reason: diagnostic.reason,
+    message: diagnostic.message,
+    rawBytes: diagnostic.byteLength,
+    maxBytes: diagnostic.maxBytes,
+    rawSha256: diagnostic.rawSha256,
+    omittedRawText: true,
+  };
+  const normalized = {
+    kind: "error",
+    role: "system",
+    display: false,
+    parts: [{ kind: "event", name: diagnostic.reason, data }],
+    source,
+  };
+
+  return {
+    eventUid: `${chunk.logicalId}:g${generation}:${diagnostic.lineNo}:${diagnostic.offset}:diagnostic:${diagnostic.reason}`,
+    eventType: "agent_diagnostic",
+    kind: "error",
+    role: "system",
+    sourceLineNo: diagnostic.lineNo,
+    sourceOffset: diagnostic.offset,
+    contentSha256: sha256Hex(JSON.stringify(normalized)),
+    metadata: {
+      diagnostic: true,
+      reason: diagnostic.reason,
+      rawBytes: diagnostic.byteLength,
+      maxBytes: diagnostic.maxBytes,
+      rawSha256: diagnostic.rawSha256,
+      omittedRawText: true,
+    },
+    normalized,
+    source,
   };
 }
 

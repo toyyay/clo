@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { INTERFACE_PREFS_BEFORE_CHANGE_EVENT } from "../storage-prefs";
 import { renderChatItem } from "./render-item";
 import type { RenderItem, SavedScroll, ScrollAnchor, UpdateRangeOptions, VirtualRange } from "./types";
 
@@ -158,6 +159,27 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     setMeasureVersion((version) => version + 1);
   }, []);
 
+  const captureVisibleAnchor = useCallback((heightScale = 1) => {
+    const el = scrollRef.current;
+    if (!el || !items.length) return;
+    const bottomGap = el.scrollHeight - el.scrollTop - el.clientHeight;
+    nearBottom.current = bottomGap < 160;
+    if (nearBottom.current) {
+      pendingBottom.current = true;
+      scrollAnchor.current = null;
+    } else {
+      const anchor = anchorForScroll(layout.offsets, itemKeys, el.scrollTop, items.length);
+      scrollAnchor.current = anchor ? { ...anchor, offset: anchor.offset * heightScale } : null;
+      pendingBottom.current = false;
+    }
+    if (heightScale > 0 && Math.abs(heightScale - 1) > 0.01) {
+      heights.current = new Map([...heights.current].map(([key, height]) => [key, Math.max(1, Math.ceil(height * heightScale))]));
+    }
+    saveChatScroll(resetKey, el);
+    setMeasureVersion((version) => version + 1);
+    scheduleRange({ captureAnchor: false });
+  }, [itemKeys, items.length, layout.offsets, resetKey, scheduleRange]);
+
   useLayoutEffect(() => {
     cancelScrollFrame();
     heights.current.clear();
@@ -232,6 +254,15 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     observer.observe(el);
     return () => observer.disconnect();
   }, [scheduleRange]);
+
+  useEffect(() => {
+    const onBeforeInterfaceChange = (event: Event) => {
+      const detail = "detail" in event ? (event as CustomEvent<{ heightScale?: number }>).detail : undefined;
+      captureVisibleAnchor(detail?.heightScale ?? 1);
+    };
+    window.addEventListener(INTERFACE_PREFS_BEFORE_CHANGE_EVENT, onBeforeInterfaceChange);
+    return () => window.removeEventListener(INTERFACE_PREFS_BEFORE_CHANGE_EVENT, onBeforeInterfaceChange);
+  }, [captureVisibleAnchor]);
 
   useEffect(() => {
     writeFollowBottom(followBottom);

@@ -1,6 +1,8 @@
 import * as Y from "yjs";
 import type { SessionInfo, YjsSocketMessage, YjsSyncRequest, YjsSyncResponse } from "../../packages/shared/types";
-import { loadYDocUpdate, saveYDocUpdate } from "./db";
+import { loadYDocUpdate, saveYDocUpdate, type QueuedYjsUpdate } from "./db";
+
+export type PendingYjsUpdate = Pick<QueuedYjsUpdate, "docId" | "sessionDbId" | "update">;
 
 export function docIdForSession(sessionDbId: string) {
   return `chat:${sessionDbId}`;
@@ -28,8 +30,12 @@ export async function loadDraftDoc(docId: string) {
   return doc;
 }
 
-export async function persistDraftDoc(docId: string, doc: Y.Doc) {
-  await saveYDocUpdate(docId, toBase64(Y.encodeStateAsUpdate(doc)));
+export async function persistDraftDoc(
+  docId: string,
+  doc: Y.Doc,
+  options: { sessionDbId?: string; dirty?: boolean; lastSyncAt?: string; lastSyncError?: string | null } = {},
+) {
+  await saveYDocUpdate(docId, toBase64(Y.encodeStateAsUpdate(doc)), options);
 }
 
 export async function mergeCachedDraftUpdate(docId: string, update: Uint8Array) {
@@ -54,7 +60,12 @@ export async function syncDraftDoc(docId: string, sessionDbId: string, doc: Y.Do
   const response = await postYjsSync(request);
   const remote = response.docs.find((item) => item.docId === docId);
   if (remote?.update) Y.applyUpdate(doc, fromBase64(remote.update), "remote");
-  await persistDraftDoc(docId, doc);
+  await persistDraftDoc(docId, doc, {
+    sessionDbId,
+    dirty: false,
+    lastSyncAt: new Date().toISOString(),
+    lastSyncError: null,
+  });
 }
 
 export async function syncCachedDraftDocs(sessions: SessionInfo[]) {
@@ -80,6 +91,32 @@ export async function syncCachedDraftDocs(sessions: SessionInfo[]) {
       await mergeCachedDraftUpdate(remote.docId, fromBase64(remote.update));
     }),
   );
+}
+
+export function buildYjsOutboxSyncRequest(entries: PendingYjsUpdate[]): YjsSyncRequest {
+  const grouped = new Map<string, { docId: string; sessionDbId: string; updates: string[] }>();
+  for (const entry of entries) {
+    const current = grouped.get(entry.docId);
+    if (current) {
+      current.sessionDbId = entry.sessionDbId || current.sessionDbId;
+      current.updates.push(entry.update);
+    } else {
+      grouped.set(entry.docId, { docId: entry.docId, sessionDbId: entry.sessionDbId, updates: [entry.update] });
+    }
+  }
+
+  return {
+    docs: [...grouped.values()].map((entry) => ({
+      docId: entry.docId,
+      sessionDbId: entry.sessionDbId,
+      update: mergeBase64Updates(entry.updates),
+    })),
+  };
+}
+
+export async function syncYjsOutboxEntries(entries: PendingYjsUpdate[]) {
+  if (!entries.length) return { docs: [] } satisfies YjsSyncResponse;
+  return postYjsSync(buildYjsOutboxSyncRequest(entries));
 }
 
 export function openYjsSocket(onRemoteUpdate: (docId: string, update: Uint8Array) => void) {
@@ -117,6 +154,11 @@ function sendWhenOpen(socket: WebSocket | null, message: YjsSocketMessage) {
   const send = () => socket.send(JSON.stringify(message));
   if (socket.readyState === WebSocket.OPEN) send();
   else if (socket.readyState === WebSocket.CONNECTING) socket.addEventListener("open", send, { once: true });
+}
+
+function mergeBase64Updates(updates: string[]) {
+  if (updates.length === 1) return updates[0];
+  return toBase64(Y.mergeUpdates(updates.map(fromBase64)));
 }
 
 async function postYjsSync(request: YjsSyncRequest): Promise<YjsSyncResponse> {

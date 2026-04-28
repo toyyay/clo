@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { missingInventoryFilesFromCursors, scanInventory } from "./inventory";
+import { missingInventoryFilesFromCursors, scanInventory, scanInventoryWithStatus } from "./inventory";
 
 describe("agent-v2 inventory", () => {
   test("scans configured roots and applies ignore patterns", async () => {
@@ -24,7 +24,22 @@ describe("agent-v2 inventory", () => {
     expect(files[0].sessionId).toBe("session-1");
   });
 
-  test("builds tombstones for legacy Claude cursor roots outside the active scan", () => {
+  test("reports missing roots as non-authoritative", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "chatview-agent-v2-inventory-missing-"));
+    const result = await scanInventoryWithStatus([{ provider: "claude", rootPath: join(dir, "missing") }]);
+
+    expect(result.files).toEqual([]);
+    expect(result.roots).toEqual([
+      {
+        provider: "claude",
+        rootPath: join(dir, "missing"),
+        authoritative: false,
+        reason: "missing",
+      },
+    ]);
+  });
+
+  test("does not build tombstones for legacy cursor roots outside authoritative scans by default", () => {
     const missingPath = "/Users/example/Downloads/claude/projects/project-a/session-1.jsonl";
     const files = missingInventoryFilesFromCursors(
       {
@@ -38,6 +53,26 @@ describe("agent-v2 inventory", () => {
       },
       [{ provider: "claude", rootPath: "/Users/example/.claude/projects" }],
       [],
+    );
+
+    expect(files).toEqual([]);
+  });
+
+  test("can still build legacy tombstones when explicitly requested", () => {
+    const missingPath = "/Users/example/Downloads/claude/projects/project-a/session-1.jsonl";
+    const files = missingInventoryFilesFromCursors(
+      {
+        [missingPath]: {
+          generation: 1,
+          offset: 10,
+          lineNo: 1,
+          sizeBytes: 10,
+          mtimeMs: 1000,
+        },
+      },
+      [{ provider: "claude", rootPath: "/Users/example/.claude/projects" }],
+      [],
+      { allowLegacyTombstones: true },
     );
 
     expect(files).toHaveLength(1);

@@ -27,6 +27,12 @@ function formatLimit(value?: number | null) {
   return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : "unlimited";
 }
 
+function formatCacheRecords(cacheStats: CacheStats | null) {
+  if (!cacheStats) return "loading";
+  const total = Object.values(cacheStats.indexedDb).reduce((sum, value) => sum + value, 0);
+  return `${total.toLocaleString()} records, ${cacheStats.indexedDb.events.toLocaleString()} events`;
+}
+
 function openRouterStatusLabel(settings: AppSettingsInfo | null) {
   const status = settings?.openRouter.status;
   if (status === "ok") return "ready";
@@ -74,8 +80,10 @@ export function SettingsModal({
   onUnregisterServiceWorkers,
   groupByProject,
   sidebarWidth,
+  retentionDays,
   onGroupByProjectChange,
   onResetSidebarWidth,
+  onRetentionDaysChange,
 }: {
   settings: AppSettingsInfo | null;
   cacheStats: CacheStats | null;
@@ -91,8 +99,10 @@ export function SettingsModal({
   onUnregisterServiceWorkers: () => void;
   groupByProject: boolean;
   sidebarWidth: number;
+  retentionDays: number;
   onGroupByProjectChange: (value: boolean) => void;
   onResetSidebarWidth: () => void;
+  onRetentionDaysChange: (value: number) => void;
 }) {
   const openRouter = settings?.openRouter;
   const openRouterReady = openRouter?.status === "ok";
@@ -171,6 +181,35 @@ export function SettingsModal({
           <div className="kv-grid">
             <span>Sidebar width</span>
             <b>{sidebarWidth}px</b>
+          </div>
+          <label className="settings-range">
+            <span>
+              <b>Keep chats</b>
+              <output>{retentionDays.toLocaleString()} days</output>
+            </span>
+            <input
+              type="range"
+              min={1}
+              max={180}
+              step={1}
+              value={retentionDays}
+              onChange={(event) => onRetentionDaysChange(Number(event.target.value))}
+            />
+            <input
+              type="number"
+              min={1}
+              max={180}
+              step={1}
+              value={retentionDays}
+              onChange={(event) => onRetentionDaysChange(Number(event.target.value))}
+              aria-label="Retention days"
+            />
+          </label>
+          <div className="kv-grid">
+            <span>Local window</span>
+            <b>
+              {formatCacheRecords(cacheStats)} / {formatBytes(cacheStats?.storageUsageBytes)}
+            </b>
           </div>
           <div className="settings-actions">
             <button className="icon-button" onClick={onResetSidebarWidth}>

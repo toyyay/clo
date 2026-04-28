@@ -3,11 +3,11 @@ import { join } from "node:path";
 import { envPositiveInteger, envValue, type EnvSource } from "../../../packages/shared/env";
 import { AGENT_V1_ENDPOINTS } from "../../../packages/contracts";
 import { readAppendJsonl } from "./cursor";
-import { missingInventoryFilesFromCursors, scanInventory } from "./inventory";
-import { DEFAULT_SYNC_POLICY, fetchServerSyncPolicy } from "./policy";
+import { missingInventoryFilesFromCursors, scanInventoryWithStatus } from "./inventory";
+import { AgentRuntimeRejectedError, AgentShutdownRequestedError, DEFAULT_SYNC_POLICY, fetchServerSyncPolicy } from "./policy";
 import { executeUploadPlan, planUploadChunks } from "./planner";
 import { parseRootSpec, rootsFromEnv } from "./roots";
-import { identityForAgentV2, loadAgentV2State, saveAgentV2State } from "./state";
+import { identityForAgentV2, loadAgentV2State, runtimeMetadataForAgentV2, saveAgentV2State } from "./state";
 import { buildAgentV1AppendRequest, buildAgentV1InventoryRequest } from "./upload";
 import type { AgentV2Identity, InventoryFile, SyncPolicy, SyncRootConfig, TailBatch, UploadChunk, UploadTransport } from "./types";
 
@@ -31,6 +31,7 @@ export type AgentV2RunOptions = {
   appendPath?: string;
   inventoryPath?: string;
   fetchPolicy?: boolean;
+  takeover?: boolean;
   logIdleEveryScans?: number;
   once?: boolean;
   env?: EnvSource;
@@ -40,9 +41,14 @@ export type AgentV2RunOptions = {
 
 export type AgentV2ScanSummary = {
   agentId: string;
+  runtimeId: string;
+  pid: number;
+  startedAt: string;
   policySource: SyncPolicy["source"];
   uploadsEnabled: boolean;
   roots: SyncRootConfig[];
+  authoritativeRootCount: number;
+  nonAuthoritativeRootCount: number;
   fileCount: number;
   pendingRecordCount: number;
   inventoryFileCount: number;
@@ -57,10 +63,11 @@ export async function runAgentV2(options: AgentV2RunOptions): Promise<void> {
   const log = options.log ?? console;
   const pollMs = options.pollMs ?? 2000;
   const logIdleEveryScans = options.logIdleEveryScans ?? 30;
+  const runtime = runtimeMetadataForAgentV2();
   let scanCount = 0;
 
   log.log(
-    `[agent-v2] starting; backend ${trimSlash(options.backendUrl)}, state ${options.statePath}, poll ${pollMs}ms`,
+    `[agent-v2] starting; backend ${trimSlash(options.backendUrl)}, state ${options.statePath}, poll ${pollMs}ms, runtime ${runtime.runtimeId}, pid ${runtime.pid}${options.takeover ? ", takeover enabled" : ""}`,
   );
 
   do {
@@ -72,6 +79,7 @@ export async function runAgentV2(options: AgentV2RunOptions): Promise<void> {
         summary.plannedChunkCount > 0 ||
         summary.inventoryFileCount > 0 ||
         summary.deletedInventoryFileCount > 0 ||
+        summary.nonAuthoritativeRootCount > 0 ||
         !summary.uploadsEnabled;
       const shouldLogIdle = logIdleEveryScans > 0 && scanCount % logIdleEveryScans === 0;
       if (options.once || hasActivity || shouldLogIdle) {
@@ -79,6 +87,10 @@ export async function runAgentV2(options: AgentV2RunOptions): Promise<void> {
         if (summary.skippedCount) log.log(`[agent-v2] skipped ${summary.skippedCount} item(s)`);
       }
     } catch (error) {
+      if (error instanceof AgentShutdownRequestedError || error instanceof AgentRuntimeRejectedError) {
+        log.error(`[agent-v2] ${error.message}`);
+        break;
+      }
       log.error(`[agent-v2] ${error instanceof Error ? error.message : String(error)}`);
     }
     if (options.once) break;
@@ -98,18 +110,21 @@ export async function scanAndUploadAgentV2(options: AgentV2RunOptions): Promise<
         backendUrl: options.backendUrl,
         token: options.token,
         identity,
+        takeover: options.takeover,
         fetchImpl: options.fetchImpl,
       })
     : DEFAULT_SYNC_POLICY;
 
   if (!policy.enabled) {
     await saveAgentV2State(options.statePath, state);
-    return emptySummary(state.agentId, policy, roots);
+    return emptySummary(identity, policy, roots);
   }
 
   const scanRoots = roots.filter((root) => policy.scanRoots.includes(root.provider));
-  const files = await scanInventory(scanRoots, policy.ignorePatterns);
-  const deletedInventoryFiles = missingInventoryFilesFromCursors(state.cursors, scanRoots, files);
+  const inventoryScan = await scanInventoryWithStatus(scanRoots, policy.ignorePatterns);
+  const files = inventoryScan.files;
+  const authoritativeRoots = authoritativeScanRoots(scanRoots, inventoryScan.roots);
+  const deletedInventoryFiles = missingInventoryFilesFromCursors(state.cursors, authoritativeRoots, files);
   const batches: TailBatch[] = [];
   const readChunkBytes = options.readChunkBytes ?? policy.maxUploadChunkBytes;
 
@@ -123,9 +138,14 @@ export async function scanAndUploadAgentV2(options: AgentV2RunOptions): Promise<
     await saveAgentV2State(options.statePath, state);
     return {
       agentId: state.agentId,
+      runtimeId: identity.runtimeId,
+      pid: identity.pid,
+      startedAt: identity.startedAt,
       policySource: policy.source,
       uploadsEnabled: false,
       roots,
+      authoritativeRootCount: authoritativeRoots.length,
+      nonAuthoritativeRootCount: inventoryScan.roots.length - authoritativeRoots.length,
       fileCount: files.length,
       pendingRecordCount: countPendingRecords(batches),
       inventoryFileCount: 0,
@@ -173,9 +193,14 @@ export async function scanAndUploadAgentV2(options: AgentV2RunOptions): Promise<
 
   return {
     agentId: state.agentId,
+    runtimeId: identity.runtimeId,
+    pid: identity.pid,
+    startedAt: identity.startedAt,
     policySource: policy.source,
     uploadsEnabled: true,
     roots,
+    authoritativeRootCount: authoritativeRoots.length,
+    nonAuthoritativeRootCount: inventoryScan.roots.length - authoritativeRoots.length,
     fileCount: files.length,
     pendingRecordCount: countPendingRecords(batches),
     inventoryFileCount: 0,
@@ -260,6 +285,7 @@ export function parseAgentV2RunArgs(argv: string[], env: EnvSource = process.env
   let appendPath = envValue(env, "APPEND_PATH", "AGENT_APPEND_PATH", "CHATVIEW_AGENT_APPEND_PATH") ?? DEFAULT_APPEND_PATH;
   let inventoryPath = envValue(env, "INVENTORY_PATH", "AGENT_INVENTORY_PATH", "CHATVIEW_AGENT_INVENTORY_PATH") ?? DEFAULT_INVENTORY_PATH;
   let logIdleEveryScans = envNonNegativeInteger(env, ["LOG_IDLE_EVERY_SCANS", "CHATVIEW_LOG_IDLE_EVERY_SCANS"], 30);
+  let takeover = envBoolean(env, ["AGENT_TAKEOVER", "TAKEOVER", "KILL_EXISTING_AGENT", "KILL_EXISTING", "KILLALL", "CHATVIEW_AGENT_TAKEOVER"], false);
   let fetchPolicy = true;
   let once = false;
 
@@ -290,6 +316,8 @@ export function parseAgentV2RunArgs(argv: string[], env: EnvSource = process.env
       inventoryPath = argv[++i] ?? inventoryPath;
     } else if (value === "--log-idle-every-scans") {
       logIdleEveryScans = nonNegativeInteger(argv[++i], logIdleEveryScans) ?? logIdleEveryScans;
+    } else if (value === "--takeover" || value === "--override" || value === "--kill-existing" || value === "--killall" || value === "--kill-all") {
+      takeover = true;
     } else if (value === "--no-fetch-policy") {
       fetchPolicy = false;
     } else if (value === "--once") {
@@ -308,6 +336,7 @@ export function parseAgentV2RunArgs(argv: string[], env: EnvSource = process.env
     inventoryPath,
     logIdleEveryScans,
     fetchPolicy,
+    takeover,
     once,
     env,
   };
@@ -337,12 +366,17 @@ async function fetchWithRetry(url: string, init: RequestInit, fetchImpl: typeof 
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-function emptySummary(agentId: string, policy: SyncPolicy, roots: SyncRootConfig[]): AgentV2ScanSummary {
+function emptySummary(identity: AgentV2Identity, policy: SyncPolicy, roots: SyncRootConfig[]): AgentV2ScanSummary {
   return {
-    agentId,
+    agentId: identity.agentId,
+    runtimeId: identity.runtimeId,
+    pid: identity.pid,
+    startedAt: identity.startedAt,
     policySource: policy.source,
     uploadsEnabled: policy.uploadsEnabled,
     roots,
+    authoritativeRootCount: 0,
+    nonAuthoritativeRootCount: 0,
     fileCount: 0,
     pendingRecordCount: 0,
     inventoryFileCount: 0,
@@ -364,13 +398,25 @@ function formatAgentV2Summary(summary: AgentV2ScanSummary, mode: "activity" | "i
     : "inventory idle";
   return [
     `[agent-v2] ${mode}`,
+    `agent ${summary.agentId}`,
+    `runtime ${summary.runtimeId}`,
     `files ${summary.fileCount}`,
     `pending ${summary.pendingRecordCount}`,
     `planned ${summary.plannedChunkCount}`,
+    `roots ${summary.authoritativeRootCount} ok, ${summary.nonAuthoritativeRootCount} deferred`,
     inventoryNote,
     uploadNote,
     `policy ${summary.policySource}`,
   ].join("; ");
+}
+
+function authoritativeScanRoots(roots: SyncRootConfig[], scans: Array<{ provider: string; rootPath: string; authoritative: boolean }>) {
+  const authoritative = new Set(scans.filter((scan) => scan.authoritative).map((scan) => rootKey(scan)));
+  return roots.filter((root) => authoritative.has(rootKey(root)));
+}
+
+function rootKey(root: { provider: string; rootPath: string }) {
+  return `${root.provider}\0${root.rootPath}`;
 }
 
 function normalizePath(value: string) {
@@ -391,6 +437,16 @@ function envNonNegativeInteger(env: EnvSource, names: string[], fallback: number
   for (const name of names) {
     const parsed = nonNegativeInteger(envValue(env, name), undefined);
     if (parsed !== undefined) return parsed;
+  }
+  return fallback;
+}
+
+function envBoolean(env: EnvSource, names: string[], fallback: boolean) {
+  for (const name of names) {
+    const value = envValue(env, name);
+    if (value === undefined) continue;
+    if (/^(1|true|yes|on)$/i.test(value)) return true;
+    if (/^(0|false|no|off)$/i.test(value)) return false;
   }
   return fallback;
 }

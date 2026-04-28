@@ -8,6 +8,9 @@ export type AgentV2Identity = {
   platform: NodeJS.Platform;
   arch: string;
   version: string;
+  runtimeId: string;
+  pid: number;
+  startedAt: string;
 };
 
 export type AgentV2State = {
@@ -31,6 +34,18 @@ export type SyncRootConfig = {
   provider: ProviderKind;
   rootPath: string;
   ignorePatterns?: string[];
+};
+
+export type InventoryRootScan = {
+  provider: ProviderKind;
+  rootPath: string;
+  authoritative: boolean;
+  reason?: "ok" | "missing" | "not_directory" | "read_error";
+};
+
+export type InventoryScanResult = {
+  files: InventoryFile[];
+  roots: InventoryRootScan[];
 };
 
 export type InventoryFile = {
@@ -95,6 +110,17 @@ export type UploadChunk = {
   rawSha256?: string;
   rawBytes?: number;
   records: TailRecord[];
+  diagnostics?: UploadDiagnosticEvent[];
+};
+
+export type UploadDiagnosticEvent = {
+  reason: "record_too_large";
+  message: string;
+  lineNo: number;
+  offset: number;
+  byteLength: number;
+  maxBytes: number;
+  rawSha256: string;
 };
 
 export type UploadPlan = {

@@ -132,6 +132,60 @@ describe("agent-v2 live runner", () => {
     expect(state.cursors[missingPath]).toBeUndefined();
   });
 
+  test("does not tombstone cursor files when the scan root is non-authoritative", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "chatview-agent-v2-run-missing-root-"));
+    const rootPath = join(dir, "missing-claude");
+    const statePath = join(dir, "state", "v2.json");
+    const missingPath = join(rootPath, "project-a", "gone.jsonl");
+    await mkdir(join(dir, "state"), { recursive: true });
+    await writeFile(
+      statePath,
+      JSON.stringify({
+        agentId: "agent-test",
+        cursors: {
+          [missingPath]: { generation: 1, offset: 10, lineNo: 1, sizeBytes: 10, mtimeMs: 1 },
+        },
+      }),
+    );
+
+    const uploads: unknown[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      if (String(url).endsWith("/api/agent/v1/hello")) {
+        return jsonResponse({
+          policy: {
+            enabled: true,
+            uploadsEnabled: true,
+            maxFileBytes: 1024 * 1024,
+            maxUploadChunkBytes: 1024,
+            maxUploadLines: 10,
+            scanRoots: ["claude"],
+            ignorePatterns: [],
+          },
+        });
+      }
+      if (String(url).endsWith("/api/agent/v1/inventory")) {
+        uploads.push(JSON.parse(String(init?.body)));
+        return jsonResponse({ ok: true, acceptedFiles: 0, deletedFiles: 0, fileIds: [] });
+      }
+      return jsonResponse({ error: "not found" }, 404);
+    }) as unknown as typeof fetch;
+
+    const summary = await scanAndUploadAgentV2({
+      roots: [{ provider: "claude", rootPath }],
+      statePath,
+      backendUrl: "http://backend.test",
+      token: "test-token",
+      readChunkBytes: 1024,
+      fetchImpl,
+    });
+
+    expect(summary.deletedInventoryFileCount).toBe(0);
+    expect(summary.nonAuthoritativeRootCount).toBe(1);
+    expect(uploads).toEqual([]);
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    expect(state.cursors[missingPath]).toBeDefined();
+  });
+
   test("uploads append chunks from files larger than the raw file limit", async () => {
     const dir = await mkdtemp(join(tmpdir(), "chatview-agent-v2-run-large-"));
     const rootPath = join(dir, "codex");
@@ -220,17 +274,32 @@ describe("agent-v2 live runner", () => {
     expect(summary.skippedCount).toBe(1);
     expect((uploads[0] as any).chunks[0].rawText).toBeUndefined();
     expect((uploads[0] as any).chunks[0].rawBytes).toBe(65);
-    expect((uploads[0] as any).chunks[0].events).toEqual([]);
+    expect((uploads[0] as any).chunks[0].events).toHaveLength(1);
+    expect((uploads[0] as any).chunks[0].events[0]).toMatchObject({
+      eventType: "agent_diagnostic",
+      kind: "error",
+      role: "system",
+      sourceLineNo: 1,
+      sourceOffset: 0,
+      metadata: {
+        diagnostic: true,
+        reason: "record_too_large",
+        rawBytes: 65,
+        maxBytes: 8,
+        omittedRawText: true,
+      },
+    });
     const state = JSON.parse(await readFile(statePath, "utf8"));
     expect(state.cursors[sourcePath].offset).toBe(65);
   });
 
   test("parses repeated roots and env roots for watch or one-shot commands", () => {
     const options = parseAgentV2RunArgs(
-      ["--root", "claude=/tmp/claude", "--root=codex=/tmp/codex", "--once", "--log-idle-every-scans", "0"],
+      ["--root", "claude=/tmp/claude", "--root=codex=/tmp/codex", "--once", "--log-idle-every-scans", "0", "--killall"],
       { BACKEND_URL: "http://backend.test", AGENT_TOKEN: "token" },
     );
     expect(options.once).toBe(true);
+    expect(options.takeover).toBe(true);
     expect(options.logIdleEveryScans).toBe(0);
     expect(options.roots).toEqual([
       { provider: "claude", rootPath: "/tmp/claude" },
@@ -243,6 +312,13 @@ describe("agent-v2 live runner", () => {
       ROOTS: "gemini=/tmp/gemini",
     });
     expect(envOptions.roots).toEqual([{ provider: "gemini", rootPath: "/tmp/gemini" }]);
+
+    const takeoverOptions = parseAgentV2RunArgs([], {
+      BACKEND_URL: "http://backend.test",
+      AGENT_TOKEN: "token",
+      AGENT_TAKEOVER: "true",
+    });
+    expect(takeoverOptions.takeover).toBe(true);
   });
 });
 

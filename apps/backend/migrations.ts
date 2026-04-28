@@ -514,6 +514,110 @@ create index if not exists idx_agent_raw_chunks_storage_key
 create index if not exists idx_agent_source_files_raw_storage_key
   on agent_source_files (raw_storage_key)
   where raw_storage_key is not null;
+	`.trim(),
+  },
+  {
+    id: "0010",
+    name: "sync_revisions_and_agent_runtimes",
+    sql: `
+create sequence if not exists sync_metadata_revision_seq;
+create sequence if not exists sync_event_revision_seq;
+
+alter table agents
+  add column if not exists metadata_revision bigint;
+
+update agents
+set metadata_revision = nextval('sync_metadata_revision_seq')
+where metadata_revision is null;
+
+alter table agents
+  alter column metadata_revision set default nextval('sync_metadata_revision_seq'),
+  alter column metadata_revision set not null;
+
+alter table chat_sessions
+  add column if not exists metadata_revision bigint;
+
+update chat_sessions
+set metadata_revision = nextval('sync_metadata_revision_seq')
+where metadata_revision is null;
+
+alter table chat_sessions
+  alter column metadata_revision set default nextval('sync_metadata_revision_seq'),
+  alter column metadata_revision set not null;
+
+alter table agent_source_files
+  add column if not exists metadata_revision bigint;
+
+update agent_source_files
+set metadata_revision = nextval('sync_metadata_revision_seq')
+where metadata_revision is null;
+
+alter table agent_source_files
+  alter column metadata_revision set default nextval('sync_metadata_revision_seq'),
+  alter column metadata_revision set not null;
+
+alter table agent_normalized_events
+  add column if not exists sync_revision bigint,
+  add column if not exists updated_at timestamptz not null default now();
+
+update agent_normalized_events
+set sync_revision = id
+where sync_revision is null;
+
+select setval(
+  'sync_event_revision_seq',
+  greatest((select coalesce(max(sync_revision), 0) from agent_normalized_events), 1),
+  true
+);
+
+alter table agent_normalized_events
+  alter column sync_revision set default nextval('sync_event_revision_seq'),
+  alter column sync_revision set not null;
+
+create index if not exists idx_agent_normalized_events_sync_revision
+  on agent_normalized_events (sync_revision asc, id asc);
+
+create index if not exists idx_agents_metadata_revision
+  on agents (metadata_revision asc, id asc);
+
+create index if not exists idx_chat_sessions_metadata_revision
+  on chat_sessions (metadata_revision asc, id asc);
+
+create index if not exists idx_agent_source_files_metadata_revision
+  on agent_source_files (metadata_revision asc, id asc);
+
+alter table yjs_documents
+  add column if not exists source_file_id bigint references agent_source_files(id) on delete set null;
+
+create index if not exists idx_yjs_documents_source_file
+  on yjs_documents (source_file_id);
+
+create table if not exists agent_runtimes (
+  runtime_id text primary key,
+  agent_id text not null references agents(id) on delete cascade,
+  hostname text not null,
+  pid integer,
+  started_at timestamptz,
+  process_started_at timestamptz,
+  last_seen_at timestamptz not null default now(),
+  status text not null default 'active',
+  takeover boolean not null default false,
+  shutdown_requested_at timestamptz,
+  shutdown_reason text,
+  replaced_by_runtime_id text,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists idx_agent_runtimes_host_seen
+  on agent_runtimes (hostname, last_seen_at desc);
+
+create index if not exists idx_agent_runtimes_agent_seen
+  on agent_runtimes (agent_id, last_seen_at desc);
+
+create index if not exists idx_agent_runtimes_status
+  on agent_runtimes (status, last_seen_at desc);
 `.trim(),
   },
 ];

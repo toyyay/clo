@@ -43,8 +43,18 @@ describe("agent-v2 upload planner", () => {
       omitRawText: true,
       rawBytes: 20,
       records: [],
+      diagnostics: [
+        {
+          reason: "record_too_large",
+          lineNo: 1,
+          offset: 0,
+          byteLength: 20,
+          maxBytes: 8,
+        },
+      ],
     });
-    expect(plan.skipped[0].reason).toContain("raw payload omitted");
+    expect(plan.chunks[0].diagnostics?.[0].rawSha256).toHaveLength(64);
+    expect(plan.skipped[0].reason).toContain("diagnostic event emitted");
   });
 
   test("uses contiguous span length for chunks with blank lines between records", () => {

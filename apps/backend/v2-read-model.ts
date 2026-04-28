@@ -38,6 +38,7 @@ type V2EventRow = {
   created_at?: unknown;
   normalized?: unknown;
   ordinal?: unknown;
+  sync_revision?: unknown;
 };
 
 export function v2SessionId(sourceFileId: unknown) {
@@ -54,7 +55,8 @@ export function isV2SessionId(id: string) {
   return parseV2SessionId(id) !== null;
 }
 
-export async function listV2Hosts(sql: SqlTag): Promise<HostInfo[]> {
+export async function listV2Hosts(sql: SqlTag, cutoffIso?: string | null): Promise<HostInfo[]> {
+  const cutoff = cutoffIso ?? null;
   const rows = await sql`
     select
       a.id,
@@ -68,10 +70,13 @@ export async function listV2Hosts(sql: SqlTag): Promise<HostInfo[]> {
       count(distinct f.id) filter (where f.deleted_at is null and f.source_kind = 'conversation') as session_count,
       count(e.id) filter (where f.deleted_at is null and f.source_kind = 'conversation') as event_count
     from agents a
-    left join agent_source_files f on f.agent_id = a.id
+    left join agent_source_files f
+      on f.agent_id = a.id
+      and (${cutoff}::timestamptz is null or f.last_seen_at >= ${cutoff}::timestamptz)
     left join agent_normalized_events e
       on e.source_file_id = f.id
       and e.source_generation = f.current_generation
+      and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
     group by a.id
     having count(distinct f.id) filter (where f.deleted_at is null and f.source_kind = 'conversation') > 0
     order by a.last_seen_at desc
@@ -80,7 +85,8 @@ export async function listV2Hosts(sql: SqlTag): Promise<HostInfo[]> {
   return rows.map(mapV2HostRow);
 }
 
-export async function listV2Sessions(sql: SqlTag, agentId?: string): Promise<SessionInfo[]> {
+export async function listV2Sessions(sql: SqlTag, agentId?: string, options: { cutoffIso?: string | null } = {}): Promise<SessionInfo[]> {
+  const cutoff = options.cutoffIso ?? null;
   const rows = agentId
     ? await sql`
         select
@@ -161,9 +167,11 @@ export async function listV2Sessions(sql: SqlTag, agentId?: string): Promise<Ses
         left join agent_normalized_events e
           on e.source_file_id = f.id
           and e.source_generation = f.current_generation
+          and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
         where f.agent_id = ${agentId}
           and f.source_kind = 'conversation'
           and f.deleted_at is null
+          and (${cutoff}::timestamptz is null or f.last_seen_at >= ${cutoff}::timestamptz)
         group by f.id, a.hostname, source_meta.metadata
         order by f.last_seen_at desc, max(e.id) desc nulls last
       `
@@ -246,8 +254,10 @@ export async function listV2Sessions(sql: SqlTag, agentId?: string): Promise<Ses
         left join agent_normalized_events e
           on e.source_file_id = f.id
           and e.source_generation = f.current_generation
+          and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
         where f.source_kind = 'conversation'
           and f.deleted_at is null
+          and (${cutoff}::timestamptz is null or f.last_seen_at >= ${cutoff}::timestamptz)
         group by f.id, a.hostname, source_meta.metadata
         order by f.last_seen_at desc, max(e.id) desc nulls last
       `;
@@ -255,9 +265,14 @@ export async function listV2Sessions(sql: SqlTag, agentId?: string): Promise<Ses
   return rows.map(mapV2SessionRow);
 }
 
-export async function getV2SessionsMeta(sql: SqlTag, sourceFileIds: string[], options: { includeDeleted?: boolean } = {}): Promise<SessionInfo[]> {
+export async function getV2SessionsMeta(
+  sql: SqlTag,
+  sourceFileIds: string[],
+  options: { includeDeleted?: boolean; cutoffIso?: string | null } = {},
+): Promise<SessionInfo[]> {
   const ids = [...new Set(sourceFileIds.filter((id) => /^\d+$/.test(id)))];
   if (!ids.length) return [];
+  const cutoff = options.cutoffIso ?? null;
   const rows = options.includeDeleted
     ? await sql`
         select
@@ -338,8 +353,10 @@ export async function getV2SessionsMeta(sql: SqlTag, sourceFileIds: string[], op
         left join agent_normalized_events e
           on e.source_file_id = f.id
           and e.source_generation = f.current_generation
+          and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
         where f.id = any(${postgresBigintArrayLiteral(ids)}::bigint[])
           and f.source_kind = 'conversation'
+          and (${cutoff}::timestamptz is null or f.last_seen_at >= ${cutoff}::timestamptz or f.deleted_at >= ${cutoff}::timestamptz)
         group by f.id, a.hostname, source_meta.metadata
       `
     : await sql`
@@ -421,18 +438,21 @@ export async function getV2SessionsMeta(sql: SqlTag, sourceFileIds: string[], op
         left join agent_normalized_events e
           on e.source_file_id = f.id
           and e.source_generation = f.current_generation
+          and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
         where f.id = any(${postgresBigintArrayLiteral(ids)}::bigint[])
           and f.source_kind = 'conversation'
           and f.deleted_at is null
+          and (${cutoff}::timestamptz is null or f.last_seen_at >= ${cutoff}::timestamptz)
         group by f.id, a.hostname, source_meta.metadata
       `;
   const byId = new Map(rows.map((row: any) => [toId(row.id), mapV2SessionRow(row)] as const));
   return ids.map((id) => byId.get(id)).filter((session): session is SessionInfo => Boolean(session));
 }
 
-export async function getV2Session(sql: SqlTag, sessionId: string): Promise<SessionPayload | null> {
+export async function getV2Session(sql: SqlTag, sessionId: string, options: { cutoffIso?: string | null } = {}): Promise<SessionPayload | null> {
   const sourceFileId = parseV2SessionId(sessionId);
   if (!sourceFileId) return null;
+  const cutoff = options.cutoffIso ?? null;
 
   const sessionRows = await sql`
     select
@@ -513,9 +533,11 @@ export async function getV2Session(sql: SqlTag, sessionId: string): Promise<Sess
     left join agent_normalized_events e
       on e.source_file_id = f.id
       and e.source_generation = f.current_generation
+      and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
     where f.id = ${sourceFileId}
       and f.source_kind = 'conversation'
       and f.deleted_at is null
+      and (${cutoff}::timestamptz is null or f.last_seen_at >= ${cutoff}::timestamptz)
     group by f.id, a.hostname, source_meta.metadata
   `;
 
@@ -541,6 +563,7 @@ export async function getV2Session(sql: SqlTag, sessionId: string): Promise<Sess
       and e.source_generation = f.current_generation
       and f.source_kind = 'conversation'
       and f.deleted_at is null
+      and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
     order by e.source_line_no asc nulls last, e.source_offset asc nulls last, e.id asc
   `;
 
@@ -550,83 +573,63 @@ export async function getV2Session(sql: SqlTag, sessionId: string): Promise<Sess
   };
 }
 
-export async function listV2EventsForSync(sql: SqlTag, cursor: bigint, limit: number): Promise<V2EventRow[]> {
+export async function listV2EventsForSync(sql: SqlTag, cursor: bigint, limit: number, cutoffIso?: string | null): Promise<V2EventRow[]> {
+  const cutoff = cutoffIso ?? null;
   return await sql`
     select
-      visible.id,
-      visible.source_file_id,
-      visible.source_line_no,
-      visible.source_offset,
-      visible.event_type,
-      visible.role,
-      visible.occurred_at,
-      visible.created_at,
-      visible.normalized,
-      visible.ordinal
-    from (
-      select
-        e.id,
-        e.source_file_id,
-        e.source_line_no,
-        e.source_offset,
-        e.event_type,
-        e.role,
-        e.occurred_at,
-        e.created_at,
-        e.normalized,
-        row_number() over (
-          partition by e.source_file_id
-          order by e.source_line_no asc nulls last, e.source_offset asc nulls last, e.id asc
-        ) as ordinal
-      from agent_normalized_events e
-      join agent_source_files f on f.id = e.source_file_id
-      where e.source_generation = f.current_generation
-        and f.source_kind = 'conversation'
-        and f.deleted_at is null
-    ) visible
-    where visible.id > ${cursor}
-    order by visible.id asc
+      e.id,
+      e.source_file_id,
+      e.source_line_no,
+      e.source_offset,
+      e.event_type,
+      e.role,
+      e.occurred_at,
+      e.created_at,
+      e.normalized,
+      e.sync_revision,
+      coalesce(e.source_line_no + 1, 0) as ordinal
+    from agent_normalized_events e
+    join agent_source_files f on f.id = e.source_file_id
+    where e.source_generation = f.current_generation
+      and f.source_kind = 'conversation'
+      and f.deleted_at is null
+      and e.sync_revision > ${cursor}
+      and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
+    order by e.sync_revision asc, e.id asc
     limit ${limit}
   `;
 }
 
-export async function listV2EventsForBackfill(sql: SqlTag, before: bigint, ceiling: bigint, limit: number): Promise<V2EventRow[]> {
+export async function listV2EventsForBackfill(
+  sql: SqlTag,
+  before: bigint,
+  ceiling: bigint,
+  limit: number,
+  cutoffIso?: string | null,
+): Promise<V2EventRow[]> {
+  const cutoff = cutoffIso ?? null;
   return await sql`
     select
-      visible.id,
-      visible.source_file_id,
-      visible.source_line_no,
-      visible.source_offset,
-      visible.event_type,
-      visible.role,
-      visible.occurred_at,
-      visible.created_at,
-      visible.normalized,
-      visible.ordinal
-    from (
-      select
-        e.id,
-        e.source_file_id,
-        e.source_line_no,
-        e.source_offset,
-        e.event_type,
-        e.role,
-        e.occurred_at,
-        e.created_at,
-        e.normalized,
-        row_number() over (
-          partition by e.source_file_id
-          order by e.source_line_no asc nulls last, e.source_offset asc nulls last, e.id asc
-        ) as ordinal
-      from agent_normalized_events e
-      join agent_source_files f on f.id = e.source_file_id
-      where e.source_generation = f.current_generation
-        and f.source_kind = 'conversation'
-        and f.deleted_at is null
-    ) visible
-    where visible.id < ${before}
-      and visible.id <= ${ceiling}
-    order by visible.id desc
+      e.id,
+      e.source_file_id,
+      e.source_line_no,
+      e.source_offset,
+      e.event_type,
+      e.role,
+      e.occurred_at,
+      e.created_at,
+      e.normalized,
+      e.sync_revision,
+      coalesce(e.source_line_no + 1, 0) as ordinal
+    from agent_normalized_events e
+    join agent_source_files f on f.id = e.source_file_id
+    where e.source_generation = f.current_generation
+      and f.source_kind = 'conversation'
+      and f.deleted_at is null
+      and e.sync_revision < ${before}
+      and e.sync_revision <= ${ceiling}
+      and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
+    order by e.sync_revision desc, e.id desc
     limit ${limit}
   `;
 }

@@ -20,10 +20,14 @@ import {
   clearBrowserCaches,
   cacheSessionPayload,
   cacheShell,
+  deleteYjsOutboxUpdates,
+  enqueueYjsOutboxUpdate,
   getMeta,
   loadCacheStats,
   loadHosts,
   loadSessions,
+  loadYjsOutboxUpdates,
+  pruneCacheBefore,
   resetIndexedDbCache,
   setMeta,
   unregisterServiceWorkers,
@@ -44,13 +48,22 @@ import { openIngestStream } from "./stream";
 import {
   clampSidebarWidth,
   DEFAULT_SIDEBAR_WIDTH,
+  DEFAULT_INTERFACE_PREFS,
   GROUP_BY_PROJECT_STORAGE_KEY,
+  INTERFACE_PREFS_BEFORE_CHANGE_EVENT,
   MIN_SIDEBAR_WIDTH,
+  clampInterfacePrefs,
+  clampRetentionDays,
+  readInterfacePrefs,
   readLocalStorageBoolean,
+  readRetentionDays,
   readSidebarWidth,
   SIDEBAR_WIDTH_STORAGE_KEY,
   sidebarWidthLimit,
+  writeInterfacePrefs,
   writeLocalStorageValue,
+  writeRetentionDays,
+  type InterfacePrefs,
 } from "./storage-prefs";
 import { fetchSessionEvents, fetchSessionMetadata, pullUpdates, SyncAuthError } from "./sync";
 import { useAudioImports } from "./use-audio-imports";
@@ -58,6 +71,7 @@ import { useSessionEventsCache } from "./use-session-events-cache";
 import { useStartupCache } from "./use-startup-cache";
 import {
   docIdForSession,
+  fromBase64,
   getDraft,
   loadDraftDoc,
   mergeCachedDraftUpdate,
@@ -68,6 +82,8 @@ import {
   subscribeYjsSocket,
   syncCachedDraftDocs,
   syncDraftDoc,
+  syncYjsOutboxEntries,
+  toBase64,
 } from "./yjs";
 import { Topbar } from "./topbar";
 
@@ -98,6 +114,9 @@ export function App() {
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [sidebarOpen, setSidebarOpen] = useState(() => !window.matchMedia("(max-width: 780px)").matches);
   const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth);
+  const [interfacePrefs, setInterfacePrefs] = useState(readInterfacePrefs);
+  const [interfacePrefsOpen, setInterfacePrefsOpen] = useState(false);
+  const [retentionDays, setRetentionDays] = useState(readRetentionDays);
   const [groupByProject, setGroupByProject] = useState(() => readLocalStorageBoolean(GROUP_BY_PROJECT_STORAGE_KEY, true));
   const [draft, setDraft] = useState("");
   const [settings, setSettings] = useState<AppSettingsInfo | null>(null);
@@ -116,6 +135,13 @@ export function App() {
   const yDocs = useRef(new Map<string, Y.Doc>());
   const ySocket = useRef<WebSocket | null>(null);
   const yPushTimers = useRef(new Map<string, number>());
+  const yOutboxFlushing = useRef(false);
+  const yReconcileRunning = useRef(false);
+  const yReconcileQueued = useRef(false);
+  const resumeRecentAfterBackfill = useRef(false);
+  const previousRetentionDays = useRef(retentionDays);
+  const sessionEventRefreshes = useRef(new Map<string, { generation: number; controller: AbortController }>());
+  const sessionPayloadCacheWrites = useRef(new Map<string, Promise<void>>());
   const isAuthenticated = authState === "authenticated";
   const canShowLocalApp = authState !== "anonymous";
   const settingsOpen = route.panel === "settings";
@@ -142,6 +168,30 @@ export function App() {
   const resetSidebarWidth = useCallback(() => {
     setSidebarWidth(clampSidebarWidth(DEFAULT_SIDEBAR_WIDTH));
   }, []);
+
+  const updateInterfacePrefs = useCallback((patch: Partial<InterfacePrefs>) => {
+    setInterfacePrefs((current) => {
+      const next = clampInterfacePrefs({ ...current, ...patch });
+      if (
+        next.uiScale === current.uiScale &&
+        next.chatScale === current.chatScale &&
+        next.density === current.density &&
+        next.chatWidth === current.chatWidth
+      ) {
+        return current;
+      }
+      window.dispatchEvent(
+        new CustomEvent(INTERFACE_PREFS_BEFORE_CHANGE_EVENT, {
+          detail: { heightScale: estimateChatHeightScale(current, next) },
+        }),
+      );
+      return next;
+    });
+  }, []);
+
+  const resetInterfacePrefs = useCallback(() => {
+    updateInterfacePrefs(DEFAULT_INTERFACE_PREFS);
+  }, [updateInterfacePrefs]);
 
   const beginSidebarResize = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -188,8 +238,15 @@ export function App() {
   );
 
   const appShellStyle = useMemo(
-    () => ({ "--sidebar-width": `${sidebarWidth}px` }) as CSSProperties,
-    [sidebarWidth],
+    () =>
+      ({
+        "--sidebar-width": `${sidebarWidth}px`,
+        "--ui-font-scale": String(interfacePrefs.uiScale),
+        "--ui-density": String(interfacePrefs.density),
+        "--chat-font-scale": String(interfacePrefs.chatScale),
+        "--chat-line-width": `${interfacePrefs.chatWidth}px`,
+      }) as CSSProperties,
+    [interfacePrefs, sidebarWidth],
   );
 
   const markServerAttempt = useCallback(() => {
@@ -259,8 +316,38 @@ export function App() {
     setDraft("");
   }, [setSessionEvents]);
 
+  const queueSessionPayloadCache = useCallback((sessionId: string, generation: number, payload: { session: SessionInfo; events: SessionEvent[] }) => {
+    const previous = sessionPayloadCacheWrites.current.get(sessionId) ?? Promise.resolve();
+    const write = previous
+      .catch(() => {})
+      .then(async () => {
+        const latest = sessionEventRefreshes.current.get(sessionId);
+        if (latest && latest.generation > generation) return;
+        await cacheSessionPayload(payload);
+      });
+    const tracked = write
+      .catch((cacheError) => {
+        void logClientEvent(
+          "warn",
+          "cache.session_write.failed",
+          cacheError instanceof Error ? cacheError.message : String(cacheError),
+          { sessionId, events: payload.events.length, error: cacheError },
+          ["cache", "session"],
+        ).catch(() => {});
+      })
+      .finally(() => {
+        if (sessionPayloadCacheWrites.current.get(sessionId) === tracked) sessionPayloadCacheWrites.current.delete(sessionId);
+      });
+    sessionPayloadCacheWrites.current.set(sessionId, tracked);
+  }, []);
+
   const refreshActiveSessionEvents = useCallback(async (sessionId: string, reason: string, cachedEvents: number, expectedEvents: number) => {
     if (navigator.onLine === false) return false;
+    const previousRefresh = sessionEventRefreshes.current.get(sessionId);
+    previousRefresh?.controller.abort();
+    const generation = (previousRefresh?.generation ?? 0) + 1;
+    const controller = new AbortController();
+    sessionEventRefreshes.current.set(sessionId, { generation, controller });
     const readStarted = performance.now();
     void logClientEvent(
       "debug",
@@ -270,38 +357,40 @@ export function App() {
       ["read", "session"],
     ).catch(() => {});
     markServerAttempt();
-    const payload = await fetchSessionEvents(sessionId);
-    if (activeRef.current?.id !== sessionId) return false;
-    markServerReachable();
-    const sessionForCache = payload.session ?? activeRef.current;
-    if (payload.session) setActiveSession(payload.session);
-    setSessionEvents(sessionId, payload.events);
-    if (sessionForCache) {
-      void cacheSessionPayload({ session: sessionForCache, events: payload.events }).catch((cacheError) => {
-        void logClientEvent(
-          "warn",
-          "cache.session_write.failed",
-          cacheError instanceof Error ? cacheError.message : String(cacheError),
-          { sessionId, events: payload.events.length, error: cacheError },
-          ["cache", "session"],
-        ).catch(() => {});
-      });
+    const isCurrentRefresh = () => {
+      const current = sessionEventRefreshes.current.get(sessionId);
+      return current?.generation === generation && current.controller === controller;
+    };
+    try {
+      const payload = await fetchSessionEvents(sessionId, { signal: controller.signal }, retentionDays);
+      if (!isCurrentRefresh() || activeRef.current?.id !== sessionId) return false;
+      markServerReachable();
+      const sessionForCache = payload.session ?? activeRef.current;
+      if (payload.session) setActiveSession(payload.session);
+      setSessionEvents(sessionId, payload.events);
+      if (sessionForCache) queueSessionPayloadCache(sessionId, generation, { session: sessionForCache, events: payload.events });
+      void logClientEvent(
+        "info",
+        "read.session_events.complete",
+        null,
+        {
+          sessionId,
+          source: payload.source,
+          events: payload.events.length,
+          durationMs: Math.round(performance.now() - readStarted),
+          reason,
+          generation,
+        },
+        ["read", "session"],
+      ).catch(() => {});
+      return true;
+    } catch (error) {
+      if (isAbortError(error) && !isCurrentRefresh()) return false;
+      throw error;
+    } finally {
+      if (isCurrentRefresh()) sessionEventRefreshes.current.delete(sessionId);
     }
-    void logClientEvent(
-      "info",
-      "read.session_events.complete",
-      null,
-      {
-        sessionId,
-        source: payload.source,
-        events: payload.events.length,
-        durationMs: Math.round(performance.now() - readStarted),
-        reason,
-      },
-      ["read", "session"],
-    ).catch(() => {});
-    return true;
-  }, [markServerAttempt, markServerReachable, setActiveSession, setSessionEvents]);
+  }, [markServerAttempt, markServerReachable, queueSessionPayloadCache, retentionDays, setActiveSession, setSessionEvents]);
 
   const checkAuth = useCallback(async () => {
     const started = performance.now();
@@ -434,7 +523,7 @@ export function App() {
     } finally {
       setSettingsBusy(false);
     }
-  }, []);
+  }, [retentionDays]);
 
   const copyText = useCallback(async (value: string) => {
     try {
@@ -609,6 +698,7 @@ export function App() {
       const result = await pullUpdates({
         metadataOnly,
         eventMode,
+        lookbackDays: retentionDays,
         maxBatches: eventMode === "backfill" ? 1 : 4,
         onProgress: ({ events, batches, hasMore }) => {
           if (!events && !metadataOnly) return;
@@ -652,6 +742,11 @@ export function App() {
         },
         ["sync"],
       ).catch(() => {});
+      if (!metadataOnly && eventMode === "recent" && result.eventMode === "backfill") {
+        resumeRecentAfterBackfill.current = true;
+      } else if (!metadataOnly && result.eventMode === "recent") {
+        resumeRecentAfterBackfill.current = false;
+      }
       let refreshedSessions = sessionsRef.current;
       if (shouldRefreshCache) {
         if (metadataOnly) {
@@ -665,7 +760,7 @@ export function App() {
               { durationMs: Math.round(performance.now() - started) },
               ["cache", "sync"],
             ).catch(() => {});
-            const shell = await fetchSessionMetadata();
+            const shell = await fetchSessionMetadata(retentionDays);
             setHosts((current) => (sameEntityList(current, shell.hosts, (host) => host.agentId) ? current : shell.hosts));
             setSessions((current) => (sameEntityList(current, shell.sessions, (session) => session.id) ? current : shell.sessions));
             void cacheShell(shell.hosts, shell.sessions).catch(() => {});
@@ -792,6 +887,9 @@ export function App() {
           backfillTimer.current = null;
           void syncNow({ silent: true, metadataOnly: false, eventMode: "backfill" });
         }, result.eventMode === "recent" ? 1000 : 2500);
+      } else if (!metadataOnly && result.eventMode === "backfill" && !result.backfillHasMore && resumeRecentAfterBackfill.current) {
+        resumeRecentAfterBackfill.current = false;
+        window.setTimeout(() => void syncNow({ silent: true, metadataOnly: false, eventMode: "recent" }), 0);
       }
     } catch (error) {
       if (error instanceof SyncAuthError) {
@@ -812,6 +910,8 @@ export function App() {
       ).catch(() => {});
       console.error(error);
     } finally {
+      const cutoffIso = retentionCutoffIso(retentionDays);
+      if (cutoffIso) void pruneCacheBefore(cutoffIso).catch(() => {});
       syncing.current = false;
       void flushClientLogs().catch(() => {});
       const pending = pendingSync.current;
@@ -825,6 +925,8 @@ export function App() {
     markServerReachable,
     navigateRoute,
     refreshCache,
+    retentionDays,
+    refreshActiveSessionEvents,
     setActiveSession,
     setSessionEvents,
   ]);
@@ -869,6 +971,7 @@ export function App() {
     authState,
     canShowLocalApp,
     isAuthenticated,
+    retentionDays,
     checkAuth,
     refreshCache,
     setAuthState,
@@ -942,6 +1045,105 @@ export function App() {
     sessionsRef.current = sessions;
   }, [sessions]);
 
+  const applyRemoteYjsUpdate = useCallback(async (docId: string, update: Uint8Array) => {
+    const doc = yDocs.current.get(docId);
+    if (doc) {
+      Y.applyUpdate(doc, update, "remote");
+      await persistDraftDoc(docId, doc);
+      if (activeYDocId.current === docId) setDraft(getDraft(doc));
+      return;
+    }
+    await mergeCachedDraftUpdate(docId, update);
+  }, []);
+
+  const flushYjsOutbox = useCallback(async (reason: string) => {
+    if (!isAuthenticated || navigator.onLine === false || yOutboxFlushing.current) return;
+    yOutboxFlushing.current = true;
+    let flushed = 0;
+    try {
+      while (true) {
+        const entries = await loadYjsOutboxUpdates(100);
+        if (!entries.length) break;
+        const response = await syncYjsOutboxEntries(entries);
+        for (const remote of response.docs) {
+          if (remote.update) await applyRemoteYjsUpdate(remote.docId, fromBase64(remote.update));
+        }
+        await deleteYjsOutboxUpdates(entries.map((entry) => entry.id));
+        flushed += entries.length;
+        if (entries.length < 100) break;
+      }
+      if (flushed) {
+        void logClientEvent(
+          "info",
+          "yjs.outbox.flushed",
+          null,
+          { reason, updates: flushed },
+          ["yjs", "sync"],
+        ).catch(() => {});
+      }
+    } catch (error) {
+      void logClientEvent(
+        "warn",
+        "yjs.outbox.flush_failed",
+        error instanceof Error ? error.message : String(error),
+        { reason, flushed, error },
+        ["yjs", "sync"],
+      ).catch(() => {});
+      console.error(error);
+    } finally {
+      yOutboxFlushing.current = false;
+    }
+  }, [applyRemoteYjsUpdate, isAuthenticated]);
+
+  const reconcileYjsDocs = useCallback(async (reason: string) => {
+    if (!isAuthenticated || navigator.onLine === false) return;
+    if (yReconcileRunning.current) {
+      yReconcileQueued.current = true;
+      return;
+    }
+    yReconcileRunning.current = true;
+    try {
+      do {
+        yReconcileQueued.current = false;
+        await flushYjsOutbox(`${reason}:pre`);
+        const liveDocIds = new Set<string>();
+        for (const [docId, doc] of yDocs.current) {
+          const sessionDbId = sessionDbIdFromDocId(docId);
+          if (!sessionDbId) continue;
+          liveDocIds.add(docId);
+          await syncDraftDoc(docId, sessionDbId, doc, true);
+          if (activeYDocId.current === docId) setDraft(getDraft(doc));
+        }
+        const warmSessions = sessionsRef.current
+          .slice(0, 20)
+          .filter((session) => !liveDocIds.has(docIdForSession(session.id)));
+        if (warmSessions.length) await syncCachedDraftDocs(warmSessions);
+        const docIds = [...new Set([...liveDocIds, ...warmSessions.map((session) => docIdForSession(session.id))])];
+        if (docIds.length) subscribeYjsSocket(ySocket.current, docIds);
+        if (liveDocIds.size || warmSessions.length) {
+          void logClientEvent(
+            "debug",
+            "yjs.reconcile.complete",
+            null,
+            { reason, liveDocs: liveDocIds.size, warmDocs: warmSessions.length },
+            ["yjs", "sync"],
+          ).catch(() => {});
+        }
+      } while (yReconcileQueued.current);
+    } catch (error) {
+      void logClientEvent(
+        "warn",
+        "yjs.reconcile.failed",
+        error instanceof Error ? error.message : String(error),
+        { reason, error },
+        ["yjs", "sync"],
+      ).catch(() => {});
+      console.error(error);
+    } finally {
+      yReconcileRunning.current = false;
+    }
+  }, [flushYjsOutbox, isAuthenticated]);
+
   useEffect(() => {
     if (!canShowLocalApp) return;
 
@@ -973,21 +1175,16 @@ export function App() {
 
     const connect = () => {
       if (disposed) return;
-      const socket = openYjsSocket(async (docId, update) => {
-        const doc = yDocs.current.get(docId);
-        if (doc) {
-          Y.applyUpdate(doc, update, "remote");
-          await persistDraftDoc(docId, doc);
-          if (activeYDocId.current === docId) setDraft(getDraft(doc));
-        } else {
-          await mergeCachedDraftUpdate(docId, update);
-        }
+      const socket = openYjsSocket((docId, update) => {
+        void applyRemoteYjsUpdate(docId, update).catch((error) => console.error(error));
       });
       ySocket.current = socket;
 
       socket.addEventListener("open", () => {
         const warmIds = sessionsRef.current.slice(0, 20).map((session) => docIdForSession(session.id));
         subscribeYjsSocket(socket, [...new Set([...yDocs.current.keys(), ...warmIds])]);
+        void flushYjsOutbox("socket_open");
+        void reconcileYjsDocs("socket_open");
       });
       socket.addEventListener("close", () => {
         if (ySocket.current === socket) ySocket.current = null;
@@ -1003,24 +1200,60 @@ export function App() {
       ySocket.current?.close();
       ySocket.current = null;
     };
-  }, [isAuthenticated]);
+  }, [applyRemoteYjsUpdate, flushYjsOutbox, isAuthenticated, reconcileYjsDocs]);
 
   const scheduleYjsPush = useCallback((docId: string, sessionDbId: string, doc: Y.Doc, update: Uint8Array) => {
-    if (!isAuthenticated || navigator.onLine === false) return;
-    sendYjsSocketUpdate(ySocket.current, docId, sessionDbId, update);
+    void enqueueYjsOutboxUpdate({ docId, sessionDbId, update: toBase64(update) })
+      .then(() => {
+        if (!isAuthenticated || navigator.onLine === false) return;
+        sendYjsSocketUpdate(ySocket.current, docId, sessionDbId, update);
+        void flushYjsOutbox("local_update");
+      })
+      .catch((error) => {
+        console.error(error);
+        if (isAuthenticated && navigator.onLine !== false) sendYjsSocketUpdate(ySocket.current, docId, sessionDbId, update);
+      });
     const current = yPushTimers.current.get(docId);
     if (current) window.clearTimeout(current);
     const timer = window.setTimeout(() => {
       yPushTimers.current.delete(docId);
+      if (!isAuthenticated || navigator.onLine === false) return;
+      flushYjsOutbox("local_update_debounce").catch((error) => console.error(error));
       syncDraftDoc(docId, sessionDbId, doc, true).catch((error) => console.error(error));
     }, 500);
     yPushTimers.current.set(docId, timer);
-  }, [isAuthenticated]);
+  }, [flushYjsOutbox, isAuthenticated]);
 
   useEffect(() => {
     return () => {
       for (const timer of yPushTimers.current.values()) window.clearTimeout(timer);
       yPushTimers.current.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const flushAndReconcile = (reason: string) => {
+      void flushYjsOutbox(reason);
+      void reconcileYjsDocs(reason);
+    };
+    const onOnline = () => flushAndReconcile("online");
+    const onVisible = () => {
+      if (!document.hidden) flushAndReconcile("visible");
+    };
+    window.addEventListener("online", onOnline);
+    document.addEventListener("visibilitychange", onVisible);
+    flushAndReconcile("authenticated");
+    return () => {
+      window.removeEventListener("online", onOnline);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [flushYjsOutbox, isAuthenticated, reconcileYjsDocs]);
+
+  useEffect(() => {
+    return () => {
+      for (const refresh of sessionEventRefreshes.current.values()) refresh.controller.abort();
+      sessionEventRefreshes.current.clear();
     };
   }, []);
 
@@ -1034,8 +1267,41 @@ export function App() {
   }, [sidebarWidth]);
 
   useEffect(() => {
+    writeInterfacePrefs(interfacePrefs);
+  }, [interfacePrefs]);
+
+  useEffect(() => {
     writeLocalStorageValue(GROUP_BY_PROJECT_STORAGE_KEY, groupByProject ? "true" : "false");
   }, [groupByProject]);
+
+  useEffect(() => {
+    const nextRetentionDays = clampRetentionDays(retentionDays);
+    if (nextRetentionDays !== retentionDays) {
+      setRetentionDays(nextRetentionDays);
+      return;
+    }
+    writeRetentionDays(nextRetentionDays);
+    const previous = previousRetentionDays.current;
+    if (previous === nextRetentionDays) return;
+    const timer = window.setTimeout(() => {
+      previousRetentionDays.current = nextRetentionDays;
+      if (backfillTimer.current !== null) {
+        window.clearTimeout(backfillTimer.current);
+        backfillTimer.current = null;
+      }
+      const cutoffIso = retentionCutoffIso(nextRetentionDays);
+      void pruneCacheBefore(cutoffIso)
+        .then(() => refreshCache())
+        .then(() => refreshSettings())
+        .catch((error) => console.error(error));
+      if (isAuthenticated) {
+        setStatusText(`Keeping ${nextRetentionDays.toLocaleString()} days`);
+        void syncNow({ metadataOnly: true });
+        window.setTimeout(() => void syncNow({ silent: true, metadataOnly: false, eventMode: "recent" }), 0);
+      }
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [isAuthenticated, refreshCache, refreshSettings, retentionDays, syncNow]);
 
   useEffect(() => {
     const onResize = () => setSidebarWidth((current) => clampSidebarWidth(current));
@@ -1083,6 +1349,7 @@ export function App() {
         doc.on("update", onUpdate);
         cleanup = () => doc.off("update", onUpdate);
         if (isAuthenticated) {
+          await flushYjsOutbox("active_doc_load");
           await syncDraftDoc(docId, sessionDbId, doc, true);
           if (!disposed) setDraft(getDraft(doc));
         }
@@ -1097,7 +1364,7 @@ export function App() {
       if (activeYDocId.current === docId) activeYDocId.current = null;
       yDocs.current.delete(docId);
     };
-  }, [activeId, canShowLocalApp, isAuthenticated, scheduleYjsPush]);
+  }, [activeId, canShowLocalApp, flushYjsOutbox, isAuthenticated, scheduleYjsPush]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -1261,10 +1528,9 @@ export function App() {
 
   useEffect(() => {
     if (!isAuthenticated) return;
-    const topSessions = sessions.slice(0, 20);
-    if (!topSessions.length) return;
-    syncCachedDraftDocs(topSessions).catch((error) => console.error(error));
-  }, [isAuthenticated, sessions]);
+    if (!sessions.length) return;
+    void reconcileYjsDocs("warm_sessions_changed");
+  }, [isAuthenticated, reconcileYjsDocs, sessions]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -1308,7 +1574,13 @@ export function App() {
         syncHealth={syncHealth}
         now={now}
         theme={theme}
+        interfacePrefs={interfacePrefs}
+        interfacePrefsOpen={interfacePrefsOpen}
         onToggleSidebar={() => setSidebarOpen((open) => !open)}
+        onToggleInterfacePrefs={() => setInterfacePrefsOpen((open) => !open)}
+        onCloseInterfacePrefs={() => setInterfacePrefsOpen(false)}
+        onInterfacePrefsChange={updateInterfacePrefs}
+        onResetInterfacePrefs={resetInterfacePrefs}
         onOpenAudio={() => openPanel("audio")}
         onOpenSettings={() => openPanel("settings")}
         onSync={() => syncNow({ metadataOnly: true })}
@@ -1360,8 +1632,10 @@ export function App() {
           onUnregisterServiceWorkers={resetServiceWorkers}
           groupByProject={groupByProject}
           sidebarWidth={sidebarWidth}
+          retentionDays={retentionDays}
           onGroupByProjectChange={setGroupByProject}
           onResetSidebarWidth={resetSidebarWidth}
+          onRetentionDaysChange={setRetentionDays}
         />
       )}
       {audioOpen && (
@@ -1403,6 +1677,15 @@ function formatBuildSha(sha: string | null) {
   return clean.slice(0, 8);
 }
 
+function estimateChatHeightScale(current: InterfacePrefs, next: InterfacePrefs) {
+  const currentText = Math.max(0.1, current.uiScale * current.chatScale);
+  const nextText = Math.max(0.1, next.uiScale * next.chatScale);
+  const textRatio = nextText / currentText;
+  const densityRatio = Math.max(0.1, next.density) / Math.max(0.1, current.density);
+  const widthRatio = Math.max(0.1, current.chatWidth) / Math.max(0.1, next.chatWidth);
+  return Math.min(1.8, Math.max(0.5, textRatio * 0.68 + densityRatio * 0.14 + widthRatio * 0.18));
+}
+
 function mergeSyncOptions(current: SyncNowOptions | null, next: SyncNowOptions): SyncNowOptions {
   return {
     silent: current ? current.silent === true && next.silent === true : next.silent === true,
@@ -1415,6 +1698,10 @@ function mergeSyncEventMode(current?: SyncNowOptions["eventMode"], next?: SyncNo
   if (current === "recent" || next === "recent") return "recent";
   if (current === "forward" || next === "forward") return "forward";
   return current ?? next;
+}
+
+function retentionCutoffIso(days: number) {
+  return new Date(Date.now() - clampRetentionDays(days) * 24 * 60 * 60 * 1000).toISOString();
 }
 
 function sameSessionEvents(a: SessionEvent[], b: SessionEvent[]) {
@@ -1439,6 +1726,10 @@ function sameSessionEvents(a: SessionEvent[], b: SessionEvent[]) {
 function sameRawValue(a: unknown, b: unknown) {
   if (a === b) return true;
   return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function sessionDbIdFromDocId(docId: string) {
+  return docId.startsWith("chat:") ? docId.slice("chat:".length) : null;
 }
 
 function eventSourceReadyStateLabel(value: number) {
@@ -1476,6 +1767,10 @@ async function writeClipboardText(value: string) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function shouldRefreshHealthTimestamp(value: string | null, now: number) {

@@ -1,29 +1,110 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { arch, hostname, platform } from "node:os";
-import { dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { AGENT_V2_VERSION, type AgentV2Identity, type AgentV2State } from "./types";
+
+const AGENT_V2_RUNTIME_ID = randomUUID();
+const AGENT_V2_STARTED_AT = new Date().toISOString();
 
 export function emptyAgentV2State(): AgentV2State {
   return { agentId: randomUUID(), cursors: {} };
 }
 
 export async function loadAgentV2State(path: string): Promise<AgentV2State> {
+  let raw: string;
   try {
-    const parsed = JSON.parse(await readFile(path, "utf8"));
-    return {
-      agentId: typeof parsed.agentId === "string" ? parsed.agentId : randomUUID(),
-      cursors: normalizeCursors(parsed.cursors),
-      previewCursors: normalizeCursors(parsed.previewCursors),
-    };
+    raw = await readFile(path, "utf8");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return emptyAgentV2State();
+    throw error;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
   } catch {
-    return emptyAgentV2State();
+    return backupCorruptState(path, raw);
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return backupCorruptState(path, raw);
+  }
+
+  const record = parsed as Record<string, unknown>;
+  return {
+    agentId: typeof record.agentId === "string" ? record.agentId : randomUUID(),
+    cursors: normalizeCursors(record.cursors),
+    previewCursors: normalizeCursors(record.previewCursors),
+  };
+}
+
+async function backupCorruptState(path: string, raw: string): Promise<AgentV2State> {
+  const backupPath = corruptBackupPath(path);
+  try {
+    await rename(path, backupPath);
+  } catch (backupError) {
+    throw new Error(`failed to backup corrupt agent v2 state at ${path}: ${messageFor(backupError)}`, { cause: backupError });
+  }
+
+  return {
+    agentId: recoverAgentId(raw) ?? randomUUID(),
+    cursors: {},
+  };
+}
+
+export function runtimeMetadataForAgentV2() {
+  return {
+    runtimeId: process.env.AGENT_RUNTIME_ID ?? process.env.CHATVIEW_AGENT_RUNTIME_ID ?? AGENT_V2_RUNTIME_ID,
+    pid: process.pid,
+    startedAt: parseableTimestamp(process.env.AGENT_STARTED_AT ?? process.env.CHATVIEW_AGENT_STARTED_AT) ?? AGENT_V2_STARTED_AT,
+  };
+}
+
+function corruptBackupPath(path: string) {
+  const safeTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `${path}.corrupt-${safeTimestamp}-${randomUUID()}.bak`;
+}
+
+function recoverAgentId(raw: string): string | undefined {
+  const match = raw.match(/"agentId"\s*:\s*("(?:(?:\\.)|[^"\\])*")/);
+  if (!match) return undefined;
+  try {
+    const value = JSON.parse(match[1]);
+    return typeof value === "string" && value.trim() ? value : undefined;
+  } catch {
+    return undefined;
   }
 }
 
+function messageFor(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function parseableTimestamp(value: string | undefined) {
+  return value && !Number.isNaN(Date.parse(value)) ? value : undefined;
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
+}
+
 export async function saveAgentV2State(path: string, state: AgentV2State) {
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(state, null, 2)}\n`);
+  const dir = dirname(path);
+  await mkdir(dir, { recursive: true });
+  const tempPath = join(dir, `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(tempPath, "w", 0o600);
+    await handle.writeFile(`${JSON.stringify(state, null, 2)}\n`);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(tempPath, path);
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+    await rm(tempPath, { force: true }).catch(() => {});
+  }
 }
 
 export function identityForAgentV2(state: AgentV2State): AgentV2Identity {
@@ -33,6 +114,7 @@ export function identityForAgentV2(state: AgentV2State): AgentV2Identity {
     platform: platform(),
     arch: arch(),
     version: AGENT_V2_VERSION,
+    ...runtimeMetadataForAgentV2(),
   };
 }
 

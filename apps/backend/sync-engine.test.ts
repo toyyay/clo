@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  handleAgentHello,
   handleAgentInventory,
   isSyncEngineHttpError,
   planRawChunkStorage,
@@ -307,7 +308,91 @@ describe("sync engine helpers", () => {
     }
   });
 
-  test("active inventory reports clear prior deleted_at on source files", async () => {
+  test("rejects a second active runtime on the same host", async () => {
+    const { sql } = runtimeSql({
+      activeRows: [
+        {
+          runtime_id: "runtime-old",
+          agent_id: "agent-old",
+          hostname: "workstation",
+          pid: 456,
+          started_at: "2026-04-25T09:00:00.000Z",
+          last_seen_at: "2026-04-25T10:00:00.000Z",
+          status: "active",
+        },
+      ],
+    });
+    const req = new Request("http://chatview.test/api/agent/v1/hello", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        agent: {
+          ...agent,
+          runtimeId: "runtime-new",
+          pid: 789,
+          startedAt: "2026-04-25T10:00:00.000Z",
+        },
+      }),
+    });
+
+    try {
+      await handleAgentHello(req, sql);
+      throw new Error("expected duplicate runtime rejection");
+    } catch (error) {
+      expect(isSyncEngineHttpError(error)).toBe(true);
+      if (isSyncEngineHttpError(error)) {
+        expect(error.status).toBe(409);
+        expect(error.payload).toMatchObject({
+          control: {
+            action: "reject",
+            activeRuntimes: [{ runtimeId: "runtime-old", pid: 456 }],
+          },
+        });
+      }
+    }
+  });
+
+  test("takeover hello asks existing runtimes to shut down", async () => {
+    const { calls, sql } = runtimeSql({
+      activeRows: [
+        {
+          runtime_id: "runtime-old",
+          agent_id: "agent-old",
+          hostname: "workstation",
+          pid: 456,
+          started_at: "2026-04-25T09:00:00.000Z",
+          last_seen_at: "2026-04-25T10:00:00.000Z",
+          status: "active",
+        },
+      ],
+    });
+    const req = new Request("http://chatview.test/api/agent/v1/hello", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        agent: {
+          ...agent,
+          runtimeId: "runtime-new",
+          pid: 789,
+          startedAt: "2026-04-25T10:00:00.000Z",
+        },
+        control: { killExisting: true },
+      }),
+    });
+
+    const result = await handleAgentHello(req, sql);
+
+    expect(result).toMatchObject({
+      runtimeId: "runtime-new",
+      control: {
+        action: "continue",
+        activeRuntimes: [{ runtimeId: "runtime-old" }],
+      },
+    });
+    expect(calls.some((call) => call.text.includes("update agent_runtimes") && call.text.includes("shutdown_requested_at"))).toBe(true);
+  });
+
+  test("active inventory does not blindly resurrect tombstoned source files", async () => {
     const { calls, sql } = recordingSql();
     const req = new Request("http://chatview.test/api/agent/v1/inventory", {
       method: "POST",
@@ -328,10 +413,23 @@ describe("sync engine helpers", () => {
     await handleAgentInventory(req, sql);
 
     const sourceUpsert = calls.find((call) => call.text.includes("insert into agent_source_files"));
-    expect(sourceUpsert?.text).toContain("deleted_at = excluded.deleted_at");
+    expect(sourceUpsert?.text).toContain("when excluded.current_generation > agent_source_files.current_generation then null");
     expect(sourceUpsert?.values).toContain(false);
   });
 });
+
+function runtimeSql(options: { activeRows?: any[]; currentRows?: any[] }) {
+  const calls: Array<{ text: string; values: unknown[] }> = [];
+  const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    const text = Array.from(strings).join("?");
+    calls.push({ text, values });
+    if (text.includes("select runtime_id, agent_id, hostname")) return options.activeRows ?? [];
+    if (text.includes("select shutdown_requested_at")) return options.currentRows ?? [];
+    return [];
+  }) as any;
+  sql.transaction = async (fn: (tx: typeof sql) => Promise<unknown>) => fn(sql);
+  return { calls, sql };
+}
 
 function recordingSql() {
   const calls: Array<{ text: string; values: unknown[] }> = [];

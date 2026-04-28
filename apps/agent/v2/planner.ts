@@ -44,10 +44,10 @@ function chunkRecords(
         chunks.push(toChunk(file, pending, batch));
         pending = [];
       }
-      chunks.push(toOmittedRawChunk(file, record, batch));
+      chunks.push(toOmittedRawChunk(file, record, batch, policy.maxUploadChunkBytes));
       skipped.push({
         sourcePath: file.sourcePath,
-        reason: `record at line ${record.lineNo} exceeds maxUploadChunkBytes (${policy.maxUploadChunkBytes}); raw payload omitted`,
+        reason: `record at line ${record.lineNo} exceeds maxUploadChunkBytes (${policy.maxUploadChunkBytes}); diagnostic event emitted`,
       });
       continue;
     }
@@ -66,9 +66,10 @@ function chunkRecords(
   return { chunks, skipped };
 }
 
-function toOmittedRawChunk(file: InventoryFile, record: TailRecord, batch: TailBatch): UploadChunk {
+function toOmittedRawChunk(file: InventoryFile, record: TailRecord, batch: TailBatch, maxBytes: number): UploadChunk {
   const generation = batch.nextCursor.generation;
   const endOffset = record.offset + record.byteLength;
+  const rawSha256 = createHash("sha256").update(record.rawLine).update("\n").digest("hex");
   const hash = createHash("sha256")
     .update(file.logicalId)
     .update(String(generation))
@@ -96,9 +97,20 @@ function toOmittedRawChunk(file: InventoryFile, record: TailRecord, batch: TailB
     byteLength: record.byteLength,
     rawText: "",
     omitRawText: true,
-    rawSha256: createHash("sha256").update(record.rawLine).digest("hex"),
+    rawSha256,
     rawBytes: record.byteLength,
     records: [],
+    diagnostics: [
+      {
+        reason: "record_too_large",
+        message: `JSONL record exceeds maxUploadChunkBytes (${record.byteLength} > ${maxBytes})`,
+        lineNo: record.lineNo,
+        offset: record.offset,
+        byteLength: record.byteLength,
+        maxBytes,
+        rawSha256,
+      },
+    ],
   };
 }
 

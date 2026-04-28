@@ -28,9 +28,46 @@ export type FetchSyncPolicyOptions = {
   backendUrl: string;
   token?: string;
   identity: AgentV2Identity;
+  takeover?: boolean;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
 };
+
+export type AgentRuntimeInfo = {
+  runtimeId?: string;
+  agentId?: string;
+  hostname?: string;
+  pid?: number | null;
+  startedAt?: string | null;
+  lastSeenAt?: string | null;
+  status?: string;
+};
+
+export type AgentRuntimeControl = {
+  action?: "continue" | "shutdown" | "reject";
+  reason?: string;
+  activeRuntimes?: AgentRuntimeInfo[];
+};
+
+export class AgentRuntimeRejectedError extends Error {
+  control?: AgentRuntimeControl;
+
+  constructor(message: string, control?: AgentRuntimeControl) {
+    super(message);
+    this.name = "AgentRuntimeRejectedError";
+    this.control = control;
+  }
+}
+
+export class AgentShutdownRequestedError extends Error {
+  control?: AgentRuntimeControl;
+
+  constructor(message: string, control?: AgentRuntimeControl) {
+    super(message);
+    this.name = "AgentShutdownRequestedError";
+    this.control = control;
+  }
+}
 
 export async function fetchServerSyncPolicy(options: FetchSyncPolicyOptions): Promise<SyncPolicy> {
   const timeoutMs = options.timeoutMs ?? 1500;
@@ -48,6 +85,13 @@ export async function fetchServerSyncPolicy(options: FetchSyncPolicyOptions): Pr
       },
       body: JSON.stringify({
         agent: options.identity,
+        runtime: {
+          runtimeId: options.identity.runtimeId,
+          pid: options.identity.pid,
+          startedAt: options.identity.startedAt,
+          ...(options.takeover ? { takeover: true } : {}),
+        },
+        ...(options.takeover ? { control: { takeover: true } } : {}),
         capabilities: {
           inventory: true,
           appendJsonlCursors: true,
@@ -56,10 +100,20 @@ export async function fetchServerSyncPolicy(options: FetchSyncPolicyOptions): Pr
         },
       }),
     });
-    if (!response.ok) return DEFAULT_SYNC_POLICY;
-    const payload = await response.json();
+    const payload = await readJsonObject(response);
+    const control = normalizeRuntimeControl(payload?.control);
+    if (!response.ok) {
+      if (response.status === 409 || control?.action === "reject") {
+        throw new AgentRuntimeRejectedError(runtimeErrorMessage("agent runtime rejected by server", control), control);
+      }
+      return DEFAULT_SYNC_POLICY;
+    }
+    if (control?.action === "shutdown") {
+      throw new AgentShutdownRequestedError(runtimeErrorMessage("agent shutdown requested by server", control), control);
+    }
     return normalizeServerPolicy(payload?.policy ?? payload);
-  } catch {
+  } catch (error) {
+    if (error instanceof AgentRuntimeRejectedError || error instanceof AgentShutdownRequestedError) throw error;
     return DEFAULT_SYNC_POLICY;
   } finally {
     clearTimeout(timeout);
@@ -103,6 +157,49 @@ function stringList(value: unknown, fallback: string[]): string[] {
   if (!Array.isArray(value)) return fallback;
   const list = value.filter((item): item is string => typeof item === "string" && item.length > 0);
   return list.length ? list : fallback;
+}
+
+async function readJsonObject(response: Response): Promise<Record<string, unknown> | null> {
+  const text = await response.text();
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeRuntimeControl(value: unknown): AgentRuntimeControl | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const action = record.action === "continue" || record.action === "shutdown" || record.action === "reject" ? record.action : undefined;
+  const reason = typeof record.reason === "string" ? record.reason : undefined;
+  const activeRuntimes = Array.isArray(record.activeRuntimes)
+    ? record.activeRuntimes
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+        .map((item) => ({
+          runtimeId: typeof item.runtimeId === "string" ? item.runtimeId : undefined,
+          agentId: typeof item.agentId === "string" ? item.agentId : undefined,
+          hostname: typeof item.hostname === "string" ? item.hostname : undefined,
+          pid: typeof item.pid === "number" ? item.pid : item.pid === null ? null : undefined,
+          startedAt: typeof item.startedAt === "string" ? item.startedAt : item.startedAt === null ? null : undefined,
+          lastSeenAt: typeof item.lastSeenAt === "string" ? item.lastSeenAt : item.lastSeenAt === null ? null : undefined,
+          status: typeof item.status === "string" ? item.status : undefined,
+        }))
+    : undefined;
+  return { action, reason, activeRuntimes };
+}
+
+function runtimeErrorMessage(prefix: string, control?: AgentRuntimeControl) {
+  const runtimes = (control?.activeRuntimes ?? [])
+    .map((runtime) => {
+      const pid = runtime.pid == null ? "pid unknown" : `pid ${runtime.pid}`;
+      return [runtime.runtimeId, runtime.hostname, pid].filter(Boolean).join(" ");
+    })
+    .filter(Boolean)
+    .join(", ");
+  return [prefix, control?.reason, runtimes ? `active: ${runtimes}` : ""].filter(Boolean).join("; ");
 }
 
 function trimSlash(value: string) {

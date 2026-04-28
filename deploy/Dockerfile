@@ -13,7 +13,7 @@ COPY packages ./packages
 
 ARG GIT_SHA=unknown
 ENV GIT_SHA=${GIT_SHA}
-RUN bun run build:frontend
+RUN bun run build:frontend && bun run build:clo
 
 FROM oven/bun:1-slim
 WORKDIR /app
