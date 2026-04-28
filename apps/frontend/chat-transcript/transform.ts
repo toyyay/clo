@@ -153,8 +153,7 @@ function isCodexMessageEcho(
   if (source.provider !== "codex" || neighborSource.provider !== "codex") return false;
   if (source.rawType !== "event_msg" || neighborSource.rawType !== "response_item") return false;
   if (source.rawKind !== "agent_message" && source.rawKind !== "user_message") return false;
-  const signature = textPartsSignature(entry.parts);
-  return signature !== null && signature === textPartsSignature(neighbor.parts);
+  return sameTextParts(entry.parts, neighbor.parts);
 }
 
 function rawSource(raw: any) {
@@ -166,9 +165,15 @@ function rawSource(raw: any) {
   };
 }
 
-function textPartsSignature(parts: FlatPart[]) {
-  if (!parts.length || !parts.every((part) => part.kind === "text")) return null;
-  return JSON.stringify(parts.map((part) => [part.role, part.text]));
+function sameTextParts(a: FlatPart[], b: FlatPart[]) {
+  if (!a.length || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const left = a[i];
+    const right = b[i];
+    if (left.kind !== "text" || right.kind !== "text") return false;
+    if (left.role !== right.role || left.text !== right.text) return false;
+  }
+  return true;
 }
 
 export function groupItems(flat: FlatPart[]): RenderItem[] {

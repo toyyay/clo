@@ -15,7 +15,10 @@ export const DEFAULT_RETENTION_DAYS = 15;
 export const MIN_RETENTION_DAYS = 1;
 export const MAX_RETENTION_DAYS = 180;
 
+export type DisplayMode = "auto" | "desktop" | "eink";
+
 export type InterfacePrefs = {
+  displayMode: DisplayMode;
   uiScale: number;
   chatScale: number;
   density: number;
@@ -23,11 +26,15 @@ export type InterfacePrefs = {
 };
 
 export const DEFAULT_INTERFACE_PREFS: InterfacePrefs = {
+  displayMode: "auto",
   uiScale: 1,
   chatScale: 1,
   density: 1,
   chatWidth: 920,
 };
+
+export const EINK_CHAT_WIDTH_DEFAULT = 760;
+export const EINK_CHAT_WIDTH_MAX = 860;
 
 export function readLocalStorageString(key: string, fallback: string) {
   try {
@@ -54,10 +61,11 @@ export function readLocalStorageBoolean(key: string, fallback: boolean) {
 
 export function clampInterfacePrefs(value: Partial<InterfacePrefs>): InterfacePrefs {
   return {
+    displayMode: clampDisplayMode(value.displayMode),
     uiScale: clampNumber(value.uiScale, 0.88, 1.22, DEFAULT_INTERFACE_PREFS.uiScale),
     chatScale: clampNumber(value.chatScale, 0.9, 1.36, DEFAULT_INTERFACE_PREFS.chatScale),
     density: clampNumber(value.density, 0.82, 1.22, DEFAULT_INTERFACE_PREFS.density),
-    chatWidth: Math.round(clampNumber(value.chatWidth, 680, 1120, DEFAULT_INTERFACE_PREFS.chatWidth)),
+    chatWidth: Math.round(clampNumber(value.chatWidth, 560, 1120, DEFAULT_INTERFACE_PREFS.chatWidth)),
   };
 }
 
@@ -73,6 +81,17 @@ export function readInterfacePrefs() {
 
 export function writeInterfacePrefs(value: InterfacePrefs) {
   writeLocalStorageValue(INTERFACE_PREFS_STORAGE_KEY, JSON.stringify(clampInterfacePrefs(value)));
+}
+
+export function detectAutoDisplayMode(): Exclude<DisplayMode, "auto"> {
+  if (typeof window === "undefined" || !("matchMedia" in window)) return "desktop";
+  return window.matchMedia("(monochrome), (prefers-contrast: more), (update: slow)").matches ? "eink" : "desktop";
+}
+
+export function effectiveChatWidth(prefs: InterfacePrefs, displayMode: Exclude<DisplayMode, "auto">) {
+  if (displayMode !== "eink") return prefs.chatWidth;
+  if (prefs.chatWidth === DEFAULT_INTERFACE_PREFS.chatWidth) return EINK_CHAT_WIDTH_DEFAULT;
+  return Math.min(EINK_CHAT_WIDTH_MAX, prefs.chatWidth);
 }
 
 export function sidebarWidthLimit() {
@@ -108,4 +127,8 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.min(max, Math.max(min, number));
+}
+
+function clampDisplayMode(value: unknown): DisplayMode {
+  return value === "desktop" || value === "eink" || value === "auto" ? value : DEFAULT_INTERFACE_PREFS.displayMode;
 }

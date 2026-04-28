@@ -121,6 +121,11 @@ export type SessionPayload = {
   events: SessionEvent[];
 };
 
+export type SessionEventsPage = SessionPayload & {
+  hasOlder: boolean;
+  hasNewer: boolean;
+};
+
 export type SyncExclusionKind = "device" | "provider" | "session";
 
 export type SyncExclusionInfo = {

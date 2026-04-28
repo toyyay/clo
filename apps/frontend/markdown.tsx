@@ -1,5 +1,8 @@
+import { memo } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+
+const remarkPlugins = [remarkGfm];
 
 const markdownComponents: Components = {
   a({ href, children, ...props }) {
@@ -26,12 +29,12 @@ const markdownComponents: Components = {
   },
 };
 
-export function MarkdownText({ text, className = "" }: { text: string; className?: string }) {
+export const MarkdownText = memo(function MarkdownText({ text, className = "" }: { text: string; className?: string }) {
   return (
     <div className={`markdown ${className}`.trim()}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents} skipHtml>
+      <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents} skipHtml>
         {text}
       </ReactMarkdown>
     </div>
   );
-}
+});

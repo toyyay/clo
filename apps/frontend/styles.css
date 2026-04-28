@@ -203,6 +203,34 @@ pre {
 .sync-dot.offline,
 .sync-dot.error { background: var(--danger); }
 .top-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.top-more {
+  position: relative;
+  display: none;
+}
+.top-more summary {
+  list-style: none;
+}
+.top-more summary::-webkit-details-marker {
+  display: none;
+}
+.top-more-menu {
+  position: absolute;
+  top: calc(100% + 5px);
+  right: 0;
+  z-index: 20;
+  min-width: 150px;
+  display: grid;
+  gap: 5px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+.top-more-menu .icon-button {
+  width: 100%;
+  justify-content: flex-start;
+}
 .interface-prefs-wrap {
   display: inline-flex;
   flex-shrink: 0;
@@ -247,6 +275,28 @@ pre {
   margin: 0;
   font-size: calc(15px * var(--ui-font-scale));
 }
+.prefs-mode {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+.prefs-mode button {
+  min-width: 0;
+  min-height: 28px;
+  padding: 3px 5px;
+  border-radius: 5px;
+  text-align: center;
+  font-size: calc(12px * var(--ui-font-scale));
+}
+.prefs-mode button.active {
+  background: var(--panel);
+  color: var(--accent);
+  font-weight: 700;
+}
 .prefs-range {
   display: grid;
   gap: 6px;
@@ -255,7 +305,7 @@ pre {
   border-radius: 6px;
   background: var(--panel-2);
 }
-.prefs-range span {
+.prefs-range-head {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
@@ -269,9 +319,63 @@ pre {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
-.prefs-range input {
+.range-stepper {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 6px;
+}
+.range-step-button {
+  min-width: 28px;
+  min-height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1;
+}
+.prefs-range input[type="range"],
+.settings-range input[type="range"] {
   width: 100%;
   accent-color: var(--accent);
+  appearance: none;
+  -webkit-appearance: none;
+  height: 22px;
+  background: transparent;
+}
+.prefs-range input[type="range"]::-webkit-slider-runnable-track,
+.settings-range input[type="range"]::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--line);
+}
+.prefs-range input[type="range"]::-webkit-slider-thumb,
+.settings-range input[type="range"]::-webkit-slider-thumb {
+  width: 14px;
+  height: 14px;
+  margin-top: -5.5px;
+  border: 2px solid var(--text);
+  border-radius: 999px;
+  background: var(--panel);
+  -webkit-appearance: none;
+}
+.prefs-range input[type="range"]::-moz-range-track,
+.settings-range input[type="range"]::-moz-range-track {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--line);
+}
+.prefs-range input[type="range"]::-moz-range-thumb,
+.settings-range input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--text);
+  border-radius: 999px;
+  background: var(--panel);
 }
 .icon-button {
   display: inline-flex;
@@ -613,73 +717,6 @@ body.resizing-sidebar {
   }
 }
 
-@media (monochrome), (prefers-contrast: more), (update: slow) {
-  :root {
-    --bg: #f7f7f7;
-    --panel: #ffffff;
-    --panel-2: #f3f3f3;
-    --text: #050505;
-    --muted: #303030;
-    --line: #8f8f8f;
-    --accent: #000000;
-    --accent-soft: #eeeeee;
-    --danger: #000000;
-    --shadow: none;
-  }
-  :root[data-theme="dark"] {
-    --bg: #f7f7f7;
-    --panel: #ffffff;
-    --panel-2: #f3f3f3;
-    --text: #050505;
-    --muted: #303030;
-    --line: #8f8f8f;
-    --accent: #000000;
-    --accent-soft: #eeeeee;
-    --danger: #000000;
-    --shadow: none;
-  }
-  body {
-    background: #f7f7f7;
-  }
-  .topbar,
-  .chat-head {
-    background: var(--panel);
-    backdrop-filter: none;
-  }
-  .modal-backdrop {
-    background: rgba(255, 255, 255, 0.94);
-  }
-  .modal-panel,
-  .sidebar,
-  .main,
-  .bubble,
-  .detail,
-  .url-row,
-  .toggle-row,
-  .settings-range,
-  .service-status,
-  .icon-button,
-  .search,
-  .composer textarea {
-    box-shadow: none;
-    border-color: var(--line);
-  }
-  .sync-dot,
-  .archive-dot {
-    outline: 1px solid var(--text);
-  }
-  .build-badge,
-  .muted-text,
-  .tree-meta,
-  .tree-time,
-  .chat-date,
-  .chat-source,
-  .active-inline,
-  .sync-detail {
-    color: var(--muted);
-    opacity: 1;
-  }
-}
 .session-group {
   display: flex;
   flex-direction: column;
@@ -1738,5 +1775,258 @@ body.resizing-sidebar {
   }
   .kv-grid {
     grid-template-columns: minmax(88px, auto) minmax(0, 1fr);
+  }
+}
+
+:root[data-display="eink"],
+:root[data-display="eink"][data-theme="dark"] {
+  color-scheme: light;
+  --bg: #fbfbf8;
+  --panel: #ffffff;
+  --panel-2: #eeeeec;
+  --text: #050505;
+  --muted: #242424;
+  --line: #565656;
+  --accent: #000000;
+  --accent-soft: #dededb;
+  --danger: #000000;
+  --shadow: none;
+}
+
+:root[data-display="eink"] body {
+  background: var(--bg);
+  -webkit-font-smoothing: auto;
+}
+
+:root[data-display="eink"] .topbar,
+:root[data-display="eink"] .chat-head,
+:root[data-display="eink"] .composer,
+:root[data-display="eink"] .session-group-head {
+  background: var(--panel);
+  backdrop-filter: none;
+}
+
+:root[data-display="eink"] .topbar {
+  min-height: calc(40px * var(--ui-density));
+  border-bottom: 2px solid var(--text);
+}
+
+:root[data-display="eink"] .chat-head,
+:root[data-display="eink"] .composer {
+  border-color: var(--text);
+}
+
+:root[data-display="eink"] .top-action-secondary {
+  display: none;
+}
+
+:root[data-display="eink"] .top-more {
+  display: inline-flex;
+}
+
+:root[data-display="eink"] .top-more-menu {
+  border-width: 2px;
+  box-shadow: none;
+}
+
+:root[data-display="eink"] .top-status {
+  justify-content: center;
+}
+
+:root[data-display="eink"] .sync-line {
+  color: var(--text);
+  font-weight: 650;
+}
+
+:root[data-display="eink"] .sync-detail,
+:root[data-display="eink"] .active-inline,
+:root[data-display="eink"] .chat-date,
+:root[data-display="eink"] .muted-text,
+:root[data-display="eink"] .tree-meta,
+:root[data-display="eink"] .tree-time,
+:root[data-display="eink"] .host-chip span,
+:root[data-display="eink"] .session-host,
+:root[data-display="eink"] .session-meta,
+:root[data-display="eink"] .session-source,
+:root[data-display="eink"] .audio-meta,
+:root[data-display="eink"] .transcription-status,
+:root[data-display="eink"] .transcript-label,
+:root[data-display="eink"] .path,
+:root[data-display="eink"] .detail-desc,
+:root[data-display="eink"] .detail-tool,
+:root[data-display="eink"] .detail-head {
+  color: var(--muted);
+  opacity: 1;
+}
+
+:root[data-display="eink"] .modal-panel,
+:root[data-display="eink"] .sidebar,
+:root[data-display="eink"] .main,
+:root[data-display="eink"] .bubble,
+:root[data-display="eink"] .detail,
+:root[data-display="eink"] .url-row,
+:root[data-display="eink"] .toggle-row,
+:root[data-display="eink"] .settings-range,
+:root[data-display="eink"] .service-status,
+:root[data-display="eink"] .icon-button,
+:root[data-display="eink"] .search,
+:root[data-display="eink"] .filter-chip,
+:root[data-display="eink"] .host-chip,
+:root[data-display="eink"] .filter-select,
+:root[data-display="eink"] .prefs-popover,
+:root[data-display="eink"] .prefs-mode,
+:root[data-display="eink"] .prefs-range,
+:root[data-display="eink"] .range-step-button,
+:root[data-display="eink"] .composer textarea,
+:root[data-display="eink"] .send-button,
+:root[data-display="eink"] .audio-item,
+:root[data-display="eink"] .audio-upload-panel,
+:root[data-display="eink"] .audio-record-panel,
+:root[data-display="eink"] .audio-retry-controls select,
+:root[data-display="eink"] .transcript-block,
+:root[data-display="eink"] .transcription-attempt,
+:root[data-display="eink"] .markdown pre,
+:root[data-display="eink"] .markdown th,
+:root[data-display="eink"] .markdown td {
+  box-shadow: none;
+  border-color: var(--line);
+}
+
+:root[data-display="eink"] .icon-button,
+:root[data-display="eink"] .search,
+:root[data-display="eink"] .filter-select,
+:root[data-display="eink"] .prefs-mode,
+:root[data-display="eink"] .prefs-range,
+:root[data-display="eink"] .range-step-button,
+:root[data-display="eink"] .settings-range,
+:root[data-display="eink"] .composer textarea,
+:root[data-display="eink"] .send-button {
+  border-width: 2px;
+}
+
+:root[data-display="eink"] .icon-button,
+:root[data-display="eink"] .range-step-button,
+:root[data-display="eink"] .search,
+:root[data-display="eink"] .filter-select,
+:root[data-display="eink"] .composer textarea,
+:root[data-display="eink"] .send-button {
+  background: var(--panel);
+  color: var(--text);
+}
+
+:root[data-display="eink"] .prefs-button.active,
+:root[data-display="eink"] .filter-chip.active,
+:root[data-display="eink"] .host-chip.active,
+:root[data-display="eink"] .tree-session.active,
+:root[data-display="eink"] .session-item.active,
+:root[data-display="eink"] .segmented button.active,
+:root[data-display="eink"] .prefs-mode button.active,
+:root[data-display="eink"] .follow-button.active {
+  background: var(--accent-soft);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--text);
+}
+
+:root[data-display="eink"] .sidebar {
+  border-right: 2px solid var(--text);
+  transition: none;
+}
+
+:root[data-display="eink"] .sidebar-resize-handle::after {
+  background: var(--line);
+}
+
+:root[data-display="eink"] .tree-action {
+  opacity: 1;
+  background: var(--panel);
+  color: var(--text);
+}
+
+:root[data-display="eink"] .tree-row:hover {
+  background: var(--accent-soft);
+}
+
+:root[data-display="eink"] .tree-session.active {
+  font-weight: 750;
+  box-shadow: inset 4px 0 0 var(--text);
+}
+
+:root[data-display="eink"] .archive-dot,
+:root[data-display="eink"] .sync-dot {
+  opacity: 1;
+  outline: 1px solid var(--text);
+}
+
+:root[data-display="eink"] .archive-dot.active,
+:root[data-display="eink"] .sync-dot.online {
+  background: #0f6b3a;
+}
+
+:root[data-display="eink"] .archive-dot.archived,
+:root[data-display="eink"] .sync-dot.offline,
+:root[data-display="eink"] .sync-dot.error {
+  background: var(--text);
+}
+
+:root[data-display="eink"] .chat-scroll {
+  padding-inline: calc(10px * var(--ui-density));
+}
+
+:root[data-display="eink"] .bubble {
+  background: var(--panel);
+  border-left: 4px solid var(--text);
+  border-radius: 0 6px 6px 0;
+}
+
+:root[data-display="eink"] .markdown blockquote {
+  background: var(--panel-2);
+  border-left-color: var(--text);
+  color: var(--text);
+}
+
+:root[data-display="eink"] .markdown hr {
+  height: 2px;
+  background: var(--line);
+}
+
+:root[data-display="eink"] .bottom-button,
+:root[data-display="eink"] .follow-button {
+  border-width: 2px;
+  background: var(--panel);
+  box-shadow: none;
+}
+
+:root[data-display="eink"] .follow-check {
+  border-color: var(--text);
+}
+
+:root[data-display="eink"] .prefs-range input[type="range"]::-webkit-slider-runnable-track,
+:root[data-display="eink"] .settings-range input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  background: var(--text);
+}
+
+:root[data-display="eink"] .prefs-range input[type="range"]::-moz-range-track,
+:root[data-display="eink"] .settings-range input[type="range"]::-moz-range-track {
+  height: 4px;
+  background: var(--text);
+}
+
+:root[data-display="eink"] .modal-backdrop {
+  background: rgba(255, 255, 255, 0.96);
+}
+
+@media (max-width: 780px) {
+  :root[data-display="eink"] .topbar {
+    gap: 5px;
+  }
+
+  :root[data-display="eink"] .top-actions {
+    overflow: visible;
+  }
+
+  :root[data-display="eink"] .sidebar,
+  :root[data-display="eink"] .sidebar-backdrop {
+    inset-block-start: 42px;
   }
 }

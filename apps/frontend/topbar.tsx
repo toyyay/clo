@@ -80,24 +80,44 @@ export function Topbar({
           onChange={onInterfacePrefsChange}
           onReset={onResetInterfacePrefs}
         />
-        <button className="icon-button" onClick={onOpenAudio} title="Uploaded audio">
+        <button className="icon-button top-action-secondary" onClick={onOpenAudio} title="Uploaded audio">
           Audio
         </button>
-        <button className="icon-button" onClick={onOpenSettings} title="Settings">
+        <button className="icon-button top-action-secondary" onClick={onOpenSettings} title="Settings">
           Settings
         </button>
-        <a className="icon-button download-button" href="/api/agent/download?arch=arm64">
+        <a className="icon-button download-button top-action-secondary" href="/api/agent/download?arch=arm64">
           Download Mac Agent (M1)
         </a>
         <button className="icon-button" onClick={onSync} disabled={syncState === "syncing"} title="Sync now">
           Sync
         </button>
-        <button className="icon-button" onClick={onToggleTheme} title="Toggle theme">
+        <button className="icon-button top-action-secondary" onClick={onToggleTheme} title="Toggle theme">
           {theme === "dark" ? "Light" : "Dark"}
         </button>
-        <button className="icon-button" onClick={onLogout} title="Sign out">
+        <button className="icon-button top-action-secondary" onClick={onLogout} title="Sign out">
           Logout
         </button>
+        <details className="top-more">
+          <summary className="icon-button top-more-summary">More</summary>
+          <div className="top-more-menu">
+            <button className="icon-button" onClick={onOpenAudio} title="Uploaded audio">
+              Audio
+            </button>
+            <button className="icon-button" onClick={onOpenSettings} title="Settings">
+              Settings
+            </button>
+            <a className="icon-button download-button" href="/api/agent/download?arch=arm64">
+              Mac Agent
+            </a>
+            <button className="icon-button" onClick={onToggleTheme} title="Toggle theme">
+              {theme === "dark" ? "Light" : "Dark"}
+            </button>
+            <button className="icon-button" onClick={onLogout} title="Sign out">
+              Logout
+            </button>
+          </div>
+        </details>
       </div>
     </header>
   );

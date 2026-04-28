@@ -8,6 +8,12 @@ export type SyncHealth = {
   lastError: string | null;
 };
 export type AuthState = "checking" | "authenticated" | "cache" | "anonymous";
-export type EventState = { sessionId: string | null; events: SessionEvent[] };
+export type EventState = {
+  sessionId: string | null;
+  events: SessionEvent[];
+  windowed?: boolean;
+  hasOlder?: boolean;
+  hasNewer?: boolean;
+};
 export type SyncEventMode = "forward" | "recent" | "backfill";
 export type SyncNowOptions = { silent?: boolean; metadataOnly?: boolean; eventMode?: SyncEventMode };

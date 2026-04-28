@@ -1,4 +1,4 @@
-import type { InterfacePrefs } from "./storage-prefs";
+import type { DisplayMode, InterfacePrefs } from "./storage-prefs";
 
 type InterfacePrefsPopoverProps = {
   open: boolean;
@@ -25,6 +25,7 @@ export function InterfacePrefsPopover({ open, prefs, onToggle, onClose, onChange
                 Reset
               </button>
             </div>
+            <DisplayModeControl value={prefs.displayMode} onChange={(displayMode) => onChange({ displayMode })} />
             <RangeControl
               label="Interface"
               value={prefs.uiScale}
@@ -55,7 +56,7 @@ export function InterfacePrefsPopover({ open, prefs, onToggle, onClose, onChange
             <RangeControl
               label="Line width"
               value={prefs.chatWidth}
-              min={680}
+              min={560}
               max={1120}
               step={20}
               display={`${prefs.chatWidth}px`}
@@ -64,6 +65,29 @@ export function InterfacePrefsPopover({ open, prefs, onToggle, onClose, onChange
           </section>
         </>
       )}
+    </div>
+  );
+}
+
+function DisplayModeControl({ value, onChange }: { value: DisplayMode; onChange: (value: DisplayMode) => void }) {
+  const options: Array<{ value: DisplayMode; label: string }> = [
+    { value: "auto", label: "Auto" },
+    { value: "desktop", label: "Desktop" },
+    { value: "eink", label: "E-ink" },
+  ];
+  return (
+    <div className="prefs-mode" role="group" aria-label="Display mode">
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          className={value === option.value ? "active" : ""}
+          aria-pressed={value === option.value}
+          onClick={() => onChange(option.value)}
+        >
+          {option.label}
+        </button>
+      ))}
     </div>
   );
 }
@@ -85,13 +109,34 @@ function RangeControl({
   display: string;
   onChange: (value: number) => void;
 }) {
+  const stepValue = (direction: -1 | 1) => {
+    onChange(roundRangeValue(clampRangeValue(value + step * direction, min, max), step));
+  };
   return (
-    <label className="prefs-range">
-      <span>
+    <div className="prefs-range">
+      <div className="prefs-range-head">
         <b>{label}</b>
         <output>{display}</output>
-      </span>
-      <input type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />
-    </label>
+      </div>
+      <div className="range-stepper">
+        <button type="button" className="range-step-button" onClick={() => stepValue(-1)} aria-label={`Decrease ${label}`}>
+          -
+        </button>
+        <input aria-label={label} type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />
+        <button type="button" className="range-step-button" onClick={() => stepValue(1)} aria-label={`Increase ${label}`}>
+          +
+        </button>
+      </div>
+    </div>
   );
+}
+
+function clampRangeValue(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function roundRangeValue(value: number, step: number) {
+  if (!Number.isFinite(value)) return value;
+  const rounded = Math.round(value / step) * step;
+  return Number(rounded.toFixed(step < 1 ? 4 : 0));
 }

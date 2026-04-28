@@ -74,6 +74,9 @@ create index if not exists idx_sessions_project_seen
 create index if not exists idx_events_session_line
   on session_events (session_db_id, source_line_no asc);
 
+create index if not exists idx_events_session_order
+  on session_events (session_db_id, source_line_no asc, source_offset asc, id asc);
+
 create index if not exists idx_events_type
   on session_events (event_type);
 
@@ -397,6 +400,9 @@ create unique index if not exists idx_agent_normalized_events_uid
 
 create index if not exists idx_agent_normalized_events_source_line
   on agent_normalized_events (source_file_id, source_line_no asc nulls last, source_offset asc nulls last);
+
+create index if not exists idx_agent_normalized_events_file_generation_order
+  on agent_normalized_events (source_file_id, source_generation, source_line_no asc nulls last, source_offset asc nulls last, id asc);
 
 create index if not exists idx_agent_normalized_events_type
   on agent_normalized_events (provider, event_type);

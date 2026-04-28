@@ -1,4 +1,4 @@
-import type { HostInfo, SessionEvent, SessionInfo, SessionPayload } from "../../packages/shared/types";
+import type { HostInfo, SessionEvent, SessionEventsPage, SessionInfo, SessionPayload } from "../../packages/shared/types";
 import { normalizeTranscriptRecord } from "../../packages/parsers";
 
 export const V2_SESSION_ID_PREFIX = "v3:";
@@ -39,6 +39,17 @@ type V2EventRow = {
   normalized?: unknown;
   ordinal?: unknown;
   sync_revision?: unknown;
+};
+
+export type V2EventPageOptions = {
+  cutoffIso?: string | null;
+  limit: number;
+  direction?: "recent" | "before" | "after";
+  cursor?: {
+    id: string;
+    lineNo: number;
+    offset: number;
+  };
 };
 
 export function v2SessionId(sourceFileId: unknown) {
@@ -642,6 +653,232 @@ export async function getV2Session(sql: SqlTag, sessionId: string, options: { cu
   };
 }
 
+export async function getV2SessionEventPage(sql: SqlTag, sessionId: string, options: V2EventPageOptions): Promise<SessionEventsPage | null> {
+  const sourceFileId = parseV2SessionId(sessionId);
+  if (!sourceFileId) return null;
+  const cutoff = options.cutoffIso ?? null;
+  const limit = Math.max(1, Math.min(1000, Math.floor(options.limit)));
+  const fetchLimit = limit + 1;
+  const direction = options.direction ?? "recent";
+  const cursor = normalizeV2EventPageCursor(options.cursor);
+
+  const sessionRows = await sql`
+    select
+      f.id,
+      f.agent_id,
+      a.hostname,
+      f.provider,
+      f.source_kind,
+      f.current_generation,
+      f.source_path,
+      f.size_bytes,
+      f.mtime_ms,
+      f.content_sha256,
+      f.mime_type,
+      f.encoding,
+      f.line_count,
+      f.git,
+      f.metadata || coalesce(source_meta.metadata, '{}'::jsonb) as metadata,
+      f.first_seen_at,
+      f.last_seen_at,
+      f.deleted_at,
+      count(e.id) as event_count
+    from agent_source_files f
+    join agents a on a.id = f.agent_id
+    left join lateral (
+      select jsonb_strip_nulls(jsonb_build_object(
+        'cwd', (
+          select coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}')
+          from agent_normalized_events e
+          where e.source_file_id = f.id
+            and e.source_generation = f.current_generation
+            and e.event_type in ('meta', 'session', 'event', 'turn')
+            and coalesce(e.normalized #>> '{parts,0,data,cwd}', e.normalized #>> '{parts,0,data,payload,cwd}') is not null
+          order by e.source_line_no asc nulls last, e.id asc
+          limit 1
+        ),
+        'sessionId', (
+          select coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}')
+          from agent_normalized_events e
+          where e.source_file_id = f.id
+            and e.source_generation = f.current_generation
+            and e.event_type in ('meta', 'session', 'event')
+            and coalesce(e.normalized #>> '{parts,0,data,id}', e.normalized #>> '{parts,0,data,payload,id}') is not null
+          order by e.source_line_no asc nulls last, e.id asc
+          limit 1
+        ),
+        'title', (
+          select coalesce(
+            nullif(e.normalized #>> '{parts,0,data,thread_name}', ''),
+            nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', ''),
+            nullif(e.normalized #>> '{parts,0,data,payload,message}', ''),
+            nullif(e.normalized #>> '{parts,0,text}', '')
+          )
+          from agent_normalized_events e
+          where e.source_file_id = f.id
+            and e.source_generation = f.current_generation
+            and (
+              coalesce(nullif(e.normalized #>> '{parts,0,data,thread_name}', ''), nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', '')) is not null
+              or e.normalized #>> '{parts,0,data,payload,type}' = 'user_message'
+              or (
+                e.normalized ->> 'display' = 'true'
+                and coalesce(e.normalized ->> 'role', e.role) = 'user'
+                and nullif(e.normalized #>> '{parts,0,text}', '') is not null
+              )
+            )
+          order by
+            case
+              when coalesce(nullif(e.normalized #>> '{parts,0,data,thread_name}', ''), nullif(e.normalized #>> '{parts,0,data,payload,thread_name}', '')) is not null then 0
+              when nullif(e.normalized #>> '{parts,0,data,payload,message}', '') is not null then 1
+              else 2
+            end,
+            e.source_line_no asc nulls last,
+            e.id asc
+          limit 1
+        )
+      )) as metadata
+    ) source_meta on true
+    left join agent_normalized_events e
+      on e.source_file_id = f.id
+      and e.source_generation = f.current_generation
+      and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
+    where f.id = ${sourceFileId}
+      and f.source_kind = 'conversation'
+      and f.deleted_at is null
+      and (${cutoff}::timestamptz is null or f.last_seen_at >= ${cutoff}::timestamptz)
+      and not exists (
+        select 1 from sync_exclusions x
+        where x.restored_at is null
+          and (
+            (x.kind = 'device' and x.target_id = f.agent_id)
+            or (x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown')))
+            or (x.kind = 'session' and x.target_id = ('v3:' || f.id::text))
+          )
+      )
+    group by f.id, a.hostname, source_meta.metadata
+  `;
+
+  if (!sessionRows.length) return null;
+
+  const eventRows =
+    direction === "before" && cursor
+      ? await sql`
+          select
+            e.id,
+            e.source_file_id,
+            e.source_line_no,
+            e.source_offset,
+            e.event_type,
+            e.role,
+            e.occurred_at,
+            e.created_at,
+            e.normalized,
+            coalesce(e.source_line_no + 1, 0) as ordinal
+          from agent_normalized_events e
+          join agent_source_files f on f.id = e.source_file_id
+          where e.source_file_id = ${sourceFileId}
+            and e.source_generation = f.current_generation
+            and f.source_kind = 'conversation'
+            and f.deleted_at is null
+            and (
+              e.source_line_no < ${cursor.lineNo}
+              or (e.source_line_no = ${cursor.lineNo} and coalesce(e.source_offset, 0) < ${cursor.offset})
+              or (e.source_line_no = ${cursor.lineNo} and coalesce(e.source_offset, 0) = ${cursor.offset} and e.id < ${cursor.id}::bigint)
+            )
+            and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
+            and not exists (
+              select 1 from sync_exclusions x
+              where x.restored_at is null
+                and (
+                  (x.kind = 'device' and x.target_id = f.agent_id)
+                  or (x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown')))
+                  or (x.kind = 'session' and x.target_id = ('v3:' || f.id::text))
+                )
+            )
+          order by e.source_line_no desc nulls last, e.source_offset desc nulls last, e.id desc
+          limit ${fetchLimit}
+        `
+      : direction === "after" && cursor
+        ? await sql`
+            select
+              e.id,
+              e.source_file_id,
+              e.source_line_no,
+              e.source_offset,
+              e.event_type,
+              e.role,
+              e.occurred_at,
+              e.created_at,
+              e.normalized,
+              coalesce(e.source_line_no + 1, 0) as ordinal
+            from agent_normalized_events e
+            join agent_source_files f on f.id = e.source_file_id
+            where e.source_file_id = ${sourceFileId}
+              and e.source_generation = f.current_generation
+              and f.source_kind = 'conversation'
+              and f.deleted_at is null
+              and (
+                e.source_line_no > ${cursor.lineNo}
+                or (e.source_line_no = ${cursor.lineNo} and coalesce(e.source_offset, 0) > ${cursor.offset})
+                or (e.source_line_no = ${cursor.lineNo} and coalesce(e.source_offset, 0) = ${cursor.offset} and e.id > ${cursor.id}::bigint)
+              )
+              and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
+              and not exists (
+                select 1 from sync_exclusions x
+                where x.restored_at is null
+                  and (
+                    (x.kind = 'device' and x.target_id = f.agent_id)
+                    or (x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown')))
+                    or (x.kind = 'session' and x.target_id = ('v3:' || f.id::text))
+                  )
+              )
+            order by e.source_line_no asc nulls last, e.source_offset asc nulls last, e.id asc
+            limit ${fetchLimit}
+          `
+        : await sql`
+            select
+              e.id,
+              e.source_file_id,
+              e.source_line_no,
+              e.source_offset,
+              e.event_type,
+              e.role,
+              e.occurred_at,
+              e.created_at,
+              e.normalized,
+              coalesce(e.source_line_no + 1, 0) as ordinal
+            from agent_normalized_events e
+            join agent_source_files f on f.id = e.source_file_id
+            where e.source_file_id = ${sourceFileId}
+              and e.source_generation = f.current_generation
+              and f.source_kind = 'conversation'
+              and f.deleted_at is null
+              and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
+              and not exists (
+                select 1 from sync_exclusions x
+                where x.restored_at is null
+                  and (
+                    (x.kind = 'device' and x.target_id = f.agent_id)
+                    or (x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown')))
+                    or (x.kind = 'session' and x.target_id = ('v3:' || f.id::text))
+                  )
+              )
+            order by e.source_line_no desc nulls last, e.source_offset desc nulls last, e.id desc
+            limit ${fetchLimit}
+          `;
+
+  const hasExtra = eventRows.length > limit;
+  const pageRows = eventRows.slice(0, limit);
+  const orderedRows = direction === "after" && cursor ? pageRows : pageRows.reverse();
+
+  return {
+    session: mapV2SessionRow(sessionRows[0]),
+    events: orderedRows.map(mapV2EventRow),
+    hasOlder: direction === "after" && cursor ? true : hasExtra,
+    hasNewer: direction === "before" && cursor ? true : direction === "after" && cursor ? hasExtra : false,
+  };
+}
+
 export async function listV2EventsForSync(sql: SqlTag, cursor: bigint, limit: number, cutoffIso?: string | null): Promise<V2EventRow[]> {
   const cutoff = cutoffIso ?? null;
   return await sql`
@@ -882,6 +1119,18 @@ function repairLegacyCodexPayloadEvent(normalized: Record<string, unknown>) {
 
 function v2EventId(eventId: unknown) {
   return `v2e:${toId(eventId)}`;
+}
+
+function normalizeV2EventPageCursor(cursor: V2EventPageOptions["cursor"]) {
+  if (!cursor) return null;
+  const id = cursor.id.startsWith("v2e:") ? cursor.id.slice("v2e:".length) : cursor.id;
+  if (!/^\d+$/.test(id)) return null;
+  if (!Number.isFinite(cursor.lineNo) || !Number.isFinite(cursor.offset)) return null;
+  return {
+    id,
+    lineNo: Math.max(0, Math.floor(cursor.lineNo)),
+    offset: Math.max(0, Math.floor(cursor.offset)),
+  };
 }
 
 function postgresBigintArrayLiteral(values: string[]) {

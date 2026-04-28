@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { INTERFACE_PREFS_BEFORE_CHANGE_EVENT } from "../storage-prefs";
 import { renderChatItem } from "./render-item";
 import type { RenderItem, SavedScroll, ScrollAnchor, UpdateRangeOptions, VirtualRange } from "./types";
 
 const ROW_OVERSCAN = 8;
 const DEFAULT_ROW_HEIGHT = 96;
+const LOAD_EDGE_PX = 720;
 const SCROLL_STORAGE_PREFIX = "chatview:chat-scroll:";
 const FOLLOW_BOTTOM_STORAGE_KEY = "chatview:chat-follow-bottom";
 
@@ -15,7 +16,13 @@ function estimateItemHeight(item: RenderItem) {
   return Math.max(44, Math.min(420, 18 + lines * 22));
 }
 
-function VirtualRow({
+function observedBlockSize(value: ResizeObserverSize | readonly ResizeObserverSize[] | undefined) {
+  if (!value) return undefined;
+  if (Array.isArray(value)) return (value as readonly ResizeObserverSize[])[0]?.blockSize;
+  return (value as ResizeObserverSize).blockSize;
+}
+
+const VirtualRow = memo(function VirtualRow({
   index,
   itemKey,
   item,
@@ -31,9 +38,14 @@ function VirtualRow({
   useEffect(() => {
     const node = rowRef.current;
     if (!node) return;
-    const measure = () => onMeasure(itemKey, node.getBoundingClientRect().height);
+    const measure = (height = node.getBoundingClientRect().height) => onMeasure(itemKey, height);
     measure();
-    const observer = new ResizeObserver(measure);
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      const borderBox = entry?.borderBoxSize as ResizeObserverSize | readonly ResizeObserverSize[] | undefined;
+      const borderHeight = observedBlockSize(borderBox);
+      measure(borderHeight ?? entry?.contentRect.height);
+    });
     observer.observe(node);
     return () => observer.disconnect();
   }, [itemKey, onMeasure]);
@@ -43,9 +55,23 @@ function VirtualRow({
       {renderChatItem(item, index)}
     </div>
   );
-}
+});
 
-export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey: string }) {
+export function VirtualChat({
+  items,
+  resetKey,
+  hasOlder = false,
+  hasNewer = false,
+  onLoadOlder,
+  onLoadNewer,
+}: {
+  items: RenderItem[];
+  resetKey: string;
+  hasOlder?: boolean;
+  hasNewer?: boolean;
+  onLoadOlder?: () => void;
+  onLoadNewer?: () => void;
+}) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const heights = useRef(new Map<string, number>());
   const nearBottom = useRef(true);
@@ -54,6 +80,9 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
   const scrollAnchor = useRef<ScrollAnchor | null>(null);
   const raf = useRef<number | null>(null);
   const scrollRaf = useRef<number | null>(null);
+  const scrollSaveRaf = useRef<number | null>(null);
+  const measureRaf = useRef<number | null>(null);
+  const pendingHeights = useRef(new Map<string, number>());
   const pendingRangeCapture = useRef(false);
   const previousItemsLength = useRef(0);
   const resetKeyRef = useRef(resetKey);
@@ -91,13 +120,15 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     if (options.captureAnchor && !nearBottom.current) {
       scrollAnchor.current = anchorForScroll(layout.offsets, itemKeys, viewportTop, items.length);
     }
-    setShowBottom(bottomGap >= 160);
-    setRange({
+    const nextShowBottom = bottomGap >= 160;
+    setShowBottom((current) => (current === nextShowBottom ? current : nextShowBottom));
+    const nextRange = {
       start,
       end,
       top: layout.offsets[start] ?? 0,
       bottom: Math.max(0, layout.total - (layout.offsets[end] ?? layout.total)),
-    });
+    };
+    setRange((current) => (sameRange(current, nextRange) ? current : nextRange));
   }, [items.length, itemKeys, layout]);
 
   const scheduleRange = useCallback((options: UpdateRangeOptions = {}) => {
@@ -111,11 +142,25 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     });
   }, [updateRange]);
 
+  const scheduleScrollSave = useCallback(() => {
+    if (scrollSaveRaf.current !== null) return;
+    scrollSaveRaf.current = window.requestAnimationFrame(() => {
+      scrollSaveRaf.current = null;
+      const el = scrollRef.current;
+      if (el) saveChatScroll(resetKeyRef.current, el);
+    });
+  }, []);
+
   const onScroll = useCallback(() => {
     const el = scrollRef.current;
-    if (el) saveChatScroll(resetKey, el);
+    if (el) {
+      scheduleScrollSave();
+      const bottomGap = el.scrollHeight - el.scrollTop - el.clientHeight;
+      if (hasOlder && el.scrollTop < LOAD_EDGE_PX) onLoadOlder?.();
+      if (hasNewer && bottomGap < LOAD_EDGE_PX) onLoadNewer?.();
+    }
     scheduleRange({ captureAnchor: true });
-  }, [resetKey, scheduleRange]);
+  }, [hasNewer, hasOlder, onLoadNewer, onLoadOlder, scheduleRange, scheduleScrollSave]);
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
     const el = scrollRef.current;
@@ -152,12 +197,23 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     if (next) scheduleScrollFrame(() => scrollToBottom("smooth"));
   }, [scheduleScrollFrame, scrollToBottom]);
 
-  const onMeasure = useCallback((key: string, height: number) => {
-    const rounded = Math.ceil(height);
-    if (Math.abs((heights.current.get(key) ?? 0) - rounded) < 2) return;
-    heights.current.set(key, rounded);
-    setMeasureVersion((version) => version + 1);
+  const flushMeasurements = useCallback(() => {
+    measureRaf.current = null;
+    let changed = false;
+    for (const [key, rounded] of pendingHeights.current) {
+      if (Math.abs((heights.current.get(key) ?? 0) - rounded) < 2) continue;
+      heights.current.set(key, rounded);
+      changed = true;
+    }
+    pendingHeights.current.clear();
+    if (changed) setMeasureVersion((version) => version + 1);
   }, []);
+
+  const onMeasure = useCallback((key: string, height: number) => {
+    pendingHeights.current.set(key, Math.ceil(height));
+    if (measureRaf.current !== null) return;
+    measureRaf.current = window.requestAnimationFrame(flushMeasurements);
+  }, [flushMeasurements]);
 
   const captureVisibleAnchor = useCallback((heightScale = 1) => {
     const el = scrollRef.current;
@@ -183,6 +239,7 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
   useLayoutEffect(() => {
     cancelScrollFrame();
     heights.current.clear();
+    pendingHeights.current.clear();
     scrollAnchor.current = null;
     nearBottom.current = true;
     const saved = loadChatScroll(resetKey);
@@ -272,6 +329,8 @@ export function VirtualChat({ items, resetKey }: { items: RenderItem[]; resetKey
     return () => {
       if (raf.current !== null) window.cancelAnimationFrame(raf.current);
       if (scrollRaf.current !== null) window.cancelAnimationFrame(scrollRaf.current);
+      if (scrollSaveRaf.current !== null) window.cancelAnimationFrame(scrollSaveRaf.current);
+      if (measureRaf.current !== null) window.cancelAnimationFrame(measureRaf.current);
     };
   }, []);
 
@@ -382,6 +441,10 @@ function anchorForScroll(offsets: number[], itemKeys: string[], scrollTop: numbe
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+function sameRange(a: VirtualRange, b: VirtualRange) {
+  return a.start === b.start && a.end === b.end && a.top === b.top && a.bottom === b.bottom;
 }
 
 function stableItemKeys(items: RenderItem[]) {

@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import type { SessionEvent, SessionInfo } from "../../packages/shared/types";
 import type { AuthState, EventState } from "./app-types";
-import { loadSessionEvents } from "./db";
+import { loadRecentSessionEvents } from "./db";
 import { logClientEvent } from "./client-logs";
 import { withTimeout } from "./app-utils";
 
@@ -19,7 +19,7 @@ type SessionEventsCacheOptions = {
   eventStateRef: RefLike<EventState>;
   ensureSessionEventsTarget: (sessionId: string) => void;
   onNoActiveSession: () => void;
-  setSessionEvents: (sessionId: string | null, nextEvents: SessionEvent[]) => void;
+  setSessionEvents: (sessionId: string | null, nextEvents: SessionEvent[], options?: Partial<EventState>) => void;
   refreshActiveSessionEvents: (
     sessionId: string,
     reason: string,
@@ -30,6 +30,7 @@ type SessionEventsCacheOptions = {
 };
 
 const SESSION_EVENTS_CACHE_TIMEOUT_MS = 2500;
+const INITIAL_EVENT_WINDOW_LIMIT = 360;
 
 export function useSessionEventsCache({
   activeId,
@@ -57,7 +58,7 @@ export function useSessionEventsCache({
     ensureSessionEventsTarget(loadForSessionId);
 
     withTimeout(
-      loadSessionEvents(loadForSessionId),
+      loadRecentSessionEvents(loadForSessionId, INITIAL_EVENT_WINDOW_LIMIT),
       SESSION_EVENTS_CACHE_TIMEOUT_MS,
       "local session events read timed out",
     )
@@ -75,8 +76,9 @@ export function useSessionEventsCache({
         if (disposed || activeRef.current?.id !== loadForSessionId) return;
         const currentEvents = eventStateRef.current;
         const hasLiveEvents = currentEvents.sessionId === loadForSessionId && currentEvents.events.length > 0;
-        if (cachedEvents.length && !hasLiveEvents) setSessionEvents(loadForSessionId, cachedEvents);
         const expectedEvents = activeRef.current?.eventCount ?? 0;
+        const cacheWindow = eventWindowState(cachedEvents, expectedEvents);
+        if (cachedEvents.length && !hasLiveEvents) setSessionEvents(loadForSessionId, cachedEvents, cacheWindow);
         if (hasLiveEvents && currentEvents.events.length >= expectedEvents && expectedEvents > 0) {
           return;
         }
@@ -143,4 +145,14 @@ export function useSessionEventsCache({
     refreshActiveSessionEvents,
     setSessionEvents,
   ]);
+}
+
+function eventWindowState(events: SessionEvent[], expectedEvents: number): Partial<EventState> {
+  if (!events.length) return { windowed: expectedEvents > 0, hasOlder: expectedEvents > 0, hasNewer: false };
+  const looksPartial = expectedEvents > events.length || (expectedEvents <= 0 && events.length >= INITIAL_EVENT_WINDOW_LIMIT);
+  return {
+    windowed: looksPartial,
+    hasOlder: looksPartial && (events.length >= INITIAL_EVENT_WINDOW_LIMIT || events[0].lineNo > 0),
+    hasNewer: false,
+  };
 }

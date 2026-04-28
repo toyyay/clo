@@ -20,6 +20,7 @@ import type {
 } from "../../packages/shared/types";
 import {
   clearBrowserCaches,
+  cacheSessionEventPage,
   cacheSessionPayload,
   cacheShell,
   cacheMutedSources,
@@ -31,6 +32,8 @@ import {
   loadHosts,
   loadMutedSources,
   loadSessions,
+  loadSessionEventsAfter,
+  loadSessionEventsBefore,
   loadSessionStats,
   loadYjsOutboxUpdates,
   pruneCacheBefore,
@@ -62,6 +65,8 @@ import {
   MIN_SIDEBAR_WIDTH,
   clampInterfacePrefs,
   clampRetentionDays,
+  detectAutoDisplayMode,
+  effectiveChatWidth,
   readInterfacePrefs,
   readLocalStorageBoolean,
   readRetentionDays,
@@ -71,10 +76,12 @@ import {
   writeInterfacePrefs,
   writeLocalStorageValue,
   writeRetentionDays,
+  type DisplayMode,
   type InterfacePrefs,
 } from "./storage-prefs";
 import {
   createSyncExclusion,
+  fetchSessionEventPage,
   fetchSessionEvents,
   fetchSessionMetadata,
   fetchSyncExclusions,
@@ -104,6 +111,11 @@ import {
 import { Topbar } from "./topbar";
 
 const HEALTH_REFRESH_MS = 30_000;
+const CHAT_EVENT_WINDOW_INITIAL = 360;
+const CHAT_EVENT_WINDOW_PAGE = 180;
+const CHAT_EVENT_WINDOW_MAX = 720;
+const CHAT_FULL_REFRESH_MAX_EVENTS = 700;
+const DISPLAY_MODE_MEDIA_QUERIES = ["(monochrome)", "(prefers-contrast: more)", "(update: slow)"];
 
 export function App() {
   const [route, navigateRoute] = useRoute();
@@ -131,6 +143,7 @@ export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(() => !window.matchMedia("(max-width: 780px)").matches);
   const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth);
   const [interfacePrefs, setInterfacePrefs] = useState(readInterfacePrefs);
+  const [autoDisplayMode, setAutoDisplayMode] = useState<Exclude<DisplayMode, "auto">>(() => detectAutoDisplayMode());
   const [interfacePrefsOpen, setInterfacePrefsOpen] = useState(false);
   const [retentionDays, setRetentionDays] = useState(readRetentionDays);
   const [groupByProject, setGroupByProject] = useState(() => readLocalStorageBoolean(GROUP_BY_PROJECT_STORAGE_KEY, true));
@@ -160,6 +173,7 @@ export function App() {
   const previousRetentionDays = useRef(retentionDays);
   const sessionEventRefreshes = useRef(new Map<string, { generation: number; controller: AbortController }>());
   const sessionPayloadCacheWrites = useRef(new Map<string, Promise<void>>());
+  const eventWindowLoads = useRef({ older: false, newer: false });
   const isAuthenticated = authState === "authenticated";
   const canShowLocalApp = authState !== "anonymous";
   const settingsOpen = route.panel === "settings";
@@ -167,6 +181,7 @@ export function App() {
   const audio = useAudioImports({ isAuthenticated, audioOpen });
   const activeId = active?.id ?? null;
   const events = eventState.sessionId === activeId ? eventState.events : [];
+  const resolvedDisplayMode = interfacePrefs.displayMode === "auto" ? autoDisplayMode : interfacePrefs.displayMode;
   const isMutedSession = useMemo(() => mutedSessionMatcher(mutedSources), [mutedSources]);
   const visibleSessions = useMemo(() => sessions.filter((session) => !isMutedSession(session)), [isMutedSession, sessions]);
   const sessionStatsById = useMemo(() => new Map(sessionStats.map((stat) => [stat.sessionId, stat])), [sessionStats]);
@@ -195,6 +210,7 @@ export function App() {
     setInterfacePrefs((current) => {
       const next = clampInterfacePrefs({ ...current, ...patch });
       if (
+        next.displayMode === current.displayMode &&
         next.uiScale === current.uiScale &&
         next.chatScale === current.chatScale &&
         next.density === current.density &&
@@ -266,9 +282,9 @@ export function App() {
         "--ui-font-scale": String(interfacePrefs.uiScale),
         "--ui-density": String(interfacePrefs.density),
         "--chat-font-scale": String(interfacePrefs.chatScale),
-        "--chat-line-width": `${interfacePrefs.chatWidth}px`,
+        "--chat-line-width": `${effectiveChatWidth(interfacePrefs, resolvedDisplayMode)}px`,
       }) as CSSProperties,
-    [interfacePrefs, sidebarWidth],
+    [interfacePrefs, resolvedDisplayMode, sidebarWidth],
   );
 
   const markServerAttempt = useCallback(() => {
@@ -321,10 +337,25 @@ export function App() {
     });
   }, []);
 
-  const setSessionEvents = useCallback((sessionId: string | null, nextEvents: SessionEvent[]) => {
+  const setSessionEvents = useCallback((sessionId: string | null, nextEvents: SessionEvent[], options: Partial<EventState> = {}) => {
     setEventState((current) => {
-      if (current.sessionId === sessionId && sameSessionEvents(current.events, nextEvents)) return current;
-      return { sessionId, events: nextEvents };
+      const next = {
+        sessionId,
+        events: nextEvents,
+        windowed: options.windowed ?? false,
+        hasOlder: options.hasOlder ?? false,
+        hasNewer: options.hasNewer ?? false,
+      } satisfies EventState;
+      if (
+        current.sessionId === next.sessionId &&
+        current.windowed === next.windowed &&
+        current.hasOlder === next.hasOlder &&
+        current.hasNewer === next.hasNewer &&
+        sameSessionEvents(current.events, next.events)
+      ) {
+        return current;
+      }
+      return next;
     });
   }, []);
 
@@ -384,12 +415,59 @@ export function App() {
       return current?.generation === generation && current.controller === controller;
     };
     try {
+      if (sessionId.startsWith("v3:") && expectedEvents > CHAT_FULL_REFRESH_MAX_EVENTS) {
+        const payload = await fetchSessionEventPage(
+          sessionId,
+          { direction: "recent", limit: CHAT_EVENT_WINDOW_INITIAL, init: { signal: controller.signal } },
+          retentionDays,
+        );
+        if (!isCurrentRefresh() || activeRef.current?.id !== sessionId) return false;
+        markServerReachable();
+        setActiveSession(payload.session);
+        setSessionEvents(sessionId, payload.events, {
+          windowed: true,
+          hasOlder: payload.hasOlder,
+          hasNewer: payload.hasNewer,
+        });
+        void cacheSessionEventPage(payload).catch((cacheError) => {
+          void logClientEvent(
+            "warn",
+            "cache.session_page_write.failed",
+            cacheError instanceof Error ? cacheError.message : String(cacheError),
+            { sessionId, events: payload.events.length, error: cacheError },
+            ["cache", "session"],
+          ).catch(() => {});
+        });
+        void logClientEvent(
+          "info",
+          "read.session_events.page_complete",
+          null,
+          {
+            sessionId,
+            source: payload.source,
+            events: payload.events.length,
+            expectedEvents,
+            durationMs: Math.round(performance.now() - readStarted),
+            reason,
+            generation,
+            hasOlder: payload.hasOlder,
+            hasNewer: payload.hasNewer,
+          },
+          ["read", "session"],
+        ).catch(() => {});
+        return true;
+      }
+
       const payload = await fetchSessionEvents(sessionId, { signal: controller.signal }, retentionDays);
       if (!isCurrentRefresh() || activeRef.current?.id !== sessionId) return false;
       markServerReachable();
       const sessionForCache = payload.session ?? activeRef.current;
       if (payload.session) setActiveSession(payload.session);
-      setSessionEvents(sessionId, payload.events);
+      setSessionEvents(sessionId, payload.events, {
+        windowed: false,
+        hasOlder: false,
+        hasNewer: false,
+      });
       if (sessionForCache) queueSessionPayloadCache(sessionId, generation, { session: sessionForCache, events: payload.events });
       void logClientEvent(
         "info",
@@ -413,6 +491,98 @@ export function App() {
       if (isCurrentRefresh()) sessionEventRefreshes.current.delete(sessionId);
     }
   }, [markServerAttempt, markServerReachable, queueSessionPayloadCache, retentionDays, setActiveSession, setSessionEvents]);
+
+  const loadOlderEventWindow = useCallback(async () => {
+    const session = activeRef.current;
+    const current = eventStateRef.current;
+    if (!session || current.sessionId !== session.id || !current.events.length || current.hasOlder === false) return;
+    if (eventWindowLoads.current.older) return;
+    eventWindowLoads.current.older = true;
+    const cursor = current.events[0];
+    const canFetchRemote = session.id.startsWith("v3:") && isAuthenticated && navigator.onLine !== false;
+    try {
+      let older = await loadSessionEventsBefore(session.id, cursor, CHAT_EVENT_WINDOW_PAGE);
+      let hasOlder = older.length >= CHAT_EVENT_WINDOW_PAGE;
+      if (!older.length && canFetchRemote) {
+        const payload = await fetchSessionEventPage(
+          session.id,
+          { direction: "before", cursor, limit: CHAT_EVENT_WINDOW_PAGE },
+          retentionDays,
+        );
+        older = payload.events;
+        hasOlder = payload.hasOlder;
+        setActiveSession(payload.session);
+        void cacheSessionEventPage(payload).catch(() => {});
+      }
+      setEventState((latest) => {
+        if (latest.sessionId !== session.id || latest.events[0]?.id !== cursor.id) return latest;
+        if (!older.length) {
+          return {
+            ...latest,
+            hasOlder: canFetchRemote ? false : Boolean(latest.hasOlder && session.eventCount > latest.events.length),
+            windowed: latest.windowed || latest.hasNewer || session.eventCount > latest.events.length,
+          };
+        }
+        return mergeEventWindow(latest, older, "prepend", hasOlder);
+      });
+    } catch (error) {
+      void logClientEvent(
+        "warn",
+        "read.session_events.older_failed",
+        error instanceof Error ? error.message : String(error),
+        { sessionId: session.id, cursorId: cursor.id, error },
+        ["read", "session"],
+      ).catch(() => {});
+    } finally {
+      eventWindowLoads.current.older = false;
+    }
+  }, [isAuthenticated, retentionDays, setActiveSession]);
+
+  const loadNewerEventWindow = useCallback(async (force = false) => {
+    const session = activeRef.current;
+    const current = eventStateRef.current;
+    if (!session || current.sessionId !== session.id || !current.events.length || (!force && current.hasNewer === false)) return;
+    if (eventWindowLoads.current.newer) return;
+    eventWindowLoads.current.newer = true;
+    const cursor = current.events.at(-1)!;
+    const canFetchRemote = session.id.startsWith("v3:") && isAuthenticated && navigator.onLine !== false;
+    try {
+      let newer = await loadSessionEventsAfter(session.id, cursor, CHAT_EVENT_WINDOW_PAGE);
+      let hasNewer = newer.length >= CHAT_EVENT_WINDOW_PAGE;
+      if (!newer.length && canFetchRemote) {
+        const payload = await fetchSessionEventPage(
+          session.id,
+          { direction: "after", cursor, limit: CHAT_EVENT_WINDOW_PAGE },
+          retentionDays,
+        );
+        newer = payload.events;
+        hasNewer = payload.hasNewer;
+        setActiveSession(payload.session);
+        void cacheSessionEventPage(payload).catch(() => {});
+      }
+      setEventState((latest) => {
+        if (latest.sessionId !== session.id || latest.events.at(-1)?.id !== cursor.id) return latest;
+        if (!newer.length) {
+          return {
+            ...latest,
+            hasNewer: canFetchRemote ? false : Boolean(latest.hasNewer && session.eventCount > latest.events.length),
+            windowed: latest.windowed || latest.hasOlder || session.eventCount > latest.events.length,
+          };
+        }
+        return mergeEventWindow(latest, newer, "append", hasNewer);
+      });
+    } catch (error) {
+      void logClientEvent(
+        "warn",
+        "read.session_events.newer_failed",
+        error instanceof Error ? error.message : String(error),
+        { sessionId: session.id, cursorId: cursor.id, error },
+        ["read", "session"],
+      ).catch(() => {});
+    } finally {
+      eventWindowLoads.current.newer = false;
+    }
+  }, [isAuthenticated, retentionDays, setActiveSession]);
 
   const checkAuth = useCallback(async () => {
     const started = performance.now();
@@ -858,6 +1028,8 @@ export function App() {
               ).catch(() => {});
             }
           }
+        } else if (result.touchedSessionIds.includes(current.id) && eventStateRef.current.windowed) {
+          await loadNewerEventWindow(true);
         } else if (result.touchedSessionIds.includes(current.id)) {
           await refreshActiveSessionEvents(
             current.id,
@@ -910,12 +1082,7 @@ export function App() {
       } else {
         setSyncState((currentState) => (currentState === "syncing" ? "idle" : currentState));
       }
-      if (!metadataOnly && result.backfillHasMore && !document.hidden && backfillTimer.current === null) {
-        backfillTimer.current = window.setTimeout(() => {
-          backfillTimer.current = null;
-          void syncNow({ silent: true, metadataOnly: false, eventMode: "backfill" });
-        }, result.eventMode === "recent" ? 1000 : 2500);
-      } else if (!metadataOnly && result.eventMode === "backfill" && !result.backfillHasMore && resumeRecentAfterBackfill.current) {
+      if (!metadataOnly && result.eventMode === "backfill" && !result.backfillHasMore && resumeRecentAfterBackfill.current) {
         resumeRecentAfterBackfill.current = false;
         window.setTimeout(() => void syncNow({ silent: true, metadataOnly: false, eventMode: "recent" }), 0);
       }
@@ -952,6 +1119,7 @@ export function App() {
     markServerError,
     markServerReachable,
     navigateRoute,
+    loadNewerEventWindow,
     refreshCache,
     retentionDays,
     refreshActiveSessionEvents,
@@ -1435,6 +1603,20 @@ export function App() {
   }, [theme]);
 
   useEffect(() => {
+    const update = () => setAutoDisplayMode(detectAutoDisplayMode());
+    const queries = DISPLAY_MODE_MEDIA_QUERIES.map((query) => window.matchMedia(query));
+    for (const query of queries) query.addEventListener("change", update);
+    update();
+    return () => {
+      for (const query of queries) query.removeEventListener("change", update);
+    };
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.display = resolvedDisplayMode;
+  }, [resolvedDisplayMode]);
+
+  useEffect(() => {
     writeLocalStorageValue(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth));
   }, [sidebarWidth]);
 
@@ -1737,7 +1919,7 @@ export function App() {
   }
 
   return (
-    <div className={`app-shell ${sidebarOpen ? "" : "sidebar-closed"}`} style={appShellStyle}>
+    <div className={`app-shell display-${resolvedDisplayMode} ${sidebarOpen ? "" : "sidebar-closed"}`} style={appShellStyle}>
       <BuildBadge sha={buildSha} />
       <Topbar
         active={active}
@@ -1784,12 +1966,17 @@ export function App() {
         <MainChat
           active={active}
           eventsLength={events.length}
+          eventWindowed={eventState.sessionId === activeId ? eventState.windowed : false}
+          hasOlderEvents={eventState.sessionId === activeId ? eventState.hasOlder : false}
+          hasNewerEvents={eventState.sessionId === activeId ? eventState.hasNewer : false}
           items={items}
           draft={draft}
           now={now}
           syncHealth={syncHealth}
           syncState={syncState}
           onDraftChange={handleDraftChange}
+          onLoadOlderEvents={loadOlderEventWindow}
+          onLoadNewerEvents={loadNewerEventWindow}
         />
       </div>
       {settingsOpen && (
@@ -1946,8 +2133,7 @@ function sameSessionEvents(a: SessionEvent[], b: SessionEvent[]) {
       a[i].eventType !== b[i].eventType ||
       a[i].role !== b[i].role ||
       a[i].createdAt !== b[i].createdAt ||
-      a[i].ingestedAt !== b[i].ingestedAt ||
-      !sameRawValue(a[i].raw, b[i].raw)
+      a[i].ingestedAt !== b[i].ingestedAt
     ) {
       return false;
     }
@@ -1955,9 +2141,37 @@ function sameSessionEvents(a: SessionEvent[], b: SessionEvent[]) {
   return true;
 }
 
-function sameRawValue(a: unknown, b: unknown) {
-  if (a === b) return true;
-  return JSON.stringify(a) === JSON.stringify(b);
+function mergeEventWindow(current: EventState, incoming: SessionEvent[], mode: "prepend" | "append", hasMoreInDirection: boolean): EventState {
+  const events = mergeSessionEvents(mode === "prepend" ? [...incoming, ...current.events] : [...current.events, ...incoming]);
+  let trimmed = events;
+  let trimmedOlder = false;
+  let trimmedNewer = false;
+  if (events.length > CHAT_EVENT_WINDOW_MAX) {
+    if (mode === "prepend") {
+      trimmed = events.slice(0, CHAT_EVENT_WINDOW_MAX);
+      trimmedNewer = true;
+    } else {
+      trimmed = events.slice(events.length - CHAT_EVENT_WINDOW_MAX);
+      trimmedOlder = true;
+    }
+  }
+  return {
+    sessionId: current.sessionId,
+    events: trimmed,
+    windowed: true,
+    hasOlder: mode === "prepend" ? hasMoreInDirection : Boolean(current.hasOlder || trimmedOlder),
+    hasNewer: mode === "append" ? hasMoreInDirection : Boolean(current.hasNewer || trimmedNewer),
+  };
+}
+
+function mergeSessionEvents(events: SessionEvent[]) {
+  const byId = new Map<string, SessionEvent>();
+  for (const event of events) byId.set(event.id, event);
+  return [...byId.values()].sort(compareSessionEventOrder);
+}
+
+function compareSessionEventOrder(a: SessionEvent, b: SessionEvent) {
+  return a.lineNo - b.lineNo || a.offset - b.offset || a.id.localeCompare(b.id);
 }
 
 function sessionDbIdFromDocId(docId: string) {

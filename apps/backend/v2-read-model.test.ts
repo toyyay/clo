@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   getV2SessionsMeta,
   getV2Session,
+  getV2SessionEventPage,
   listV2EventsForBackfill,
   listV2Sessions,
   listV2EventsForSync,
@@ -284,6 +285,43 @@ describe("v2 read model helpers", () => {
     expect(calls[0].values).toEqual([10n, "2026-04-13T00:00:00.000Z", "2026-04-13T00:00:00.000Z", 25]);
   });
 
+  test("v2 event page queries use generation-scoped keyset order", async () => {
+    const { calls, sql } = recordingSql([
+      [
+        {
+          id: 42,
+          agent_id: "agent-1",
+          hostname: "workstation",
+          provider: "codex",
+          source_kind: "conversation",
+          current_generation: 2,
+          source_path: "thread.jsonl",
+          size_bytes: 100n,
+          mtime_ms: 1,
+          git: {},
+          metadata: {},
+          first_seen_at: "2026-04-25T10:00:00.000Z",
+          last_seen_at: "2026-04-25T10:05:00.000Z",
+          event_count: 2000n,
+        },
+      ],
+      [],
+    ]);
+
+    await getV2SessionEventPage(sql, "v3:42", {
+      direction: "before",
+      cursor: { id: "v2e:100", lineNo: 99, offset: 1200 },
+      limit: 50,
+    });
+
+    expect(calls).toHaveLength(2);
+    const text = normalizeSql(calls[1].text);
+    expect(text).toContain("e.source_generation = f.current_generation");
+    expect(text).toContain("e.id < ?::bigint");
+    expect(text).toContain("order by e.source_line_no desc nulls last, e.source_offset desc nulls last, e.id desc");
+    expect(text).toContain("limit ?");
+  });
+
   test("v2 metadata lookup can return deleted tombstones for delta sync", async () => {
     const { calls, sql } = recordingSql();
 
@@ -347,11 +385,12 @@ describe("v2 read model helpers", () => {
   });
 });
 
-function recordingSql(rows: any[] = []) {
+function recordingSql(rows: any[] | any[][] = []) {
   const calls: Array<{ text: string; values: unknown[] }> = [];
+  const rowBatches = Array.isArray(rows[0]) ? (rows as any[][]) : null;
   const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
     calls.push({ text: Array.from(strings).join("?"), values });
-    return rows;
+    return rowBatches ? (rowBatches[calls.length - 1] ?? []) : rows;
   }) as any;
   return { calls, sql };
 }

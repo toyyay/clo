@@ -16,6 +16,7 @@ import type {
   IngestBatchResponse,
   ImportTokenInfo,
   SessionInfo,
+  SessionEventsPage,
   SessionPayload,
   SyncExclusionInfo,
   SyncExclusionKind,
@@ -43,6 +44,7 @@ import {
 } from "./sync-engine";
 import {
   getV2Session,
+  getV2SessionEventPage,
   getV2SessionsMeta,
   isV2SessionId,
   listV2EventsForBackfill,
@@ -237,7 +239,12 @@ Bun.serve<{ docIds: Set<string> }>({
       const fallbackId = new URL(req.url).pathname.match(/^\/api\/v2\/sessions\/([^/]+)\/events$/)?.[1];
       const id = decodeURIComponent(req.params?.id ?? fallbackId ?? "");
       if (!id) return text("missing id", 400);
-      const payload = await getReadableSession(id, retentionCutoffFromRequest(req));
+      const url = new URL(req.url);
+      const pageOptions = parseSessionEventPageOptions(url.searchParams);
+      const payload = pageOptions
+        ? await getReadableSessionEventPage(id, { ...pageOptions, cutoffIso: retentionCutoffFromRequest(req) })
+        : await getReadableSession(id, retentionCutoffFromRequest(req));
+      const pagedPayload = pageOptions && payload ? (payload as SessionEventsPage) : null;
       void logBackendRequestEvent({
         level: payload ? "info" : "warn",
         event: payload ? "session.events.result" : "session.events.missing",
@@ -249,6 +256,9 @@ Bun.serve<{ docIds: Set<string> }>({
           found: Boolean(payload),
           eventCount: payload?.events.length ?? 0,
           sessionEventCount: payload?.session.eventCount ?? null,
+          paged: Boolean(pageOptions),
+          hasOlder: pagedPayload?.hasOlder ?? null,
+          hasNewer: pagedPayload?.hasNewer ?? null,
           firstEventId: payload?.events[0]?.id ?? null,
           lastEventId: payload?.events.at(-1)?.id ?? null,
         },
@@ -2165,6 +2175,37 @@ async function getReadableSession(id: string, cutoffIso?: string | null): Promis
   if (isV2SessionId(id)) return getV2Session(sql, id, { cutoffIso });
   if (!legacyReadEnabled) return null;
   return getSession(id, cutoffIso);
+}
+
+async function getReadableSessionEventPage(
+  id: string,
+  options: {
+    cutoffIso?: string | null;
+    limit: number;
+    direction?: "recent" | "before" | "after";
+    cursor?: { id: string; lineNo: number; offset: number };
+  },
+): Promise<SessionEventsPage | null> {
+  if (!isV2SessionId(id)) return null;
+  return getV2SessionEventPage(sql, id, options);
+}
+
+function parseSessionEventPageOptions(searchParams: URLSearchParams) {
+  const page = searchParams.get("page");
+  const limitParam = searchParams.get("limit");
+  if (!page && !limitParam) return null;
+  const direction: "recent" | "before" | "after" =
+    page === "before" || page === "after" || page === "recent" ? page : "recent";
+  const parsedLimit = Number(limitParam ?? 300);
+  const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(1000, Math.floor(parsedLimit))) : 300;
+  const cursorId = searchParams.get("cursorId");
+  const cursorLineNo = Number(searchParams.get("cursorLineNo"));
+  const cursorOffset = Number(searchParams.get("cursorOffset"));
+  const cursor =
+    cursorId && Number.isFinite(cursorLineNo) && Number.isFinite(cursorOffset)
+      ? { id: cursorId, lineNo: cursorLineNo, offset: cursorOffset }
+      : undefined;
+  return { direction, limit, cursor };
 }
 
 async function listHosts(cutoffIso?: string | null): Promise<HostInfo[]> {

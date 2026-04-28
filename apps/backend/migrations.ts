@@ -642,6 +642,17 @@ create index if not exists idx_sync_exclusions_created
   on sync_exclusions (created_at desc);
 `.trim(),
   },
+  {
+    id: "0012",
+    name: "event_window_indexes",
+    sql: `
+create index if not exists idx_events_session_order
+  on session_events (session_db_id, source_line_no asc, source_offset asc, id asc);
+
+create index if not exists idx_agent_normalized_events_file_generation_order
+  on agent_normalized_events (source_file_id, source_generation, source_line_no asc nulls last, source_offset asc nulls last, id asc);
+`.trim(),
+  },
 ];
 
 export function migrationsEnabled(env = process.env) {

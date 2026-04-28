@@ -1,9 +1,11 @@
 import type { HostInfo, SessionEvent, SessionInfo, SessionPayload, SyncExclusionInfo, SyncResponse } from "../../packages/shared/types";
 
 const DB_NAME = "chatview-cache-v3";
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const CURRENT_SESSION_PREFIX = "v3:";
 const DB_OPEN_TIMEOUT_MS = 4000;
+const EVENT_ORDER_INDEX = "sessionOrder";
+const EVENT_ORDER_MAX = Number.MAX_SAFE_INTEGER;
 
 type StoreName =
   | "meta"
@@ -89,6 +91,13 @@ export function openCacheDb() {
       if (!db.objectStoreNames.contains("events")) {
         const events = db.createObjectStore("events", { keyPath: "id" });
         events.createIndex("sessionDbId", "sessionDbId");
+        events.createIndex(EVENT_ORDER_INDEX, ["sessionDbId", "lineNo", "offset", "id"]);
+      } else {
+        const tx = request.transaction;
+        const events = tx?.objectStore("events");
+        if (events && !events.indexNames.contains(EVENT_ORDER_INDEX)) {
+          events.createIndex(EVENT_ORDER_INDEX, ["sessionDbId", "lineNo", "offset", "id"]);
+        }
       }
       if (!db.objectStoreNames.contains("mutedSources")) db.createObjectStore("mutedSources", { keyPath: "id" });
       if (!db.objectStoreNames.contains("sessionStats")) {
@@ -176,12 +185,27 @@ export async function loadSessions(): Promise<SessionInfo[]> {
     .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
 }
 
-export async function loadSessionEvents(sessionDbId: string): Promise<SessionEvent[]> {
+export async function loadRecentSessionEvents(sessionDbId: string, limit: number): Promise<SessionEvent[]> {
   if (!isCurrentSessionId(sessionDbId)) return [];
-  const db = await openCacheDb();
-  const index = db.transaction("events").objectStore("events").index("sessionDbId");
-  const events = await request<SessionEvent[]>(index.getAll(IDBKeyRange.only(sessionDbId)));
-  return events.sort(compareSessionEvents);
+  return readSessionEventPage(sessionDbId, { direction: "prev", limit });
+}
+
+export async function loadSessionEventsBefore(sessionDbId: string, cursor: SessionEvent, limit: number): Promise<SessionEvent[]> {
+  if (!isCurrentSessionId(sessionDbId)) return [];
+  return readSessionEventPage(sessionDbId, {
+    direction: "prev",
+    limit,
+    range: IDBKeyRange.bound(minEventOrderKey(sessionDbId), eventOrderKey(cursor), false, true),
+  });
+}
+
+export async function loadSessionEventsAfter(sessionDbId: string, cursor: SessionEvent, limit: number): Promise<SessionEvent[]> {
+  if (!isCurrentSessionId(sessionDbId)) return [];
+  return readSessionEventPage(sessionDbId, {
+    direction: "next",
+    limit,
+    range: IDBKeyRange.bound(eventOrderKey(cursor), maxEventOrderKey(sessionDbId), true, false),
+  });
 }
 
 export async function loadMutedSources(): Promise<SyncExclusionInfo[]> {
@@ -206,8 +230,34 @@ export async function loadSessionStats(): Promise<SessionCacheStat[]> {
   return request<SessionCacheStat[]>(db.transaction("sessionStats").objectStore("sessionStats").getAll());
 }
 
-function compareSessionEvents(a: SessionEvent, b: SessionEvent) {
-  return a.lineNo - b.lineNo || a.offset - b.offset || a.id.localeCompare(b.id);
+async function readSessionEventPage(
+  sessionDbId: string,
+  options: {
+    direction: IDBCursorDirection;
+    limit: number;
+    range?: IDBKeyRange;
+  },
+) {
+  const limit = Math.max(0, Math.floor(options.limit));
+  if (!limit) return [];
+  const db = await openCacheDb();
+  const tx = db.transaction("events");
+  const index = tx.objectStore("events").index(EVENT_ORDER_INDEX);
+  const range = options.range ?? IDBKeyRange.bound(minEventOrderKey(sessionDbId), maxEventOrderKey(sessionDbId));
+  const events = await collectCursor<SessionEvent>(index.openCursor(range, options.direction), limit);
+  return options.direction === "prev" ? events.reverse() : events;
+}
+
+function minEventOrderKey(sessionDbId: string): [string, number, number, string] {
+  return [sessionDbId, 0, 0, ""];
+}
+
+function maxEventOrderKey(sessionDbId: string): [string, number, number, string] {
+  return [sessionDbId, EVENT_ORDER_MAX, EVENT_ORDER_MAX, "\uffff"];
+}
+
+function eventOrderKey(event: SessionEvent): [string, number, number, string] {
+  return [event.sessionDbId, event.lineNo, event.offset, event.id];
 }
 
 export async function applySync(
@@ -222,6 +272,7 @@ export async function applySync(
   const meta = tx.objectStore("meta");
   const stats = tx.objectStore("sessionStats");
   const currentSessions = payload.sessions.filter((session) => isCurrentSessionId(session.id));
+  const eventsBySessionId = groupEventsBySession(payload.events);
   if (payload.sessions.length !== currentSessions.length) {
     warnLegacyFiltered("applySync.sessions", payload.sessions.length - currentSessions.length, payload.sessions[0]?.id);
   }
@@ -236,7 +287,7 @@ export async function applySync(
       queueDeleteEventsForSession(events, session.id);
     } else {
       sessions.put(session);
-      queuePutSessionStat(stats, session, payload.events.filter((event) => event.sessionDbId === session.id));
+      queuePutSessionStat(stats, session, eventsBySessionId.get(session.id) ?? []);
     }
   }
   const shouldPruneMissing = options.pruneMissing === "full-shell" || options.replaceShell === true;
@@ -400,6 +451,19 @@ export async function cacheSessionPayload(payload: SessionPayload) {
   sessions.put(payload.session);
   for (const event of payload.events) events.put(event);
   queuePutSessionStat(stats, payload.session, payload.events);
+  await transactionDone(tx);
+}
+
+export async function cacheSessionEventPage(payload: SessionPayload) {
+  if (!isCurrentSessionId(payload.session.id)) return;
+  const db = await openCacheDb();
+  const tx = db.transaction(["sessions", "events", "sessionStats"] satisfies StoreName[], "readwrite");
+  const sessions = tx.objectStore("sessions");
+  const events = tx.objectStore("events");
+  const stats = tx.objectStore("sessionStats");
+  sessions.put(payload.session);
+  for (const event of payload.events) events.put(event);
+  queuePutSessionStat(stats, payload.session);
   await transactionDone(tx);
 }
 
@@ -580,6 +644,22 @@ function request<T>(req: IDBRequest<T>): Promise<T> {
   });
 }
 
+function collectCursor<T>(cursorRequest: IDBRequest<IDBCursorWithValue | null>, limit: number): Promise<T[]> {
+  return new Promise((resolve, reject) => {
+    const rows: T[] = [];
+    cursorRequest.onerror = () => reject(cursorRequest.error);
+    cursorRequest.onsuccess = () => {
+      const cursor = cursorRequest.result;
+      if (!cursor || rows.length >= limit) {
+        resolve(rows);
+        return;
+      }
+      rows.push(cursor.value as T);
+      cursor.continue();
+    };
+  });
+}
+
 function newQueueId() {
   const random = typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
@@ -595,6 +675,16 @@ function queueDeleteEventsForSession(events: IDBObjectStore, sessionId: string) 
     events.delete(cursor.primaryKey);
     cursor.continue();
   };
+}
+
+function groupEventsBySession(events: SessionEvent[]) {
+  const bySession = new Map<string, SessionEvent[]>();
+  for (const event of events) {
+    const bucket = bySession.get(event.sessionDbId);
+    if (bucket) bucket.push(event);
+    else bySession.set(event.sessionDbId, [event]);
+  }
+  return bySession;
 }
 
 function queuePutSessionStat(stats: IDBObjectStore, session: SessionInfo, events: SessionEvent[] = []) {

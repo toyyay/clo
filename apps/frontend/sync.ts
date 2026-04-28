@@ -1,6 +1,7 @@
 import type {
   HostInfo,
   SessionEvent,
+  SessionEventsPage,
   SessionInfo,
   SessionPayload,
   SyncExclusionInfo,
@@ -34,6 +35,12 @@ export type SessionEventsPayload = {
   events: SessionEvent[];
   source: "v2" | "legacy";
 };
+
+export type SessionEventsPagePayload = SessionEventsPage & {
+  source: "v2";
+};
+
+export type SessionEventPageDirection = "recent" | "before" | "after";
 
 export type PullResult = {
   events: number;
@@ -135,6 +142,23 @@ function withLookback(url: string, lookbackDays?: number) {
   return `${url}${separator}lookbackDays=${encodeURIComponent(String(clampRetentionDays(lookbackDays)))}`;
 }
 
+function withSessionEventPageParams(
+  url: string,
+  options: { direction?: SessionEventPageDirection; cursor?: Pick<SessionEvent, "id" | "lineNo" | "offset">; limit?: number },
+) {
+  const params = new URLSearchParams();
+  params.set("page", options.direction ?? "recent");
+  if (options.limit !== undefined) params.set("limit", String(Math.max(1, Math.floor(options.limit))));
+  if (options.cursor) {
+    params.set("cursorId", options.cursor.id);
+    params.set("cursorLineNo", String(options.cursor.lineNo));
+    params.set("cursorOffset", String(options.cursor.offset));
+  }
+  const query = params.toString();
+  if (!query) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}${query}`;
+}
+
 function shouldFallBackToLegacy(error: unknown) {
   return error instanceof ReadApiError && (error.status === 404 || error.status === 405 || error.status === 501);
 }
@@ -228,6 +252,24 @@ export async function fetchSessionEvents(sessionId: string, init?: RequestInit, 
   const payload = await readJson<SessionPayload>(withLookback(READ_API_ENDPOINTS.legacySession(sessionId), lookbackDays), init);
   rememberReadApi("legacy");
   return normalizeSessionEventsPayload(payload, "legacy");
+}
+
+export async function fetchSessionEventPage(
+  sessionId: string,
+  options: {
+    direction?: SessionEventPageDirection;
+    cursor?: Pick<SessionEvent, "id" | "lineNo" | "offset">;
+    limit?: number;
+    init?: RequestInit;
+  } = {},
+  lookbackDays?: number,
+): Promise<SessionEventsPagePayload> {
+  const payload = await readJson<SessionEventsPage>(
+    withLookback(withSessionEventPageParams(READ_API_ENDPOINTS.v2SessionEvents(sessionId), options), lookbackDays),
+    options.init,
+  );
+  rememberReadApi("v2");
+  return { ...payload, source: "v2" };
 }
 
 export async function fetchSyncExclusions(): Promise<SyncExclusionInfo[]> {
