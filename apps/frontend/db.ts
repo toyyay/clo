@@ -1,7 +1,7 @@
-import type { HostInfo, SessionEvent, SessionInfo, SessionPayload, SyncResponse } from "../../packages/shared/types";
+import type { HostInfo, SessionEvent, SessionInfo, SessionPayload, SyncExclusionInfo, SyncResponse } from "../../packages/shared/types";
 
 const DB_NAME = "chatview-cache-v3";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const CURRENT_SESSION_PREFIX = "v3:";
 const DB_OPEN_TIMEOUT_MS = 4000;
 
@@ -10,6 +10,8 @@ type StoreName =
   | "hosts"
   | "sessions"
   | "events"
+  | "mutedSources"
+  | "sessionStats"
   | "ydocs"
   | "yjsOutbox"
   | "audioRecordings"
@@ -40,6 +42,17 @@ export type CacheStats = {
   storageQuotaBytes?: number;
   cacheNames: string[];
   serviceWorkers: number;
+};
+
+export type SessionCacheStat = {
+  sessionId: string;
+  agentId: string;
+  hostname: string;
+  sourceProvider?: string | null;
+  projectKey: string;
+  approxBytes: number;
+  eventCount: number;
+  updatedAt: string;
 };
 
 let dbPromise: Promise<IDBDatabase> | null = null;
@@ -76,6 +89,12 @@ export function openCacheDb() {
       if (!db.objectStoreNames.contains("events")) {
         const events = db.createObjectStore("events", { keyPath: "id" });
         events.createIndex("sessionDbId", "sessionDbId");
+      }
+      if (!db.objectStoreNames.contains("mutedSources")) db.createObjectStore("mutedSources", { keyPath: "id" });
+      if (!db.objectStoreNames.contains("sessionStats")) {
+        const stats = db.createObjectStore("sessionStats", { keyPath: "sessionId" });
+        stats.createIndex("agentId", "agentId");
+        stats.createIndex("sourceProvider", "sourceProvider");
       }
       if (!db.objectStoreNames.contains("ydocs")) db.createObjectStore("ydocs", { keyPath: "docId" });
       if (!db.objectStoreNames.contains("yjsOutbox")) {
@@ -165,6 +184,28 @@ export async function loadSessionEvents(sessionDbId: string): Promise<SessionEve
   return events.sort(compareSessionEvents);
 }
 
+export async function loadMutedSources(): Promise<SyncExclusionInfo[]> {
+  const db = await openCacheDb();
+  const rows = await request<SyncExclusionInfo[]>(db.transaction("mutedSources").objectStore("mutedSources").getAll());
+  return rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export async function cacheMutedSources(exclusions: SyncExclusionInfo[]) {
+  const db = await openCacheDb();
+  const tx = db.transaction("mutedSources", "readwrite");
+  const store = tx.objectStore("mutedSources");
+  store.clear();
+  for (const exclusion of exclusions) {
+    if (!exclusion.restoredAt) store.put(exclusion);
+  }
+  await transactionDone(tx);
+}
+
+export async function loadSessionStats(): Promise<SessionCacheStat[]> {
+  const db = await openCacheDb();
+  return request<SessionCacheStat[]>(db.transaction("sessionStats").objectStore("sessionStats").getAll());
+}
+
 function compareSessionEvents(a: SessionEvent, b: SessionEvent) {
   return a.lineNo - b.lineNo || a.offset - b.offset || a.id.localeCompare(b.id);
 }
@@ -174,11 +215,12 @@ export async function applySync(
   options: { pruneMissing?: "none" | "full-shell"; replaceShell?: boolean; storeEventCursor?: boolean } = {},
 ) {
   const db = await openCacheDb();
-  const tx = db.transaction(["meta", "hosts", "sessions", "events"] satisfies StoreName[], "readwrite");
+  const tx = db.transaction(["meta", "hosts", "sessions", "events", "sessionStats"] satisfies StoreName[], "readwrite");
   const hosts = tx.objectStore("hosts");
   const sessions = tx.objectStore("sessions");
   const events = tx.objectStore("events");
   const meta = tx.objectStore("meta");
+  const stats = tx.objectStore("sessionStats");
   const currentSessions = payload.sessions.filter((session) => isCurrentSessionId(session.id));
   if (payload.sessions.length !== currentSessions.length) {
     warnLegacyFiltered("applySync.sessions", payload.sessions.length - currentSessions.length, payload.sessions[0]?.id);
@@ -190,9 +232,11 @@ export async function applySync(
   for (const session of currentSessions) {
     if (session.deletedAt) {
       sessions.delete(session.id);
+      stats.delete(session.id);
       queueDeleteEventsForSession(events, session.id);
     } else {
       sessions.put(session);
+      queuePutSessionStat(stats, session, payload.events.filter((event) => event.sessionDbId === session.id));
     }
   }
   const shouldPruneMissing = options.pruneMissing === "full-shell" || options.replaceShell === true;
@@ -205,6 +249,7 @@ export async function applySync(
       const session = cursor.value as SessionInfo;
       if (!liveSessionIds.has(session.id)) {
         sessions.delete(cursor.primaryKey);
+        stats.delete(session.id);
         queueDeleteEventsForSession(events, session.id);
       }
       cursor.continue();
@@ -226,10 +271,11 @@ export async function applySync(
 
 export async function cacheShell(hostsInput: HostInfo[], sessionsInput: SessionInfo[], options: { authoritative?: boolean } = {}) {
   const db = await openCacheDb();
-  const tx = db.transaction(["hosts", "sessions", "events"] satisfies StoreName[], "readwrite");
+  const tx = db.transaction(["hosts", "sessions", "events", "sessionStats"] satisfies StoreName[], "readwrite");
   const hosts = tx.objectStore("hosts");
   const sessions = tx.objectStore("sessions");
   const events = tx.objectStore("events");
+  const stats = tx.objectStore("sessionStats");
   const currentSessions = sessionsInput.filter((session) => isCurrentSessionId(session.id));
   const liveHostIds = new Set(hostsInput.map((host) => host.agentId));
   const liveSessionIds = new Set(currentSessions.filter((session) => !session.deletedAt).map((session) => session.id));
@@ -237,9 +283,11 @@ export async function cacheShell(hostsInput: HostInfo[], sessionsInput: SessionI
   for (const session of currentSessions) {
     if (session.deletedAt) {
       sessions.delete(session.id);
+      stats.delete(session.id);
       queueDeleteEventsForSession(events, session.id);
     } else {
       sessions.put(session);
+      queuePutSessionStat(stats, session);
     }
   }
   if (options.authoritative !== false) {
@@ -251,6 +299,7 @@ export async function cacheShell(hostsInput: HostInfo[], sessionsInput: SessionI
       const session = cursor.value as SessionInfo;
       if (!liveSessionIds.has(session.id)) {
         sessions.delete(cursor.primaryKey);
+        stats.delete(session.id);
         queueDeleteEventsForSession(events, session.id);
       }
       cursor.continue();
@@ -263,9 +312,10 @@ export async function pruneCacheBefore(cutoffIso: string) {
   const cutoffTime = Date.parse(cutoffIso);
   if (!Number.isFinite(cutoffTime)) return;
   const db = await openCacheDb();
-  const tx = db.transaction(["sessions", "events"] satisfies StoreName[], "readwrite");
+  const tx = db.transaction(["sessions", "events", "sessionStats"] satisfies StoreName[], "readwrite");
   const sessions = tx.objectStore("sessions");
   const events = tx.objectStore("events");
+  const stats = tx.objectStore("sessionStats");
 
   const sessionCursor = sessions.openCursor();
   sessionCursor.onsuccess = () => {
@@ -274,6 +324,7 @@ export async function pruneCacheBefore(cutoffIso: string) {
     const session = cursor.value as SessionInfo;
     if (Date.parse(session.lastSeenAt) < cutoffTime) {
       sessions.delete(cursor.primaryKey);
+      stats.delete(session.id);
       queueDeleteEventsForSession(events, session.id);
     }
     cursor.continue();
@@ -286,6 +337,41 @@ export async function pruneCacheBefore(cutoffIso: string) {
     const event = cursor.value as SessionEvent;
     const eventTime = Date.parse(event.createdAt ?? event.ingestedAt);
     if (Number.isFinite(eventTime) && eventTime < cutoffTime) events.delete(cursor.primaryKey);
+    cursor.continue();
+  };
+
+  await transactionDone(tx);
+}
+
+export async function pruneMutedSources(exclusions: SyncExclusionInfo[]) {
+  if (!exclusions.length) return;
+  const db = await openCacheDb();
+  const tx = db.transaction(["hosts", "sessions", "events", "sessionStats"] satisfies StoreName[], "readwrite");
+  const hosts = tx.objectStore("hosts");
+  const sessions = tx.objectStore("sessions");
+  const events = tx.objectStore("events");
+  const stats = tx.objectStore("sessionStats");
+  const shouldPrune = mutedMatcher(exclusions);
+
+  const hostCursor = hosts.openCursor();
+  hostCursor.onsuccess = () => {
+    const cursor = hostCursor.result;
+    if (!cursor) return;
+    const host = cursor.value as HostInfo;
+    if (exclusions.some((exclusion) => exclusion.kind === "device" && exclusion.targetId === host.agentId)) hosts.delete(cursor.primaryKey);
+    cursor.continue();
+  };
+
+  const sessionCursor = sessions.openCursor();
+  sessionCursor.onsuccess = () => {
+    const cursor = sessionCursor.result;
+    if (!cursor) return;
+    const session = cursor.value as SessionInfo;
+    if (shouldPrune(session)) {
+      sessions.delete(cursor.primaryKey);
+      stats.delete(session.id);
+      queueDeleteEventsForSession(events, session.id);
+    }
     cursor.continue();
   };
 
@@ -306,12 +392,14 @@ function queueDeleteMissingHosts(hosts: IDBObjectStore, liveHostIds: Set<string>
 export async function cacheSessionPayload(payload: SessionPayload) {
   if (!isCurrentSessionId(payload.session.id)) return;
   const db = await openCacheDb();
-  const tx = db.transaction(["sessions", "events"] satisfies StoreName[], "readwrite");
+  const tx = db.transaction(["sessions", "events", "sessionStats"] satisfies StoreName[], "readwrite");
   const sessions = tx.objectStore("sessions");
   const events = tx.objectStore("events");
+  const stats = tx.objectStore("sessionStats");
   queueDeleteEventsForSession(events, payload.session.id);
   sessions.put(payload.session);
   for (const event of payload.events) events.put(event);
+  queuePutSessionStat(stats, payload.session, payload.events);
   await transactionDone(tx);
 }
 
@@ -431,6 +519,8 @@ export async function loadCacheStats(): Promise<CacheStats> {
     "hosts",
     "sessions",
     "events",
+    "mutedSources",
+    "sessionStats",
     "ydocs",
     "yjsOutbox",
     "audioRecordings",
@@ -505,6 +595,40 @@ function queueDeleteEventsForSession(events: IDBObjectStore, sessionId: string) 
     events.delete(cursor.primaryKey);
     cursor.continue();
   };
+}
+
+function queuePutSessionStat(stats: IDBObjectStore, session: SessionInfo, events: SessionEvent[] = []) {
+  stats.put({
+    sessionId: session.id,
+    agentId: session.agentId,
+    hostname: session.hostname,
+    sourceProvider: session.sourceProvider ?? null,
+    projectKey: session.projectKey,
+    approxBytes: estimateSessionBytes(session, events),
+    eventCount: Math.max(session.eventCount, events.length),
+    updatedAt: new Date().toISOString(),
+  } satisfies SessionCacheStat);
+}
+
+function estimateSessionBytes(session: SessionInfo, events: SessionEvent[]) {
+  let bytes = byteSize(JSON.stringify(session));
+  for (const event of events) bytes += byteSize(JSON.stringify(event));
+  if (!events.length) bytes += Math.max(0, session.sizeBytes || 0);
+  return bytes;
+}
+
+function mutedMatcher(exclusions: SyncExclusionInfo[]) {
+  const deviceIds = new Set(exclusions.filter((exclusion) => exclusion.kind === "device").map((exclusion) => exclusion.targetId));
+  const providerKeys = new Set(exclusions.filter((exclusion) => exclusion.kind === "provider").map((exclusion) => exclusion.targetId));
+  const sessionIds = new Set(exclusions.filter((exclusion) => exclusion.kind === "session").map((exclusion) => exclusion.targetId));
+  return (session: SessionInfo) => {
+    const provider = session.sourceProvider || (session.id.startsWith(CURRENT_SESSION_PREFIX) ? "v3" : "claude");
+    return deviceIds.has(session.agentId) || providerKeys.has(`${session.agentId}:${provider}`) || sessionIds.has(session.id);
+  };
+}
+
+function byteSize(value: string) {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 function transactionDone(tx: IDBTransaction) {

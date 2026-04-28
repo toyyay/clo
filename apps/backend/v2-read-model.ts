@@ -73,6 +73,15 @@ export async function listV2Hosts(sql: SqlTag, cutoffIso?: string | null): Promi
     left join agent_source_files f
       on f.agent_id = a.id
       and (${cutoff}::timestamptz is null or f.last_seen_at >= ${cutoff}::timestamptz)
+      and not exists (
+        select 1 from sync_exclusions x
+        where x.restored_at is null
+          and (
+            (x.kind = 'device' and x.target_id = f.agent_id)
+            or (x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown')))
+            or (x.kind = 'session' and x.target_id = ('v3:' || f.id::text))
+          )
+      )
     left join agent_normalized_events e
       on e.source_file_id = f.id
       and e.source_generation = f.current_generation
@@ -172,6 +181,15 @@ export async function listV2Sessions(sql: SqlTag, agentId?: string, options: { c
           and f.source_kind = 'conversation'
           and f.deleted_at is null
           and (${cutoff}::timestamptz is null or f.last_seen_at >= ${cutoff}::timestamptz)
+          and not exists (
+            select 1 from sync_exclusions x
+            where x.restored_at is null
+              and (
+                (x.kind = 'device' and x.target_id = f.agent_id)
+                or (x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown')))
+                or (x.kind = 'session' and x.target_id = ('v3:' || f.id::text))
+              )
+          )
         group by f.id, a.hostname, source_meta.metadata
         order by f.last_seen_at desc, max(e.id) desc nulls last
       `
@@ -258,6 +276,15 @@ export async function listV2Sessions(sql: SqlTag, agentId?: string, options: { c
         where f.source_kind = 'conversation'
           and f.deleted_at is null
           and (${cutoff}::timestamptz is null or f.last_seen_at >= ${cutoff}::timestamptz)
+          and not exists (
+            select 1 from sync_exclusions x
+            where x.restored_at is null
+              and (
+                (x.kind = 'device' and x.target_id = f.agent_id)
+                or (x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown')))
+                or (x.kind = 'session' and x.target_id = ('v3:' || f.id::text))
+              )
+          )
         group by f.id, a.hostname, source_meta.metadata
         order by f.last_seen_at desc, max(e.id) desc nulls last
       `;
@@ -293,7 +320,7 @@ export async function getV2SessionsMeta(
           f.metadata || coalesce(source_meta.metadata, '{}'::jsonb) as metadata,
           f.first_seen_at,
           f.last_seen_at,
-          f.deleted_at,
+          coalesce(f.deleted_at, source_exclusion.created_at) as deleted_at,
           count(e.id) as event_count
         from agent_source_files f
         join agents a on a.id = f.agent_id
@@ -350,14 +377,29 @@ export async function getV2SessionsMeta(
             )
           )) as metadata
         ) source_meta on true
+        left join lateral (
+          select min(x.created_at) as created_at
+          from sync_exclusions x
+          where x.restored_at is null
+            and (
+              (x.kind = 'device' and x.target_id = f.agent_id)
+              or (x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown')))
+              or (x.kind = 'session' and x.target_id = ('v3:' || f.id::text))
+            )
+        ) source_exclusion on true
         left join agent_normalized_events e
           on e.source_file_id = f.id
           and e.source_generation = f.current_generation
           and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
         where f.id = any(${postgresBigintArrayLiteral(ids)}::bigint[])
           and f.source_kind = 'conversation'
-          and (${cutoff}::timestamptz is null or f.last_seen_at >= ${cutoff}::timestamptz or f.deleted_at >= ${cutoff}::timestamptz)
-        group by f.id, a.hostname, source_meta.metadata
+          and (
+            ${cutoff}::timestamptz is null
+            or f.last_seen_at >= ${cutoff}::timestamptz
+            or f.deleted_at >= ${cutoff}::timestamptz
+            or source_exclusion.created_at >= ${cutoff}::timestamptz
+          )
+        group by f.id, a.hostname, source_meta.metadata, source_exclusion.created_at
       `
     : await sql`
         select
@@ -443,6 +485,15 @@ export async function getV2SessionsMeta(
           and f.source_kind = 'conversation'
           and f.deleted_at is null
           and (${cutoff}::timestamptz is null or f.last_seen_at >= ${cutoff}::timestamptz)
+          and not exists (
+            select 1 from sync_exclusions x
+            where x.restored_at is null
+              and (
+                (x.kind = 'device' and x.target_id = f.agent_id)
+                or (x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown')))
+                or (x.kind = 'session' and x.target_id = ('v3:' || f.id::text))
+              )
+          )
         group by f.id, a.hostname, source_meta.metadata
       `;
   const byId = new Map(rows.map((row: any) => [toId(row.id), mapV2SessionRow(row)] as const));
@@ -538,6 +589,15 @@ export async function getV2Session(sql: SqlTag, sessionId: string, options: { cu
       and f.source_kind = 'conversation'
       and f.deleted_at is null
       and (${cutoff}::timestamptz is null or f.last_seen_at >= ${cutoff}::timestamptz)
+      and not exists (
+        select 1 from sync_exclusions x
+        where x.restored_at is null
+          and (
+            (x.kind = 'device' and x.target_id = f.agent_id)
+            or (x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown')))
+            or (x.kind = 'session' and x.target_id = ('v3:' || f.id::text))
+          )
+      )
     group by f.id, a.hostname, source_meta.metadata
   `;
 
@@ -564,6 +624,15 @@ export async function getV2Session(sql: SqlTag, sessionId: string, options: { cu
       and f.source_kind = 'conversation'
       and f.deleted_at is null
       and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
+      and not exists (
+        select 1 from sync_exclusions x
+        where x.restored_at is null
+          and (
+            (x.kind = 'device' and x.target_id = f.agent_id)
+            or (x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown')))
+            or (x.kind = 'session' and x.target_id = ('v3:' || f.id::text))
+          )
+      )
     order by e.source_line_no asc nulls last, e.source_offset asc nulls last, e.id asc
   `;
 
@@ -595,6 +664,15 @@ export async function listV2EventsForSync(sql: SqlTag, cursor: bigint, limit: nu
       and f.deleted_at is null
       and e.sync_revision > ${cursor}
       and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
+      and not exists (
+        select 1 from sync_exclusions x
+        where x.restored_at is null
+          and (
+            (x.kind = 'device' and x.target_id = f.agent_id)
+            or (x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown')))
+            or (x.kind = 'session' and x.target_id = ('v3:' || f.id::text))
+          )
+      )
     order by e.sync_revision asc, e.id asc
     limit ${limit}
   `;
@@ -629,6 +707,15 @@ export async function listV2EventsForBackfill(
       and e.sync_revision < ${before}
       and e.sync_revision <= ${ceiling}
       and (${cutoff}::timestamptz is null or coalesce(e.occurred_at, e.created_at) >= ${cutoff}::timestamptz)
+      and not exists (
+        select 1 from sync_exclusions x
+        where x.restored_at is null
+          and (
+            (x.kind = 'device' and x.target_id = f.agent_id)
+            or (x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown')))
+            or (x.kind = 'session' and x.target_id = ('v3:' || f.id::text))
+          )
+      )
     order by e.sync_revision desc, e.id desc
     limit ${limit}
   `;

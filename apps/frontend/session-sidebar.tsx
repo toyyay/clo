@@ -8,6 +8,7 @@ import {
   type RefObject,
 } from "react";
 import type { SessionInfo } from "../../packages/shared/types";
+import type { SessionCacheStat } from "./db";
 import {
   projectFilterValue,
   projectLabel,
@@ -35,20 +36,24 @@ type TreePrefs = {
 
 type DeviceNode = {
   key: string;
+  agentId: string;
   label: string;
   title: string;
   count: number;
   archivedCount: number;
+  bytes: number;
   updatedAt: string;
   providers: ProviderNode[];
 };
 
 type ProviderNode = {
   key: string;
+  agentId: string;
   value: string;
   label: string;
   count: number;
   archivedCount: number;
+  bytes: number;
   updatedAt: string;
   projects: ProjectNode[];
 };
@@ -59,6 +64,7 @@ type ProjectNode = {
   label: string;
   count: number;
   archivedCount: number;
+  bytes: number;
   updatedAt: string;
   sessions: SessionInfo[];
 };
@@ -70,6 +76,7 @@ export function SessionSidebar({
   now,
   query,
   sessions,
+  sessionStatsById,
   filteredSessionCount,
   groupByProject,
   onClose,
@@ -77,6 +84,9 @@ export function SessionSidebar({
   onResizeKeyDown,
   onQueryChange,
   onSelectSession,
+  onMuteDevice,
+  onMuteProvider,
+  onMuteSession,
 }: {
   sidebarOpen: boolean;
   sidebarRef: RefObject<HTMLElement | null>;
@@ -84,6 +94,7 @@ export function SessionSidebar({
   now: number;
   query: string;
   sessions: SessionInfo[];
+  sessionStatsById: Map<string, SessionCacheStat>;
   filteredSessionCount: number;
   groupByProject: boolean;
   onClose: () => void;
@@ -91,9 +102,12 @@ export function SessionSidebar({
   onResizeKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => void;
   onQueryChange: (value: string) => void;
   onSelectSession: (session: SessionInfo) => void;
+  onMuteDevice: (agentId: string, label: string) => void;
+  onMuteProvider: (agentId: string, provider: string, label: string) => void;
+  onMuteSession: (session: SessionInfo) => void;
 }) {
   const [treePrefs, setTreePrefs] = useState<TreePrefs>(readTreePrefs);
-  const tree = useMemo(() => buildTree(sessions, groupByProject), [groupByProject, sessions]);
+  const tree = useMemo(() => buildTree(sessions, groupByProject, sessionStatsById), [groupByProject, sessionStatsById, sessions]);
 
   useEffect(() => {
     writeTreePrefs(treePrefs);
@@ -156,7 +170,7 @@ export function SessionSidebar({
             const deviceOpen = isOpen(device.key);
             return (
               <div key={device.key} className="tree-node">
-                <FolderRow nodeKey={device.key} level={0} label={device.label} title={device.title} count={device.count} updatedAt={device.updatedAt} now={now} open={deviceOpen} archivedCount={device.archivedCount} onToggle={toggleOpen} />
+                <FolderRow nodeKey={device.key} level={0} label={device.label} title={device.title} count={device.count} bytes={device.bytes} updatedAt={device.updatedAt} now={now} open={deviceOpen} archivedCount={device.archivedCount} onToggle={toggleOpen} onMute={() => onMuteDevice(device.agentId, device.label)} />
                 {deviceOpen &&
                   device.providers.map((provider) => {
                     const providerOpen = isOpen(provider.key);
@@ -164,7 +178,7 @@ export function SessionSidebar({
                     const hiddenProjects = Math.max(0, provider.projects.length - visibleProjects.length);
                     return (
                       <div key={provider.key} className="tree-node">
-                        <FolderRow nodeKey={provider.key} level={1} label={provider.label} count={provider.count} updatedAt={provider.updatedAt} now={now} open={providerOpen} archivedCount={provider.archivedCount} onToggle={toggleOpen} />
+                        <FolderRow nodeKey={provider.key} level={1} label={provider.label} count={provider.count} bytes={provider.bytes} updatedAt={provider.updatedAt} now={now} open={providerOpen} archivedCount={provider.archivedCount} onToggle={toggleOpen} onMute={() => onMuteProvider(provider.agentId, provider.value, `${device.label} / ${provider.label}`)} />
                         {providerOpen && (
                           <>
                             {visibleProjects.map((project) => {
@@ -173,23 +187,30 @@ export function SessionSidebar({
                               const hiddenSessions = Math.max(0, project.sessions.length - visibleSessions.length);
                               return (
                                 <div key={project.key} className="tree-node">
-                                  <FolderRow nodeKey={project.key} level={2} label={project.label} count={project.count} updatedAt={project.updatedAt} now={now} open={projectOpen} archivedCount={project.archivedCount} onToggle={toggleOpen} />
+                                  <FolderRow nodeKey={project.key} level={2} label={project.label} count={project.count} bytes={project.bytes} updatedAt={project.updatedAt} now={now} open={projectOpen} archivedCount={project.archivedCount} onToggle={toggleOpen} />
                                   {projectOpen && (
                                     <>
-                                      {visibleSessions.map((session) => (
-                                        <button
-                                          key={session.id}
-                                          className={`tree-row tree-session level-3 ${active?.id === session.id ? "active" : ""}`}
-                                          onClick={() => onSelectSession(session)}
-                                          title={sessionSourceTitle(session)}
-                                        >
-                                          <span className={`archive-dot ${session.deletedAt ? "archived" : "active"}`} title={session.deletedAt ? "Archived" : "Active"} />
-                                          <span className="tree-label">{sessionDisplayTitle(session)}</span>
-                                          <span className="tree-time" title={sessionActivityTitle(session)}>
-                                            {sessionActivityLabel(session, now)}
-                                          </span>
-                                        </button>
-                                      ))}
+                                      {visibleSessions.map((session) => {
+                                        const bytes = sessionStatsById.get(session.id)?.approxBytes ?? session.sizeBytes ?? 0;
+                                        return (
+                                          <div
+                                            key={session.id}
+                                            className={`tree-row tree-session level-3 ${active?.id === session.id ? "active" : ""}`}
+                                            title={sessionSourceTitle(session)}
+                                          >
+                                            <button className="tree-main" onClick={() => onSelectSession(session)}>
+                                              <span className={`archive-dot ${session.deletedAt ? "archived" : "active"}`} title={session.deletedAt ? "Archived" : "Active"} />
+                                              <span className="tree-label">{sessionDisplayTitle(session)}</span>
+                                              <span className="tree-time" title={sessionActivityTitle(session)}>
+                                                {formatBytes(bytes)} · {sessionActivityLabel(session, now)}
+                                              </span>
+                                            </button>
+                                            <button className="tree-action compact-button" onClick={() => onMuteSession(session)}>
+                                              Mute
+                                            </button>
+                                          </div>
+                                        );
+                                      })}
                                       {hiddenSessions > 0 && (
                                         <button className="tree-show-more level-3" onClick={() => showMoreSessions(project.key)}>
                                           Show more
@@ -225,37 +246,48 @@ function FolderRow({
   label,
   title,
   count,
+  bytes,
   updatedAt,
   now,
   open,
   archivedCount,
   onToggle,
+  onMute,
 }: {
   nodeKey: string;
   level: 0 | 1 | 2;
   label: string;
   title?: string;
   count: number;
+  bytes: number;
   updatedAt: string;
   now: number;
   open: boolean;
   archivedCount: number;
   onToggle: (key: string) => void;
+  onMute?: () => void;
 }) {
   return (
-    <button className={`tree-row tree-folder level-${level} ${open ? "open" : ""}`} onClick={() => onToggle(nodeKey)} title={title}>
-      <span className="tree-chevron">{open ? "v" : ">"}</span>
-      <span className="tree-label">{label}</span>
-      <span className="tree-meta">
-        {archivedCount > 0 && <span className="archive-dot archived" title={`${archivedCount.toLocaleString()} archived`} />}
-        {count.toLocaleString()}
-        {updatedAt ? ` · ${relativeActivityLabel(updatedAt, now)}` : ""}
-      </span>
-    </button>
+    <div className={`tree-row tree-folder level-${level} ${open ? "open" : ""}`} title={title}>
+      <button className="tree-main" onClick={() => onToggle(nodeKey)}>
+        <span className="tree-chevron">{open ? "v" : ">"}</span>
+        <span className="tree-label">{label}</span>
+        <span className="tree-meta">
+          {archivedCount > 0 && <span className="archive-dot archived" title={`${archivedCount.toLocaleString()} archived`} />}
+          {formatBytes(bytes)} · {count.toLocaleString()}
+          {updatedAt ? ` · ${relativeActivityLabel(updatedAt, now)}` : ""}
+        </span>
+      </button>
+      {onMute && (
+        <button className="tree-action compact-button" onClick={onMute}>
+          Mute
+        </button>
+      )}
+    </div>
   );
 }
 
-function buildTree(sessions: SessionInfo[], groupByProject: boolean): DeviceNode[] {
+function buildTree(sessions: SessionInfo[], groupByProject: boolean, sessionStatsById: Map<string, SessionCacheStat>): DeviceNode[] {
   const devices = new Map<string, MutableDeviceNode>();
   for (const session of sessions) {
     const deviceKey = deviceTreeKey(session);
@@ -263,17 +295,17 @@ function buildTree(sessions: SessionInfo[], groupByProject: boolean): DeviceNode
     if (!device) {
       device = {
         key: deviceKey,
+        agentId: session.agentId,
         label: session.hostname || "Unknown device",
         title: session.hostname || "Unknown device",
         count: 0,
         archivedCount: 0,
+        bytes: 0,
         updatedAt: "",
-        agentIds: new Set(),
         providers: new Map(),
       };
       devices.set(deviceKey, device);
     }
-    device.agentIds.add(session.agentId);
 
     const providerValue = providerFilterValue(session);
     const providerKey = `${deviceKey}:provider:${providerValue}`;
@@ -281,10 +313,12 @@ function buildTree(sessions: SessionInfo[], groupByProject: boolean): DeviceNode
     if (!provider) {
       provider = {
         key: providerKey,
+        agentId: session.agentId,
         value: providerValue,
         label: providerLabel(providerValue),
         count: 0,
         archivedCount: 0,
+        bytes: 0,
         updatedAt: "",
         projects: new Map(),
       };
@@ -301,6 +335,7 @@ function buildTree(sessions: SessionInfo[], groupByProject: boolean): DeviceNode
         label: groupByProject ? projectLabel(session) : "Recent",
         count: 0,
         archivedCount: 0,
+        bytes: 0,
         updatedAt: "",
         sessions: [],
       };
@@ -309,9 +344,13 @@ function buildTree(sessions: SessionInfo[], groupByProject: boolean): DeviceNode
 
     const timestamp = sessionActivityTimestamp(session) ?? "";
     const archived = Boolean(session.deletedAt);
+    const bytes = sessionStatsById.get(session.id)?.approxBytes ?? session.sizeBytes ?? 0;
     device.count += 1;
     provider.count += 1;
     project.count += 1;
+    device.bytes += bytes;
+    provider.bytes += bytes;
+    project.bytes += bytes;
     if (archived) {
       device.archivedCount += 1;
       provider.archivedCount += 1;
@@ -326,7 +365,7 @@ function buildTree(sessions: SessionInfo[], groupByProject: boolean): DeviceNode
   return [...devices.values()]
     .map((device) => ({
       ...device,
-      title: [`${device.label}`, ...[...device.agentIds].sort()].join("\n"),
+      title: [`${device.label}`, device.agentId].join("\n"),
       providers: [...device.providers.values()]
         .map((provider) => ({
           ...provider,
@@ -342,12 +381,23 @@ function buildTree(sessions: SessionInfo[], groupByProject: boolean): DeviceNode
     .sort(compareDevices);
 }
 
-type MutableDeviceNode = Omit<DeviceNode, "providers"> & { providers: Map<string, MutableProviderNode>; agentIds: Set<string> };
+type MutableDeviceNode = Omit<DeviceNode, "providers"> & { providers: Map<string, MutableProviderNode> };
 type MutableProviderNode = Omit<ProviderNode, "projects"> & { projects: Map<string, ProjectNode> };
 
 function deviceTreeKey(session: SessionInfo) {
-  const hostname = session.hostname.trim().toLowerCase();
-  return hostname ? `device:host:${hostname}` : `device:agent:${session.agentId}`;
+  return `device:agent:${session.agentId}`;
+}
+
+function formatBytes(value?: number | null) {
+  if (!value) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let size = value;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${size.toFixed(unit ? 1 : 0)} ${units[unit]}`;
 }
 
 function compareDevices(a: DeviceNode, b: DeviceNode) {

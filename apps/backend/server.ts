@@ -17,6 +17,8 @@ import type {
   ImportTokenInfo,
   SessionInfo,
   SessionPayload,
+  SyncExclusionInfo,
+  SyncExclusionKind,
   SyncRequest,
   SyncResponse,
   StreamMessage,
@@ -261,6 +263,32 @@ Bun.serve<{ docIds: Set<string> }>({
       if (!id) return text("missing id", 400);
       const payload = await getReadableSession(id, retentionCutoffFromRequest(req));
       return payload ? json(payload) : text("session not found", 404);
+    },
+    "/api/sync/exclusions": async (req: Request) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      try {
+        if (req.method === "GET") return json({ exclusions: await listSyncExclusions(req) });
+        if (req.method === "POST") return json(await createSyncExclusion(req), 201);
+        return text("method not allowed", 405);
+      } catch (error) {
+        if (error instanceof HttpError) return text(error.message, error.status);
+        throw error;
+      }
+    },
+    "/api/sync/exclusions/:id/restore": async (req: Request & { params?: { id?: string } }) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      if (req.method !== "POST") return text("method not allowed", 405);
+      const fallbackId = new URL(req.url).pathname.match(/^\/api\/sync\/exclusions\/([^/]+)\/restore$/)?.[1];
+      const id = decodeURIComponent(req.params?.id ?? fallbackId ?? "");
+      if (!id) return text("missing id", 400);
+      try {
+        return json(await restoreSyncExclusion(id, req));
+      } catch (error) {
+        if (error instanceof HttpError) return text(error.message, error.status);
+        throw error;
+      }
     },
     "/api/sync": async (req: Request) => {
       const auth = requireWebAuth(req);
@@ -563,6 +591,147 @@ function json(value: unknown, status = 200, headers?: HeadersInit) {
 
 function text(value: string, status = 200) {
   return new Response(value, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
+}
+
+class HttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function listSyncExclusions(req: Request): Promise<SyncExclusionInfo[]> {
+  const url = new URL(req.url);
+  const includeRestored = url.searchParams.get("includeRestored") === "true";
+  const rows = await sql`
+    select id, kind, target_id, label, metadata, created_at, restored_at
+    from sync_exclusions
+    where (${includeRestored}::boolean is true or restored_at is null)
+    order by created_at desc
+  `;
+  return rows.map(mapSyncExclusionRow);
+}
+
+async function createSyncExclusion(req: Request): Promise<SyncExclusionInfo> {
+  const body = (await req.json().catch(() => ({}))) as {
+    kind?: unknown;
+    targetId?: unknown;
+    label?: unknown;
+    metadata?: unknown;
+  };
+  const kind = parseSyncExclusionKind(body.kind);
+  const targetId = typeof body.targetId === "string" ? body.targetId.trim() : "";
+  if (!kind || !targetId) throw new HttpError(400, "invalid sync exclusion");
+  const label = typeof body.label === "string" && body.label.trim() ? body.label.trim().slice(0, 500) : null;
+  const metadata = body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
+    ? body.metadata as Record<string, unknown>
+    : {};
+  const id = syncExclusionId(kind, targetId);
+  const rows = await sql`
+    insert into sync_exclusions (id, kind, target_id, label, metadata, restored_at)
+    values (${id}, ${kind}, ${targetId}, ${label}, ${JSON.stringify(metadata)}::jsonb, null)
+    on conflict (id) do update
+    set label = excluded.label,
+        metadata = excluded.metadata,
+        created_at = now(),
+        restored_at = null
+    returning id, kind, target_id, label, metadata, created_at, restored_at
+  `;
+  await touchSyncExclusionTarget(kind, targetId);
+  return mapSyncExclusionRow(rows[0]);
+}
+
+async function restoreSyncExclusion(id: string, _req: Request): Promise<{ ok: true; exclusion: SyncExclusionInfo }> {
+  const rows = await sql`
+    update sync_exclusions
+    set restored_at = now()
+    where id = ${id}
+    returning id, kind, target_id, label, metadata, created_at, restored_at
+  `;
+  if (!rows[0]) throw new HttpError(404, "sync exclusion not found");
+  const exclusion = mapSyncExclusionRow(rows[0]);
+  await touchSyncExclusionTarget(exclusion.kind, exclusion.targetId);
+  return { ok: true, exclusion };
+}
+
+async function touchSyncExclusionTarget(kind: SyncExclusionKind, targetId: string) {
+  if (kind === "device") {
+    await Promise.all([
+      sql`update agents set metadata_revision = nextval('sync_metadata_revision_seq') where id = ${targetId}`,
+      sql`update chat_sessions set metadata_revision = nextval('sync_metadata_revision_seq') where agent_id = ${targetId}`,
+      sql`update agent_source_files set metadata_revision = nextval('sync_metadata_revision_seq') where agent_id = ${targetId}`,
+    ]);
+    return;
+  }
+  if (kind === "provider") {
+    const parsed = parseProviderTarget(targetId);
+    if (!parsed) return;
+    await Promise.all([
+      parsed.provider === "claude"
+        ? sql`update chat_sessions set metadata_revision = nextval('sync_metadata_revision_seq') where agent_id = ${parsed.agentId}`
+        : Promise.resolve([]),
+      sql`
+        update agent_source_files
+        set metadata_revision = nextval('sync_metadata_revision_seq')
+        where agent_id = ${parsed.agentId}
+          and coalesce(provider, 'unknown') = ${parsed.provider}
+      `,
+    ]);
+    return;
+  }
+  const v2SourceFileId = parseV2SessionId(targetId);
+  if (v2SourceFileId) {
+    await sql`
+      update agent_source_files
+      set metadata_revision = nextval('sync_metadata_revision_seq')
+      where id = ${v2SourceFileId}
+    `;
+  } else if (/^\d+$/.test(targetId)) {
+    await sql`
+      update chat_sessions
+      set metadata_revision = nextval('sync_metadata_revision_seq')
+      where id = ${targetId}
+    `;
+  }
+}
+
+function mapSyncExclusionRow(row: any): SyncExclusionInfo {
+  return {
+    id: row.id,
+    kind: row.kind,
+    targetId: row.target_id,
+    label: row.label ?? null,
+    metadata: normalizeRecord(row.metadata),
+    createdAt: dateString(row.created_at) ?? new Date().toISOString(),
+    restoredAt: dateString(row.restored_at),
+  };
+}
+
+function parseSyncExclusionKind(value: unknown): SyncExclusionKind | null {
+  return value === "device" || value === "provider" || value === "session" ? value : null;
+}
+
+function syncExclusionId(kind: SyncExclusionKind, targetId: string) {
+  return `${kind}:${targetId}`;
+}
+
+function parseProviderTarget(targetId: string) {
+  const split = targetId.lastIndexOf(":");
+  if (split <= 0 || split === targetId.length - 1) return null;
+  return { agentId: targetId.slice(0, split), provider: targetId.slice(split + 1) };
+}
+
+function normalizeRecord(value: unknown): Record<string, unknown> {
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+    } catch {
+      return {};
+    }
+  }
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
 async function listAgentRuntimes(req: Request) {
@@ -2016,12 +2185,22 @@ async function listHosts(cutoffIso?: string | null): Promise<HostInfo[]> {
     left join chat_sessions s
       on s.agent_id = a.id
       and (${cutoff}::timestamptz is null or s.last_seen_at >= ${cutoff}::timestamptz)
-    left join session_events e
-      on e.session_db_id = s.id
-      and (${cutoff}::timestamptz is null or e.occurred_at >= ${cutoff}::timestamptz)
-    group by a.id
-    order by a.last_seen_at desc
-  `;
+      and not exists (
+        select 1 from sync_exclusions x
+        where x.restored_at is null
+          and (
+            (x.kind = 'device' and x.target_id = s.agent_id)
+            or (x.kind = 'provider' and x.target_id = concat(s.agent_id, ':claude'))
+            or (x.kind = 'session' and x.target_id = s.id::text)
+          )
+      )
+	    left join session_events e
+	      on e.session_db_id = s.id
+	      and (${cutoff}::timestamptz is null or e.occurred_at >= ${cutoff}::timestamptz)
+	    group by a.id
+	    having count(distinct s.id) > 0
+	    order by a.last_seen_at desc
+	  `;
 
   return rows.map((row: any) => ({
     agentId: row.id,
@@ -2076,6 +2255,15 @@ async function listSessions(agentId?: string, cutoffIso?: string | null): Promis
         where s.agent_id = ${agentId}
           and s.deleted_at is null
           and (${cutoff}::timestamptz is null or s.last_seen_at >= ${cutoff}::timestamptz)
+          and not exists (
+            select 1 from sync_exclusions x
+            where x.restored_at is null
+              and (
+                (x.kind = 'device' and x.target_id = s.agent_id)
+                or (x.kind = 'provider' and x.target_id = concat(s.agent_id, ':claude'))
+                or (x.kind = 'session' and x.target_id = s.id::text)
+              )
+          )
         group by s.id, a.hostname, p.project_key, p.display_name
         order by s.last_seen_at desc
       `
@@ -2114,6 +2302,15 @@ async function listSessions(agentId?: string, cutoffIso?: string | null): Promis
           and (${cutoff}::timestamptz is null or e.occurred_at >= ${cutoff}::timestamptz)
         where s.deleted_at is null
           and (${cutoff}::timestamptz is null or s.last_seen_at >= ${cutoff}::timestamptz)
+          and not exists (
+            select 1 from sync_exclusions x
+            where x.restored_at is null
+              and (
+                (x.kind = 'device' and x.target_id = s.agent_id)
+                or (x.kind = 'provider' and x.target_id = concat(s.agent_id, ':claude'))
+                or (x.kind = 'session' and x.target_id = s.id::text)
+              )
+          )
         group by s.id, a.hostname, p.project_key, p.display_name
         order by s.last_seen_at desc
       `;
@@ -2150,17 +2347,32 @@ async function getSessionsMeta(ids: string[], cutoffIso?: string | null): Promis
       s.git_commit,
       s.git_dirty,
       s.git_remote_url,
-      s.deleted_at,
+      coalesce(s.deleted_at, session_exclusion.created_at) as deleted_at,
       count(e.id) as event_count
     from chat_sessions s
     join agents a on a.id = s.agent_id
     join projects p on p.id = s.project_id
+    left join lateral (
+      select min(x.created_at) as created_at
+      from sync_exclusions x
+      where x.restored_at is null
+        and (
+          (x.kind = 'device' and x.target_id = s.agent_id)
+          or (x.kind = 'provider' and x.target_id = concat(s.agent_id, ':claude'))
+          or (x.kind = 'session' and x.target_id = s.id::text)
+        )
+    ) session_exclusion on true
     left join session_events e
       on e.session_db_id = s.id
       and (${cutoff}::timestamptz is null or e.occurred_at >= ${cutoff}::timestamptz)
     where s.id = any(${postgresBigintArrayLiteral(uniqueIds)}::bigint[])
-      and (${cutoff}::timestamptz is null or s.last_seen_at >= ${cutoff}::timestamptz or s.deleted_at >= ${cutoff}::timestamptz)
-    group by s.id, a.hostname, p.project_key, p.display_name
+      and (
+        ${cutoff}::timestamptz is null
+        or s.last_seen_at >= ${cutoff}::timestamptz
+        or s.deleted_at >= ${cutoff}::timestamptz
+        or session_exclusion.created_at >= ${cutoff}::timestamptz
+      )
+    group by s.id, a.hostname, p.project_key, p.display_name, session_exclusion.created_at
   `;
   const byId = new Map(rows.map((row: any) => [toId(row.id), mapSession(row)] as const));
   return uniqueIds.map((id) => byId.get(id)).filter((session): session is SessionInfo => Boolean(session));
@@ -2207,17 +2419,44 @@ async function getSession(id: string, cutoffIso?: string | null): Promise<Sessio
       and (${cutoff}::timestamptz is null or e.occurred_at >= ${cutoff}::timestamptz)
     where s.id = ${id}
       and (${cutoff}::timestamptz is null or s.last_seen_at >= ${cutoff}::timestamptz)
+      and not exists (
+        select 1 from sync_exclusions x
+        where x.restored_at is null
+          and (
+            (x.kind = 'device' and x.target_id = s.agent_id)
+            or (x.kind = 'provider' and x.target_id = concat(s.agent_id, ':claude'))
+            or (x.kind = 'session' and x.target_id = s.id::text)
+          )
+      )
     group by s.id, a.hostname, p.project_key, p.display_name
   `;
 
   if (!sessionRows.length) return null;
 
   const eventRows = await sql`
-    select id, source_line_no, source_offset, event_type, role, occurred_at, ingested_at, raw
+    select
+      session_events.id,
+      session_events.source_line_no,
+      session_events.source_offset,
+      session_events.event_type,
+      session_events.role,
+      session_events.occurred_at,
+      session_events.ingested_at,
+      session_events.raw
     from session_events
-    where session_db_id = ${id}
-      and (${cutoff}::timestamptz is null or occurred_at >= ${cutoff}::timestamptz)
-    order by source_line_no asc
+    join chat_sessions s on s.id = session_events.session_db_id
+    where session_events.session_db_id = ${id}
+      and (${cutoff}::timestamptz is null or session_events.occurred_at >= ${cutoff}::timestamptz)
+      and not exists (
+        select 1 from sync_exclusions x
+        where x.restored_at is null
+          and (
+            (x.kind = 'device' and x.target_id = s.agent_id)
+            or (x.kind = 'provider' and x.target_id = concat(s.agent_id, ':claude'))
+            or (x.kind = 'session' and x.target_id = s.id::text)
+          )
+      )
+    order by session_events.source_line_no asc
   `;
 
   return {
@@ -2362,11 +2601,21 @@ function syncEventMode(body: SyncRequest): EventSyncMode {
 async function listLegacyEventsForSync(cursor: bigint, limit: number, cutoffIso?: string | null) {
   const cutoff = cutoffIso ?? null;
   return await sql`
-    select id, session_db_id, source_line_no, source_offset, event_type, role, occurred_at, ingested_at, raw
-    from session_events
-    where id > ${cursor}
-      and (${cutoff}::timestamptz is null or occurred_at >= ${cutoff}::timestamptz)
-    order by id asc
+    select e.id, e.session_db_id, e.source_line_no, e.source_offset, e.event_type, e.role, e.occurred_at, e.ingested_at, e.raw
+    from session_events e
+    join chat_sessions s on s.id = e.session_db_id
+    where e.id > ${cursor}
+      and (${cutoff}::timestamptz is null or e.occurred_at >= ${cutoff}::timestamptz)
+      and not exists (
+        select 1 from sync_exclusions x
+        where x.restored_at is null
+          and (
+            (x.kind = 'device' and x.target_id = s.agent_id)
+            or (x.kind = 'provider' and x.target_id = concat(s.agent_id, ':claude'))
+            or (x.kind = 'session' and x.target_id = s.id::text)
+          )
+      )
+    order by e.id asc
     limit ${limit}
   `;
 }
@@ -2374,12 +2623,22 @@ async function listLegacyEventsForSync(cursor: bigint, limit: number, cutoffIso?
 async function listLegacyEventsForBackfill(before: bigint, ceiling: bigint, limit: number, cutoffIso?: string | null) {
   const cutoff = cutoffIso ?? null;
   return await sql`
-    select id, session_db_id, source_line_no, source_offset, event_type, role, occurred_at, ingested_at, raw
-    from session_events
-    where id < ${before}
-      and id <= ${ceiling}
-      and (${cutoff}::timestamptz is null or occurred_at >= ${cutoff}::timestamptz)
-    order by id desc
+    select e.id, e.session_db_id, e.source_line_no, e.source_offset, e.event_type, e.role, e.occurred_at, e.ingested_at, e.raw
+    from session_events e
+    join chat_sessions s on s.id = e.session_db_id
+    where e.id < ${before}
+      and e.id <= ${ceiling}
+      and (${cutoff}::timestamptz is null or e.occurred_at >= ${cutoff}::timestamptz)
+      and not exists (
+        select 1 from sync_exclusions x
+        where x.restored_at is null
+          and (
+            (x.kind = 'device' and x.target_id = s.agent_id)
+            or (x.kind = 'provider' and x.target_id = concat(s.agent_id, ':claude'))
+            or (x.kind = 'session' and x.target_id = s.id::text)
+          )
+      )
+    order by e.id desc
     limit ${limit}
   `;
 }
@@ -2400,17 +2659,39 @@ function mapLegacySyncEvent(row: any) {
 
 async function currentEventHighWater(): Promise<EventCursor> {
   const legacyRowsPromise = legacyReadEnabled
-    ? sql`select coalesce(max(id), 0)::text as id from session_events`
+    ? sql`
+        select coalesce(max(e.id), 0)::text as id
+        from session_events e
+        join chat_sessions s on s.id = e.session_db_id
+        where not exists (
+          select 1 from sync_exclusions x
+          where x.restored_at is null
+            and (
+              (x.kind = 'device' and x.target_id = s.agent_id)
+              or (x.kind = 'provider' and x.target_id = concat(s.agent_id, ':claude'))
+              or (x.kind = 'session' and x.target_id = s.id::text)
+            )
+        )
+      `
     : Promise.resolve([{ id: "0" }]);
   const [legacyRows, v2Rows] = await Promise.all([
     legacyRowsPromise,
-	    sql`
-	      select coalesce(max(e.sync_revision), 0)::text as id
-	      from agent_normalized_events e
-	      join agent_source_files f on f.id = e.source_file_id
-	      where e.source_generation = f.current_generation
+    sql`
+      select coalesce(max(e.sync_revision), 0)::text as id
+      from agent_normalized_events e
+      join agent_source_files f on f.id = e.source_file_id
+      where e.source_generation = f.current_generation
         and f.source_kind = 'conversation'
         and f.deleted_at is null
+        and not exists (
+          select 1 from sync_exclusions x
+          where x.restored_at is null
+            and (
+              (x.kind = 'device' and x.target_id = f.agent_id)
+              or (x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown')))
+              or (x.kind = 'session' and x.target_id = ('v3:' || f.id::text))
+            )
+        )
     `,
   ]);
   return {

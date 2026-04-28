@@ -121,6 +121,22 @@ export type SessionPayload = {
   events: SessionEvent[];
 };
 
+export type SyncExclusionKind = "device" | "provider" | "session";
+
+export type SyncExclusionInfo = {
+  id: string;
+  kind: SyncExclusionKind;
+  targetId: string;
+  label?: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  restoredAt?: string | null;
+};
+
+export type SyncExclusionsResponse = {
+  exclusions: SyncExclusionInfo[];
+};
+
 export type SyncRequest = {
   cursor?: string;
   backfillCursor?: string;

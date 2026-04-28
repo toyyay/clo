@@ -1,5 +1,5 @@
 import type { ReactElement } from "react";
-import type { AppSettingsInfo } from "../../packages/shared/types";
+import type { AppSettingsInfo, SyncExclusionInfo, SyncExclusionKind } from "../../packages/shared/types";
 import type { CacheStats } from "./db";
 
 function formatBytes(value?: number | null) {
@@ -31,6 +31,27 @@ function formatCacheRecords(cacheStats: CacheStats | null) {
   if (!cacheStats) return "loading";
   const total = Object.values(cacheStats.indexedDb).reduce((sum, value) => sum + value, 0);
   return `${total.toLocaleString()} records, ${cacheStats.indexedDb.events.toLocaleString()} events`;
+}
+
+function formatMutedKind(kind: SyncExclusionKind) {
+  if (kind === "device") return "Device";
+  if (kind === "provider") return "Provider";
+  return "Chat";
+}
+
+function formatMutedMeta(exclusion: SyncExclusionInfo) {
+  const sessionCount = numberMeta(exclusion.metadata.sessionCount);
+  const eventCount = numberMeta(exclusion.metadata.eventCount);
+  const bytes = numberMeta(exclusion.metadata.approxBytes);
+  const parts = [];
+  if (sessionCount) parts.push(`${sessionCount.toLocaleString()} chats`);
+  if (eventCount) parts.push(`${eventCount.toLocaleString()} events`);
+  if (bytes) parts.push(formatBytes(bytes));
+  return parts.length ? parts.join(" / ") : exclusion.targetId;
+}
+
+function numberMeta(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 function openRouterStatusLabel(settings: AppSettingsInfo | null) {
@@ -68,6 +89,8 @@ function ModalFrame({
 export function SettingsModal({
   settings,
   cacheStats,
+  mutedSources,
+  mutedSummary,
   loading,
   message,
   onClose,
@@ -78,6 +101,7 @@ export function SettingsModal({
   onResetIndexedDb,
   onClearCaches,
   onUnregisterServiceWorkers,
+  onRestoreMutedSource,
   groupByProject,
   sidebarWidth,
   retentionDays,
@@ -87,6 +111,8 @@ export function SettingsModal({
 }: {
   settings: AppSettingsInfo | null;
   cacheStats: CacheStats | null;
+  mutedSources: SyncExclusionInfo[];
+  mutedSummary: Record<SyncExclusionKind, number> & { approxBytes: number; eventCount: number; sessionCount: number };
   loading: boolean;
   message: string;
   onClose: () => void;
@@ -97,6 +123,7 @@ export function SettingsModal({
   onResetIndexedDb: () => void;
   onClearCaches: () => void;
   onUnregisterServiceWorkers: () => void;
+  onRestoreMutedSource: (id: string) => void;
   groupByProject: boolean;
   sidebarWidth: number;
   retentionDays: number;
@@ -216,6 +243,39 @@ export function SettingsModal({
               Reset sidebar width
             </button>
           </div>
+        </div>
+
+        <div className="settings-section">
+          <div className="section-title">Muted</div>
+          <div className="kv-grid">
+            <span>Sources</span>
+            <b>
+              {mutedSummary.device.toLocaleString()} devices / {mutedSummary.provider.toLocaleString()} providers / {mutedSummary.session.toLocaleString()} chats
+            </b>
+            <span>Cached weight</span>
+            <b>
+              {mutedSummary.sessionCount.toLocaleString()} chats / {mutedSummary.eventCount.toLocaleString()} events / {formatBytes(mutedSummary.approxBytes)}
+            </b>
+          </div>
+          {mutedSources.length ? (
+            <div className="url-list muted-list">
+              {mutedSources.map((source) => (
+                <div className="url-row muted-row" key={source.id}>
+                  <div className="url-meta">
+                    <span>{source.label ?? source.targetId}</span>
+                    <span>
+                      {formatMutedKind(source.kind)} / {formatMutedMeta(source)}
+                    </span>
+                  </div>
+                  <button className="icon-button compact-button" onClick={() => onRestoreMutedSource(source.id)} disabled={loading}>
+                    Restore
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="muted-text">Nothing muted.</div>
+          )}
         </div>
 
         <div className="settings-section">

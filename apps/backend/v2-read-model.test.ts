@@ -255,6 +255,8 @@ describe("v2 read model helpers", () => {
     expect(text).toContain("and e.sync_revision > ?");
     expect(text).toContain("order by e.sync_revision asc, e.id asc");
     expect(text).toContain("and f.source_kind = 'conversation' and f.deleted_at is null");
+    expect(text).toContain("from sync_exclusions x");
+    expect(text).toContain("x.kind = 'provider' and x.target_id = concat(f.agent_id, ':', coalesce(f.provider, 'unknown'))");
     expect(calls[0].values).toEqual([10n, null, null, 25]);
   });
 
@@ -290,6 +292,7 @@ describe("v2 read model helpers", () => {
     expect(calls).toHaveLength(1);
     const text = normalizeSql(calls[0].text);
     expect(text).toContain("where f.id = any(?::bigint[]) and f.source_kind = 'conversation'");
+    expect(text).toContain("coalesce(f.deleted_at, source_exclusion.created_at) as deleted_at");
     expect(text).not.toContain("and f.deleted_at is null");
   });
 

@@ -15,23 +15,31 @@ import type {
   HostInfo,
   SessionEvent,
   SessionInfo,
+  SyncExclusionInfo,
+  SyncExclusionKind,
 } from "../../packages/shared/types";
 import {
   clearBrowserCaches,
   cacheSessionPayload,
   cacheShell,
+  cacheMutedSources,
   deleteYjsOutboxUpdates,
+  deleteMeta,
   enqueueYjsOutboxUpdate,
   getMeta,
   loadCacheStats,
   loadHosts,
+  loadMutedSources,
   loadSessions,
+  loadSessionStats,
   loadYjsOutboxUpdates,
   pruneCacheBefore,
+  pruneMutedSources,
   resetIndexedDbCache,
   setMeta,
   unregisterServiceWorkers,
   type CacheStats,
+  type SessionCacheStat,
 } from "./db";
 import { AudioModal, FALLBACK_REASONING_EFFORTS, FALLBACK_TRANSCRIPTION_MODELS } from "./audio-panel";
 import { fetchJson, sameEntityList, shallowEqualObject, withTimeout } from "./app-utils";
@@ -41,7 +49,7 @@ import { flatten, groupItems } from "./chat-transcript";
 import { flushClientLogs, installClientLogHandlers, logClientEvent } from "./client-logs";
 import { MainChat } from "./main-chat";
 import { parseRoute, useRoute, type RoutePanel } from "./router";
-import { sessionDisplayTitle } from "./session-utils";
+import { providerFilterValue, sessionDisplayTitle } from "./session-utils";
 import { SessionSidebar } from "./session-sidebar";
 import { SettingsModal } from "./settings-modal";
 import { openIngestStream } from "./stream";
@@ -65,7 +73,15 @@ import {
   writeRetentionDays,
   type InterfacePrefs,
 } from "./storage-prefs";
-import { fetchSessionEvents, fetchSessionMetadata, pullUpdates, SyncAuthError } from "./sync";
+import {
+  createSyncExclusion,
+  fetchSessionEvents,
+  fetchSessionMetadata,
+  fetchSyncExclusions,
+  pullUpdates,
+  restoreSyncExclusion,
+  SyncAuthError,
+} from "./sync";
 import { useAudioImports } from "./use-audio-imports";
 import { useSessionEventsCache } from "./use-session-events-cache";
 import { useStartupCache } from "./use-startup-cache";
@@ -121,6 +137,8 @@ export function App() {
   const [draft, setDraft] = useState("");
   const [settings, setSettings] = useState<AppSettingsInfo | null>(null);
   const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
+  const [mutedSources, setMutedSources] = useState<SyncExclusionInfo[]>([]);
+  const [sessionStats, setSessionStats] = useState<SessionCacheStat[]>([]);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState("");
   const syncing = useRef(false);
@@ -149,6 +167,10 @@ export function App() {
   const audio = useAudioImports({ isAuthenticated, audioOpen });
   const activeId = active?.id ?? null;
   const events = eventState.sessionId === activeId ? eventState.events : [];
+  const isMutedSession = useMemo(() => mutedSessionMatcher(mutedSources), [mutedSources]);
+  const visibleSessions = useMemo(() => sessions.filter((session) => !isMutedSession(session)), [isMutedSession, sessions]);
+  const sessionStatsById = useMemo(() => new Map(sessionStats.map((stat) => [stat.sessionId, stat])), [sessionStats]);
+  const mutedSummary = useMemo(() => buildMutedSummary(mutedSources), [mutedSources]);
 
   const openPanel = useCallback(
     (panel: RoutePanel) => {
@@ -512,18 +534,23 @@ export function App() {
     setSettingsBusy(true);
     setSettingsMessage("");
     try {
-      const [nextSettings, nextStats] = await Promise.all([
+      const [nextSettings, nextStats, nextMuted, nextSessionStats] = await Promise.all([
         fetchJson<AppSettingsInfo>("/api/app/settings"),
         loadCacheStats(),
+        isAuthenticated ? fetchSyncExclusions() : loadMutedSources(),
+        loadSessionStats(),
       ]);
       setSettings(nextSettings);
       setCacheStats(nextStats);
+      setMutedSources(nextMuted);
+      setSessionStats(nextSessionStats);
+      void cacheMutedSources(nextMuted).catch(() => {});
     } catch (error) {
       setSettingsMessage(error instanceof Error ? error.message : "Could not load settings");
     } finally {
       setSettingsBusy(false);
     }
-  }, [retentionDays]);
+  }, [isAuthenticated]);
 
   const copyText = useCallback(async (value: string) => {
     try {
@@ -640,11 +667,12 @@ export function App() {
       ).catch(() => {});
     }, 2500);
     try {
-      const [nextHosts, nextSessions] = await Promise.all([loadHosts(), loadSessions()]);
+      const [nextHosts, nextSessions, nextSessionStats] = await Promise.all([loadHosts(), loadSessions(), loadSessionStats()]);
       if (options.apply !== false) {
         setHosts((current) => (sameEntityList(current, nextHosts, (host) => host.agentId) ? current : nextHosts));
         setSessions((current) => (sameEntityList(current, nextSessions, (session) => session.id) ? current : nextSessions));
       }
+      setSessionStats(nextSessionStats);
       const durationMs = Math.round(performance.now() - started);
       if (durationMs > 500 || nextHosts.length || nextSessions.length) {
         void logClientEvent(
@@ -931,6 +959,131 @@ export function App() {
     setSessionEvents,
   ]);
 
+  const resetSyncCursorsForMutedChange = useCallback(async () => {
+    if (backfillTimer.current !== null) {
+      window.clearTimeout(backfillTimer.current);
+      backfillTimer.current = null;
+    }
+    resumeRecentAfterBackfill.current = false;
+    await Promise.all([
+      deleteMeta("metadataCursor"),
+      deleteMeta("backfillCursor"),
+      setMeta("backfillHasMore", false),
+    ]);
+  }, []);
+
+  const refreshMutedSources = useCallback(async () => {
+    const nextMuted = isAuthenticated ? await fetchSyncExclusions() : await loadMutedSources();
+    setMutedSources(nextMuted);
+    await cacheMutedSources(nextMuted);
+    await pruneMutedSources(nextMuted);
+    await refreshCache();
+    setCacheStats(await loadCacheStats());
+    setSessionStats(await loadSessionStats());
+    return nextMuted;
+  }, [isAuthenticated, refreshCache]);
+
+  const muteSource = useCallback(
+    async (input: { kind: SyncExclusionKind; targetId: string; label: string; metadata?: Record<string, unknown> }) => {
+      if (!isAuthenticated) {
+        setSettingsMessage("Connect to the server before muting sources");
+        return;
+      }
+      setSettingsBusy(true);
+      setSettingsMessage("");
+      try {
+        await createSyncExclusion(input);
+        await resetSyncCursorsForMutedChange();
+        const nextMuted = await refreshMutedSources();
+        const current = activeRef.current;
+        if (current && mutedSessionMatcher(nextMuted)(current)) {
+          setActiveSession(null);
+          setSessionEvents(null, []);
+          setDraft("");
+          if (parseRoute().chatId === current.id) navigateRoute({}, { replace: true });
+        }
+        setSettingsMessage(`Muted ${input.label}`);
+        void syncNow({ silent: true, metadataOnly: true });
+      } catch (error) {
+        setSettingsMessage(error instanceof Error ? error.message : "Could not mute source");
+      } finally {
+        setSettingsBusy(false);
+      }
+    },
+    [isAuthenticated, navigateRoute, refreshMutedSources, resetSyncCursorsForMutedChange, setActiveSession, setSessionEvents, syncNow],
+  );
+
+  const restoreMuted = useCallback(
+    async (id: string) => {
+      if (!isAuthenticated) {
+        setSettingsMessage("Connect to the server before restoring sources");
+        return;
+      }
+      setSettingsBusy(true);
+      setSettingsMessage("");
+      try {
+        const restored = await restoreSyncExclusion(id);
+        await resetSyncCursorsForMutedChange();
+        await refreshMutedSources();
+        setSettingsMessage(`Restored ${restored.label ?? restored.targetId}`);
+        void syncNow({ silent: true, metadataOnly: true });
+        window.setTimeout(() => void syncNow({ silent: true, metadataOnly: false, eventMode: "recent" }), 0);
+      } catch (error) {
+        setSettingsMessage(error instanceof Error ? error.message : "Could not restore source");
+      } finally {
+        setSettingsBusy(false);
+      }
+    },
+    [isAuthenticated, refreshMutedSources, resetSyncCursorsForMutedChange, syncNow],
+  );
+
+  const muteDevice = useCallback(
+    (agentId: string, label: string) => {
+      const affected = sessions.filter((session) => session.agentId === agentId);
+      void muteSource({
+        kind: "device",
+        targetId: agentId,
+        label,
+        metadata: mutedMetadataForSessions(affected, sessionStatsById),
+      });
+    },
+    [muteSource, sessions, sessionStatsById],
+  );
+
+  const muteProvider = useCallback(
+    (agentId: string, provider: string, label: string) => {
+      const affected = sessions.filter((session) => session.agentId === agentId && providerFilterValue(session) === provider);
+      void muteSource({
+        kind: "provider",
+        targetId: `${agentId}:${provider}`,
+        label,
+        metadata: { provider, ...mutedMetadataForSessions(affected, sessionStatsById) },
+      });
+    },
+    [muteSource, sessions, sessionStatsById],
+  );
+
+  const muteSession = useCallback(
+    (session: SessionInfo) => {
+      const stat = sessionStatsById.get(session.id);
+      void muteSource({
+        kind: "session",
+        targetId: session.id,
+        label: sessionDisplayTitle(session),
+        metadata: {
+          agentId: session.agentId,
+          hostname: session.hostname,
+          provider: providerFilterValue(session),
+          projectKey: session.projectKey,
+          approxBytes: stat?.approxBytes ?? session.sizeBytes ?? 0,
+          eventCount: stat?.eventCount ?? session.eventCount,
+          sessionCount: 1,
+        },
+      });
+    },
+    [muteSource, sessionStatsById],
+  );
+
   useEffect(() => {
     installClientLogHandlers();
     void logClientEvent(
@@ -1034,6 +1187,25 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    let disposed = false;
+    Promise.all([
+      isAuthenticated ? fetchSyncExclusions() : loadMutedSources(),
+      loadSessionStats(),
+    ])
+      .then(([nextMuted, nextStats]) => {
+        if (disposed) return;
+        setMutedSources(nextMuted);
+        setSessionStats(nextStats);
+        void cacheMutedSources(nextMuted).catch(() => {});
+        void pruneMutedSources(nextMuted).catch(() => {});
+      })
+      .catch((error) => console.error(error));
+    return () => {
+      disposed = true;
+    };
+  }, [isAuthenticated]);
+
+  useEffect(() => {
     activeRef.current = active;
   }, [active]);
 
@@ -1042,8 +1214,8 @@ export function App() {
   }, [eventState]);
 
   useEffect(() => {
-    sessionsRef.current = sessions;
-  }, [sessions]);
+    sessionsRef.current = visibleSessions;
+  }, [visibleSessions]);
 
   const applyRemoteYjsUpdate = useCallback(async (docId: string, update: Uint8Array) => {
     const doc = yDocs.current.get(docId);
@@ -1147,26 +1319,26 @@ export function App() {
   useEffect(() => {
     if (!canShowLocalApp) return;
 
-    if (!sessions.length) {
+    if (!visibleSessions.length) {
       setActiveSession(null);
       return;
     }
 
     if (route.chatId) {
-      const routedSession = sessions.find((session) => session.id === route.chatId) ?? null;
+      const routedSession = visibleSessions.find((session) => session.id === route.chatId) ?? null;
       if (routedSession) {
         setActiveSession(routedSession);
         return;
       }
 
-      const fallback = sessions[0];
+      const fallback = visibleSessions[0];
       setActiveSession(fallback);
       navigateRoute({ chatId: fallback.id, panel: route.panel }, { replace: true });
       return;
     }
 
-    setActiveSession(sessions[0]);
-  }, [canShowLocalApp, navigateRoute, route.chatId, route.panel, sessions, setActiveSession]);
+    setActiveSession(visibleSessions[0]);
+  }, [canShowLocalApp, navigateRoute, route.chatId, route.panel, setActiveSession, visibleSessions]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -1494,7 +1666,7 @@ export function App() {
 
   const filteredSessions = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return sessions.filter((session) => {
+    return visibleSessions.filter((session) => {
       if (!q) return true;
       return [
         session.hostname,
@@ -1515,10 +1687,10 @@ export function App() {
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(q));
     });
-  }, [query, sessions]);
+  }, [query, visibleSessions]);
 
   const items = useMemo(() => groupItems(flatten(events)), [events]);
-  const yDocIdsToKeepWarm = useMemo(() => sessions.slice(0, 20).map((session) => docIdForSession(session.id)), [sessions]);
+  const yDocIdsToKeepWarm = useMemo(() => visibleSessions.slice(0, 20).map((session) => docIdForSession(session.id)), [visibleSessions]);
 
   const selectSession = useCallback((session: SessionInfo) => {
     setActiveSession(session);
@@ -1528,9 +1700,9 @@ export function App() {
 
   useEffect(() => {
     if (!isAuthenticated) return;
-    if (!sessions.length) return;
+    if (!visibleSessions.length) return;
     void reconcileYjsDocs("warm_sessions_changed");
-  }, [isAuthenticated, reconcileYjsDocs, sessions]);
+  }, [isAuthenticated, reconcileYjsDocs, visibleSessions]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -1596,6 +1768,7 @@ export function App() {
           now={now}
           query={query}
           sessions={filteredSessions}
+          sessionStatsById={sessionStatsById}
           filteredSessionCount={filteredSessions.length}
           groupByProject={groupByProject}
           onClose={() => setSidebarOpen(false)}
@@ -1603,6 +1776,9 @@ export function App() {
           onResizeKeyDown={handleSidebarResizeKey}
           onQueryChange={setQuery}
           onSelectSession={selectSession}
+          onMuteDevice={muteDevice}
+          onMuteProvider={muteProvider}
+          onMuteSession={muteSession}
         />
 
         <MainChat
@@ -1620,6 +1796,8 @@ export function App() {
         <SettingsModal
           settings={settings}
           cacheStats={cacheStats}
+          mutedSources={mutedSources}
+          mutedSummary={mutedSummary}
           loading={settingsBusy}
           message={settingsMessage}
           onClose={closePanel}
@@ -1630,6 +1808,7 @@ export function App() {
           onResetIndexedDb={resetIndexedDb}
           onClearCaches={clearCaches}
           onUnregisterServiceWorkers={resetServiceWorkers}
+          onRestoreMutedSource={restoreMuted}
           groupByProject={groupByProject}
           sidebarWidth={sidebarWidth}
           retentionDays={retentionDays}
@@ -1669,6 +1848,59 @@ function BuildBadge({ sha }: { sha: string | null }) {
   const shortSha = formatBuildSha(sha);
   if (!shortSha) return null;
   return <div className="build-badge" aria-hidden="true">{`build ${shortSha}`}</div>;
+}
+
+function mutedSessionMatcher(exclusions: SyncExclusionInfo[]) {
+  const deviceIds = new Set(exclusions.filter((exclusion) => exclusion.kind === "device").map((exclusion) => exclusion.targetId));
+  const providerKeys = new Set(exclusions.filter((exclusion) => exclusion.kind === "provider").map((exclusion) => exclusion.targetId));
+  const sessionIds = new Set(exclusions.filter((exclusion) => exclusion.kind === "session").map((exclusion) => exclusion.targetId));
+  return (session: SessionInfo) =>
+    deviceIds.has(session.agentId) ||
+    providerKeys.has(`${session.agentId}:${providerFilterValue(session)}`) ||
+    sessionIds.has(session.id);
+}
+
+function buildMutedSummary(exclusions: SyncExclusionInfo[]) {
+  const summary: Record<SyncExclusionKind, number> & { approxBytes: number; eventCount: number; sessionCount: number } = {
+    device: 0,
+    provider: 0,
+    session: 0,
+    approxBytes: 0,
+    eventCount: 0,
+    sessionCount: 0,
+  };
+  for (const exclusion of exclusions) {
+    summary[exclusion.kind] += 1;
+    summary.approxBytes += numberMetadata(exclusion.metadata.approxBytes);
+    summary.eventCount += numberMetadata(exclusion.metadata.eventCount);
+    summary.sessionCount += numberMetadata(exclusion.metadata.sessionCount);
+  }
+  return summary;
+}
+
+function mutedMetadataForSessions(sessions: SessionInfo[], statsById: Map<string, SessionCacheStat>): Record<string, unknown> {
+  const providers = new Set<string>();
+  const projects = new Set<string>();
+  let approxBytes = 0;
+  let eventCount = 0;
+  for (const session of sessions) {
+    const stat = statsById.get(session.id);
+    providers.add(providerFilterValue(session));
+    if (session.projectKey) projects.add(session.projectKey);
+    approxBytes += stat?.approxBytes ?? session.sizeBytes ?? 0;
+    eventCount += stat?.eventCount ?? session.eventCount;
+  }
+  return {
+    sessionCount: sessions.length,
+    eventCount,
+    approxBytes,
+    providers: [...providers].sort(),
+    projects: [...projects].sort().slice(0, 20),
+  };
+}
+
+function numberMetadata(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 function formatBuildSha(sha: string | null) {

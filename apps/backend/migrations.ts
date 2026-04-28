@@ -620,6 +620,28 @@ create index if not exists idx_agent_runtimes_status
   on agent_runtimes (status, last_seen_at desc);
 `.trim(),
   },
+  {
+    id: "0011",
+    name: "sync_exclusions",
+    sql: `
+create table if not exists sync_exclusions (
+  id text primary key,
+  kind text not null check (kind in ('device', 'provider', 'session')),
+  target_id text not null,
+  label text,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  restored_at timestamptz
+);
+
+create index if not exists idx_sync_exclusions_active_kind
+  on sync_exclusions (kind, target_id)
+  where restored_at is null;
+
+create index if not exists idx_sync_exclusions_created
+  on sync_exclusions (created_at desc);
+`.trim(),
+  },
 ];
 
 export function migrationsEnabled(env = process.env) {

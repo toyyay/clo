@@ -1,4 +1,13 @@
-import type { HostInfo, SessionEvent, SessionInfo, SessionPayload, SyncResponse } from "../../packages/shared/types";
+import type {
+  HostInfo,
+  SessionEvent,
+  SessionInfo,
+  SessionPayload,
+  SyncExclusionInfo,
+  SyncExclusionKind,
+  SyncExclusionsResponse,
+  SyncResponse,
+} from "../../packages/shared/types";
 import { applySync, deleteMeta, getMeta, setMeta } from "./db";
 import { clampRetentionDays } from "./storage-prefs";
 
@@ -7,6 +16,8 @@ export const READ_API_ENDPOINTS = {
   v2Hosts: "/api/v2/hosts",
   v2Sessions: "/api/v2/sessions",
   v2SessionEvents: (sessionId: string) => `/api/v2/sessions/${encodeURIComponent(sessionId)}/events`,
+  syncExclusions: "/api/sync/exclusions",
+  restoreSyncExclusion: (id: string) => `/api/sync/exclusions/${encodeURIComponent(id)}/restore`,
   legacyHosts: "/api/hosts",
   legacySessions: "/api/sessions",
   legacySession: (sessionId: string) => `/api/session?id=${encodeURIComponent(sessionId)}`,
@@ -217,6 +228,31 @@ export async function fetchSessionEvents(sessionId: string, init?: RequestInit, 
   const payload = await readJson<SessionPayload>(withLookback(READ_API_ENDPOINTS.legacySession(sessionId), lookbackDays), init);
   rememberReadApi("legacy");
   return normalizeSessionEventsPayload(payload, "legacy");
+}
+
+export async function fetchSyncExclusions(): Promise<SyncExclusionInfo[]> {
+  const payload = await readJson<SyncExclusionsResponse>(READ_API_ENDPOINTS.syncExclusions);
+  return payload.exclusions;
+}
+
+export async function createSyncExclusion(input: {
+  kind: SyncExclusionKind;
+  targetId: string;
+  label?: string;
+  metadata?: Record<string, unknown>;
+}): Promise<SyncExclusionInfo> {
+  return await readJson<SyncExclusionInfo>(READ_API_ENDPOINTS.syncExclusions, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function restoreSyncExclusion(id: string): Promise<SyncExclusionInfo> {
+  const payload = await readJson<{ ok: true; exclusion: SyncExclusionInfo }>(READ_API_ENDPOINTS.restoreSyncExclusion(id), {
+    method: "POST",
+  });
+  return payload.exclusion;
 }
 
 export async function pullUpdates(options: PullOptions = {}): Promise<PullResult> {
