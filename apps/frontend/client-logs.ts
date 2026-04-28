@@ -8,8 +8,8 @@ type QueuedClientLog = AppLogInput & {
   createdAt: string;
 };
 
-const MAX_QUEUED_LOGS = 500;
-const FLUSH_BATCH_SIZE = 50;
+const MAX_QUEUED_LOGS = 2000;
+const FLUSH_BATCH_SIZE = 100;
 const MAX_TEXT_LENGTH = 4000;
 const MAX_JSON_DEPTH = 6;
 const MAX_ARRAY_LENGTH = 80;
@@ -24,11 +24,13 @@ const originalConsole = {
 };
 
 let installed = false;
+let requestLoggingInstalled = false;
 let flushing = false;
 let memoryFlushing = false;
 let idbLoggingDisabledUntil = 0;
 const memoryLogs: QueuedClientLog[] = [];
 const pageSessionId = newLogId();
+let originalFetch: typeof fetch | null = null;
 
 export function installClientLogHandlers() {
   if (installed) return;
@@ -67,6 +69,83 @@ export function installClientLogHandlers() {
     originalConsole.error(...args);
     void logClientEvent("error", "client.console_error", stringifyArgs(args), { args }, ["client", "console"]);
   };
+}
+
+export function installClientRequestLogging() {
+  if (requestLoggingInstalled) return;
+  if (typeof window === "undefined") return;
+  requestLoggingInstalled = true;
+  originalFetch = window.fetch.bind(window);
+
+  window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const started = performance.now();
+    const meta = requestLogMeta(input, init);
+    const fetchImpl = rawFetch();
+    if (!meta.shouldLog) return fetchImpl(input, init);
+
+    const slowTimer = window.setTimeout(() => {
+      void logClientEvent(
+        "warn",
+        "client.api_request.slow",
+        `${meta.method} ${meta.path} is still running`,
+        {
+          requestId: meta.requestId,
+          method: meta.method,
+          path: meta.path,
+          query: meta.query,
+          durationMs: Math.round(performance.now() - started),
+          activeElement: document.activeElement?.tagName ?? null,
+          visibilityState: document.visibilityState,
+          online: navigator.onLine,
+        },
+        ["client", "request"],
+      );
+    }, 2500);
+
+    try {
+      const response = await fetchImpl(meta.input, meta.init);
+      window.clearTimeout(slowTimer);
+      const durationMs = Math.round(performance.now() - started);
+      void logClientEvent(
+        response.ok ? "debug" : "warn",
+        "client.api_request.complete",
+        null,
+        {
+          requestId: meta.requestId,
+          method: meta.method,
+          path: meta.path,
+          query: meta.query,
+          status: response.status,
+          ok: response.ok,
+          redirected: response.redirected,
+          durationMs,
+          responseRequestId: response.headers.get("x-chatview-request-id"),
+          contentType: response.headers.get("content-type"),
+          contentLength: response.headers.get("content-length"),
+        },
+        ["client", "request"],
+      );
+      return response;
+    } catch (error) {
+      window.clearTimeout(slowTimer);
+      void logClientEvent(
+        "error",
+        "client.api_request.failed",
+        error instanceof Error ? error.message : String(error),
+        {
+          requestId: meta.requestId,
+          method: meta.method,
+          path: meta.path,
+          query: meta.query,
+          durationMs: Math.round(performance.now() - started),
+          error: errorToContext(error),
+          online: navigator.onLine,
+        },
+        ["client", "request"],
+      );
+      throw error;
+    }
+  }) as typeof window.fetch;
 }
 
 export async function logClientEvent(
@@ -126,7 +205,7 @@ async function enqueueLogWithFallback(log: QueuedClientLog) {
 
   try {
     await withTimeout(enqueueLog(log), IDB_LOG_TIMEOUT_MS, "client log IndexedDB queue timed out");
-    if (log.level === "error" || log.level === "fatal" || navigator.onLine) void flushClientLogs().catch(() => {});
+    if (log.level !== "debug" && navigator.onLine) void flushClientLogs().catch(() => {});
   } catch (error) {
     markIdbLoggingUnavailable(error);
     queueMemoryLog(log);
@@ -158,13 +237,56 @@ async function flushMemoryLogs() {
 async function sendLogs(logs: QueuedClientLog[]) {
   if (!logs.length) return;
   const body = JSON.stringify({ logs });
-  const response = await fetch("/api/app/logs", {
+  const response = await rawFetch()("/api/app/logs", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      "x-chatview-client-request-id": newLogId(),
+      "x-chatview-page-session-id": pageSessionId,
+    },
     body,
     keepalive: body.length < 60_000,
   });
   if (!response.ok) throw new Error(`log upload failed: ${response.status}`);
+}
+
+function rawFetch() {
+  return originalFetch ?? globalThis.fetch.bind(globalThis);
+}
+
+function requestLogMeta(input: RequestInfo | URL, init?: RequestInit) {
+  const request = input instanceof Request ? input : null;
+  const rawUrl = request?.url ?? String(input);
+  const url = new URL(rawUrl, window.location.href);
+  const method = String(init?.method ?? request?.method ?? "GET").toUpperCase();
+  const path = url.pathname;
+  const shouldLog = url.origin === window.location.origin && path.startsWith("/api/") && path !== "/api/app/logs";
+  const requestId = newLogId();
+  if (!shouldLog) return { shouldLog, input, init, requestId, method, path, query: sanitizeQuery(url) };
+
+  const headers = new Headers(init?.headers ?? request?.headers);
+  headers.set("x-chatview-client-request-id", requestId);
+  headers.set("x-chatview-page-session-id", pageSessionId);
+  const nextInit = { ...init, headers };
+  const nextInput = request ? new Request(request, nextInit) : input;
+  return {
+    shouldLog,
+    input: nextInput,
+    init: request ? undefined : nextInit,
+    requestId,
+    method,
+    path,
+    query: sanitizeQuery(url),
+  };
+}
+
+function sanitizeQuery(url: URL) {
+  const out: Record<string, string> = {};
+  for (const [key, value] of url.searchParams.entries()) {
+    const normalized = key.toLowerCase();
+    out[key] = normalized.includes("token") || normalized.includes("key") ? "<redacted>" : cleanText(value, 500);
+  }
+  return out;
 }
 
 function markIdbLoggingUnavailable(error: unknown) {

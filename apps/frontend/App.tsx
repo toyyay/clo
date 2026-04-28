@@ -887,10 +887,26 @@ export function App() {
     syncing.current = true;
     const started = performance.now();
     markServerAttempt();
+    void logClientEvent(
+      "debug",
+      "sync.start",
+      null,
+      {
+        reason: options.reason ?? null,
+        silent,
+        online: navigator.onLine,
+        metadataOnly,
+        eventMode: eventMode ?? null,
+        activeId: activeRef.current?.id ?? null,
+        hidden: document.hidden,
+        visibilityState: document.visibilityState,
+        pendingIngest: pendingIngest.current,
+      },
+      ["sync"],
+    ).catch(() => {});
     if (!silent) {
       setSyncState("syncing");
       setStatusText(metadataOnly ? "Refreshing metadata" : "Syncing");
-      void logClientEvent("debug", "sync.start", null, { online: navigator.onLine, metadataOnly }, ["sync"]).catch(() => {});
     }
     try {
       const result = await pullUpdates({
@@ -921,6 +937,8 @@ export function App() {
         null,
         {
           durationMs: Math.round(performance.now() - started),
+          reason: options.reason ?? null,
+          silent,
           metadataOnly,
           requestedEventMode: eventMode ?? null,
           resultEventMode: result.eventMode ?? null,
@@ -1048,6 +1066,8 @@ export function App() {
           null,
           {
             durationMs,
+            reason: options.reason ?? null,
+            silent,
             events: result.events,
             batches: result.batches,
             hosts: result.hosts,
@@ -1084,7 +1104,7 @@ export function App() {
       }
       if (!metadataOnly && result.eventMode === "backfill" && !result.backfillHasMore && resumeRecentAfterBackfill.current) {
         resumeRecentAfterBackfill.current = false;
-        window.setTimeout(() => void syncNow({ silent: true, metadataOnly: false, eventMode: "recent" }), 0);
+        window.setTimeout(() => void syncNow({ silent: true, metadataOnly: false, eventMode: "recent", reason: "resume_recent_after_backfill" }), 0);
       }
     } catch (error) {
       if (error instanceof SyncAuthError) {
@@ -1100,7 +1120,7 @@ export function App() {
         "error",
         "sync.failed",
         error instanceof Error ? error.message : String(error),
-        { durationMs: Math.round(performance.now() - started), error },
+        { durationMs: Math.round(performance.now() - started), reason: options.reason ?? null, silent, error },
         ["sync"],
       ).catch(() => {});
       console.error(error);
@@ -1171,7 +1191,7 @@ export function App() {
           if (parseRoute().chatId === current.id) navigateRoute({}, { replace: true });
         }
         setSettingsMessage(`Muted ${input.label}`);
-        void syncNow({ silent: true, metadataOnly: true });
+        void syncNow({ silent: true, metadataOnly: true, reason: "mute_source" });
       } catch (error) {
         setSettingsMessage(error instanceof Error ? error.message : "Could not mute source");
       } finally {
@@ -1194,8 +1214,8 @@ export function App() {
         await resetSyncCursorsForMutedChange();
         await refreshMutedSources();
         setSettingsMessage(`Restored ${restored.label ?? restored.targetId}`);
-        void syncNow({ silent: true, metadataOnly: true });
-        window.setTimeout(() => void syncNow({ silent: true, metadataOnly: false, eventMode: "recent" }), 0);
+        void syncNow({ silent: true, metadataOnly: true, reason: "restore_muted_source" });
+        window.setTimeout(() => void syncNow({ silent: true, metadataOnly: false, eventMode: "recent", reason: "restore_muted_source_recent" }), 0);
       } catch (error) {
         setSettingsMessage(error instanceof Error ? error.message : "Could not restore source");
       } finally {
@@ -1650,8 +1670,8 @@ export function App() {
         .catch((error) => console.error(error));
       if (isAuthenticated) {
         setStatusText(`Keeping ${nextRetentionDays.toLocaleString()} days`);
-        void syncNow({ metadataOnly: true });
-        window.setTimeout(() => void syncNow({ silent: true, metadataOnly: false, eventMode: "recent" }), 0);
+        void syncNow({ metadataOnly: true, reason: "retention_changed" });
+        window.setTimeout(() => void syncNow({ silent: true, metadataOnly: false, eventMode: "recent", reason: "retention_changed_recent" }), 0);
       }
     }, 450);
     return () => window.clearTimeout(timer);
@@ -1723,23 +1743,23 @@ export function App() {
   useEffect(() => {
     if (!isAuthenticated) return;
     const id = window.setInterval(() => {
-      if (!document.hidden) syncNow({ silent: true, metadataOnly: true });
+      if (!document.hidden) syncNow({ silent: true, metadataOnly: true, reason: "poll_interval" });
     }, 5000);
     const onVisible = () => {
       if (document.hidden) return;
       if (pendingIngest.current) {
         pendingIngest.current = false;
-        void syncNow({ silent: true, metadataOnly: false, eventMode: "forward" });
+        void syncNow({ silent: true, metadataOnly: false, eventMode: "forward", reason: "visible_pending_ingest" });
       }
-      void syncNow({ silent: true, metadataOnly: true });
+      void syncNow({ silent: true, metadataOnly: true, reason: "visible" });
     };
     document.addEventListener("visibilitychange", onVisible);
     const onOnline = () => {
       if (pendingIngest.current) {
         pendingIngest.current = false;
-        void syncNow({ silent: true, metadataOnly: false, eventMode: "forward" });
+        void syncNow({ silent: true, metadataOnly: false, eventMode: "forward", reason: "online_pending_ingest" });
       }
-      void syncNow({ silent: true, metadataOnly: true });
+      void syncNow({ silent: true, metadataOnly: true, reason: "online" });
     };
     window.addEventListener("online", onOnline);
     return () => {
@@ -1790,7 +1810,7 @@ export function App() {
         timer = window.setTimeout(() => {
           timer = null;
           pendingIngest.current = false;
-          void syncNow({ silent: true, metadataOnly: false, eventMode: "forward" });
+          void syncNow({ silent: true, metadataOnly: false, eventMode: "forward", reason: "stream_ingest" });
         }, 50);
       },
       onHeartbeat: (message, readyState) => {
@@ -1937,7 +1957,7 @@ export function App() {
         onResetInterfacePrefs={resetInterfacePrefs}
         onOpenAudio={() => openPanel("audio")}
         onOpenSettings={() => openPanel("settings")}
-        onSync={() => syncNow({ metadataOnly: true })}
+        onSync={() => syncNow({ metadataOnly: true, reason: "manual_topbar" })}
         onToggleTheme={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
         onLogout={logout}
       />
@@ -2110,7 +2130,14 @@ function mergeSyncOptions(current: SyncNowOptions | null, next: SyncNowOptions):
     silent: current ? current.silent === true && next.silent === true : next.silent === true,
     metadataOnly: current?.metadataOnly === false || next.metadataOnly === false ? false : true,
     eventMode: mergeSyncEventMode(current?.eventMode, next.eventMode),
+    reason: mergeSyncReason(current?.reason, next.reason),
   };
+}
+
+function mergeSyncReason(current?: string, next?: string) {
+  if (!current) return next;
+  if (!next || next === current) return current;
+  return `${current}+${next}`.slice(0, 200);
 }
 
 function mergeSyncEventMode(current?: SyncNowOptions["eventMode"], next?: SyncNowOptions["eventMode"]): SyncNowOptions["eventMode"] {

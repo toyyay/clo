@@ -147,7 +147,7 @@ export function useStartupCache({
           ["cache", "startup"],
         ).catch(() => {});
         if (isAuthenticated) {
-          void syncNow({ silent: true, metadataOnly: false, eventMode: "recent" });
+          void syncNow({ silent: true, metadataOnly: false, eventMode: "recent", reason: "startup" });
         }
       })
       .catch((error) => {

@@ -16,4 +16,4 @@ export type EventState = {
   hasNewer?: boolean;
 };
 export type SyncEventMode = "forward" | "recent" | "backfill";
-export type SyncNowOptions = { silent?: boolean; metadataOnly?: boolean; eventMode?: SyncEventMode };
+export type SyncNowOptions = { silent?: boolean; metadataOnly?: boolean; eventMode?: SyncEventMode; reason?: string };

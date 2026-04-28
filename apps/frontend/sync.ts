@@ -11,6 +11,7 @@ import type {
 } from "../../packages/shared/types";
 import { applySync, deleteMeta, getMeta, setMeta } from "./db";
 import { clampRetentionDays } from "./storage-prefs";
+import { logClientEvent } from "./client-logs";
 
 export const READ_API_ENDPOINTS = {
   sync: "/api/sync",
@@ -336,6 +337,24 @@ export async function pullUpdates(options: PullOptions = {}): Promise<PullResult
     const previousCursor = cursor;
     const previousMetadataCursor = metadataCursor;
     const previousBackfillCursor = backfillCursor;
+    const batchStarted = performance.now();
+    void logClientEvent(
+      "debug",
+      "sync.batch.request",
+      null,
+      {
+        batch: batches + 1,
+        maxBatches,
+        metadataOnly,
+        eventMode: eventMode ?? null,
+        cursor: previousCursor,
+        metadataCursor: previousMetadataCursor ?? null,
+        backfillCursor: previousBackfillCursor ?? null,
+        limitBytes,
+        lookbackDays: lookbackDays ?? null,
+      },
+      ["sync", "request"],
+    ).catch(() => {});
     const payload = await fetchBatch(previousCursor, limitBytes, timeoutMs, metadataOnly, metadataCursor, eventMode, backfillCursor, lookbackDays);
     const nextHasMore = metadataOnly
       ? payload.metadataHasMore === true || payload.hasMore === true
@@ -363,6 +382,33 @@ export async function pullUpdates(options: PullOptions = {}): Promise<PullResult
       pruneMissing: metadataOnly ? metadataPruneMode(payload, previousMetadataCursor) : "none",
       storeEventCursor: !metadataOnly && eventMode !== "backfill",
     });
+    void logClientEvent(
+      payload.hasMore || payload.events.length || payload.sessions.length || payload.hosts.length ? "info" : "debug",
+      "sync.batch.result",
+      null,
+      {
+        batch: batches + 1,
+        durationMs: Math.round(performance.now() - batchStarted),
+        metadataOnly,
+        eventMode: payload.eventMode ?? eventMode ?? null,
+        cursor: previousCursor,
+        nextCursor: payload.cursor,
+        metadataCursor: previousMetadataCursor ?? null,
+        nextMetadataCursor: payload.metadataCursor ?? null,
+        backfillCursor: previousBackfillCursor ?? null,
+        nextBackfillCursor: payload.backfillCursor ?? null,
+        hasMore: nextHasMore,
+        backfillHasMore: payload.backfillHasMore === true,
+        metadataHasMore: payload.metadataHasMore === true,
+        metadataFull: payload.metadataFull === true,
+        hosts: payload.hosts.length,
+        sessions: payload.sessions.length,
+        events: payload.events.length,
+        approxBytes: payload.approxBytes,
+        touchedSessionIds: [...new Set(payload.events.map((event) => event.sessionDbId))].slice(0, 25),
+      },
+      ["sync", "request"],
+    ).catch(() => {});
     for (const event of payload.events) touchedSessionIds.add(event.sessionDbId);
     events += payload.events.length;
     batches += 1;

@@ -130,6 +130,8 @@ function buildRequestContext(req: Request, url: URL | null) {
     ip: req.headers.get("cf-connecting-ip") ?? firstForwardedIp(forwardedFor),
     forwardedFor: forwardedFor ? "<present>" : null,
     forwardedProto: req.headers.get("x-forwarded-proto"),
+    clientRequestId: req.headers.get("x-chatview-client-request-id"),
+    pageSessionId: req.headers.get("x-chatview-page-session-id"),
     cfRay: req.headers.get("cf-ray"),
     cfCountry: req.headers.get("cf-ipcountry"),
     contentType: req.headers.get("content-type"),

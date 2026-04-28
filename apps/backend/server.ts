@@ -158,7 +158,7 @@ void resumeQueuedTranscriptionJobs().catch((error) => {
 
 Bun.serve<{ docIds: Set<string> }>({
   port,
-  routes: {
+  routes: withApiRequestLogging({
     "/": index,
     "/api/health": () => json({ ok: true, commit_sha: gitSha }),
     "/api/auth/status": (req: Request) => {
@@ -306,6 +306,23 @@ Bun.serve<{ docIds: Set<string> }>({
       if (req.method !== "POST") return text("method not allowed", 405);
       const started = performance.now();
       const body = (await req.json().catch(() => ({}))) as SyncRequest;
+      void logBackendRequestEvent({
+        level: "debug",
+        event: "sync.request",
+        message: "received sync request",
+        tags: ["sync", "request"],
+        context: {
+          cursor: body.cursor ?? null,
+          metadataCursor: body.metadataCursor ?? null,
+          backfillCursor: body.backfillCursor ?? null,
+          eventMode: body.eventMode ?? null,
+          metadataOnly: body.metadataOnly === true,
+          metadataMode: body.metadataMode ?? null,
+          metadataLimit: body.metadataLimit ?? null,
+          limitBytes: body.limitBytes ?? null,
+          lookbackDays: body.lookbackDays ?? null,
+        },
+      }, req);
       try {
         const result = await sync(body);
         const durationMs = Math.round(performance.now() - started);
@@ -562,7 +579,7 @@ Bun.serve<{ docIds: Set<string> }>({
     },
     "/api/imports/media": async (req: Request) => handleImportMedia(req),
     "/api/shortcuts/audio": async (req: Request) => handleImportMedia(req),
-  },
+  }),
   websocket: {
     open(ws) {
       docIdsBySocket.set(ws, ws.data.docIds);
@@ -594,6 +611,98 @@ Bun.serve<{ docIds: Set<string> }>({
 });
 
 console.log(`chatview backend running at http://localhost:${port}`);
+
+function withApiRequestLogging<T extends Record<string, unknown>>(routes: T): T {
+  const wrapped: Record<string, unknown> = {};
+  for (const [path, handler] of Object.entries(routes)) {
+    if (typeof handler !== "function") {
+      wrapped[path] = handler;
+      continue;
+    }
+    wrapped[path] = async (...args: unknown[]) => {
+      const req = args[0] as Request;
+      if (!shouldLogRequest(req)) return await (handler as (...args: unknown[]) => unknown)(...args);
+      return await logApiRequest(req, () => (handler as (...args: unknown[]) => unknown)(...args));
+    };
+  }
+  return wrapped as T;
+}
+
+async function logApiRequest(req: Request, handler: () => unknown) {
+  const started = performance.now();
+  const url = new URL(req.url);
+  const requestId = req.headers.get("x-chatview-client-request-id") ?? newRequestId();
+  try {
+    const result = await handler();
+    const status = result instanceof Response ? result.status : 101;
+    if (result instanceof Response) {
+      try {
+        result.headers.set("x-chatview-request-id", requestId);
+      } catch {
+        // Some response headers may be immutable; the log still carries the id.
+      }
+    }
+    void logBackendRequestEvent(
+      {
+        level: status >= 500 ? "error" : status >= 400 ? "warn" : "debug",
+        event: "api.request.complete",
+        message: `${req.method} ${url.pathname} -> ${status}`,
+        tags: ["api", "request"],
+        context: buildApiRequestLogContext(req, url, requestId, status, Math.round(performance.now() - started)),
+      },
+      req,
+    );
+    return result;
+  } catch (error) {
+    void logBackendRequestEvent(
+      {
+        level: "error",
+        event: "api.request.failed",
+        message: error instanceof Error ? error.message : String(error),
+        tags: ["api", "request"],
+        context: {
+          ...buildApiRequestLogContext(req, url, requestId, 500, Math.round(performance.now() - started)),
+          error: errorToLogContext(error),
+        },
+      },
+      req,
+    );
+    throw error;
+  }
+}
+
+function shouldLogRequest(req: Request) {
+  const path = new URL(req.url).pathname;
+  return path.startsWith("/api/");
+}
+
+function buildApiRequestLogContext(req: Request, url: URL, requestId: string, status: number, durationMs: number) {
+  return {
+    requestId,
+    clientRequestId: req.headers.get("x-chatview-client-request-id"),
+    pageSessionId: req.headers.get("x-chatview-page-session-id"),
+    method: req.method,
+    path: url.pathname,
+    query: queryToJson(url, redactedQueryNames),
+    status,
+    durationMs,
+    contentType: req.headers.get("content-type"),
+    contentLength: headerNumber(req.headers.get("content-length")),
+    accept: req.headers.get("accept"),
+    referer: req.headers.get("referer"),
+    userAgent: req.headers.get("user-agent"),
+  };
+}
+
+function headerNumber(value: string | null) {
+  if (!value) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function newRequestId() {
+  return globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
 
 function json(value: unknown, status = 200, headers?: HeadersInit) {
   return Response.json(value, { status, headers });

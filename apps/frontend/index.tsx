@@ -1,8 +1,12 @@
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { installClientRequestLogging } from "./client-logs";
 
 resetShellCachesIfRequested().then((reset) => {
-  if (!reset) createRoot(document.getElementById("root")!).render(<App />);
+  if (!reset) {
+    installClientRequestLogging();
+    createRoot(document.getElementById("root")!).render(<App />);
+  }
 });
 
 async function resetShellCachesIfRequested() {
