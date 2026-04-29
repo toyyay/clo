@@ -31,6 +31,7 @@ const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"] as const;
 
 type TreePrefs = {
   open?: Record<string, boolean>;
+  order?: Record<string, number>;
   projectLimits?: Record<string, number>;
   sessionLimits?: Record<string, number>;
 };
@@ -108,11 +109,16 @@ export function SessionSidebar({
   onMuteSession: (session: SessionInfo) => void;
 }) {
   const [treePrefs, setTreePrefs] = useState<TreePrefs>(readTreePrefs);
-  const tree = useMemo(() => buildTree(sessions, groupByProject, sessionStatsById), [groupByProject, sessionStatsById, sessions]);
+  const rawTree = useMemo(() => buildTree(sessions, groupByProject, sessionStatsById), [groupByProject, sessionStatsById, sessions]);
+  const tree = useMemo(() => applyStableNodeOrder(rawTree, treePrefs.order), [rawTree, treePrefs.order]);
 
   useEffect(() => {
     writeTreePrefs(treePrefs);
   }, [treePrefs]);
+
+  useEffect(() => {
+    setTreePrefs((current) => addMissingTreeOrder(current, rawTree));
+  }, [rawTree]);
 
   const hasQuery = query.trim().length > 0;
   const isOpen = useCallback((key: string) => (hasQuery ? true : treePrefs.open?.[key] ?? true), [hasQuery, treePrefs.open]);
@@ -463,6 +469,74 @@ function compareSessions(a: SessionInfo, b: SessionInfo) {
   return (sessionActivityTimestamp(b) ?? "").localeCompare(sessionActivityTimestamp(a) ?? "");
 }
 
+function applyStableNodeOrder(tree: DeviceNode[], order?: Record<string, number>): DeviceNode[] {
+  return tree
+    .map((device) => ({
+      ...device,
+      providers: [...device.providers].sort((a, b) => compareByStoredOrder(a, b, order, compareProvidersByIdentity)),
+    }))
+    .sort((a, b) => compareByStoredOrder(a, b, order, compareDevices));
+}
+
+function addMissingTreeOrder(current: TreePrefs, tree: DeviceNode[]): TreePrefs {
+  let nextOrder = current.order;
+  let changed = false;
+  let nextIndex = maxOrderIndex(nextOrder) + 1;
+
+  const ensure = (key: string) => {
+    if (typeof nextOrder?.[key] === "number") return;
+    if (!nextOrder) nextOrder = {};
+    else if (!changed) nextOrder = { ...nextOrder };
+    changed = true;
+    nextOrder[key] = nextIndex;
+    nextIndex += 1;
+  };
+
+  for (const device of tree) {
+    ensure(device.key);
+    for (const provider of device.providers) ensure(provider.key);
+  }
+
+  return changed ? { ...current, order: nextOrder } : current;
+}
+
+function maxOrderIndex(order?: Record<string, number>) {
+  if (!order) return -1;
+  let max = -1;
+  for (const value of Object.values(order)) {
+    if (Number.isFinite(value) && value > max) max = value;
+  }
+  return max;
+}
+
+function compareByStoredOrder<T extends { key: string }>(
+  a: T,
+  b: T,
+  order: Record<string, number> | undefined,
+  fallback: (a: T, b: T) => number,
+) {
+  const aOrder = order?.[a.key];
+  const bOrder = order?.[b.key];
+  if (typeof aOrder === "number" && typeof bOrder === "number" && aOrder !== bOrder) return aOrder - bOrder;
+  if (typeof aOrder === "number" && typeof bOrder !== "number") return -1;
+  if (typeof bOrder === "number" && typeof aOrder !== "number") return 1;
+  return fallback(a, b);
+}
+
+function compareProvidersByIdentity(a: ProviderNode, b: ProviderNode) {
+  return providerRank(a.value) - providerRank(b.value) || a.label.localeCompare(b.label);
+}
+
+function providerRank(value: string) {
+  if (value === "codex") return 0;
+  if (value === "claude") return 1;
+  if (value === "gemini") return 2;
+  if (value === "legacy") return 3;
+  if (value === "v3") return 4;
+  if (value === "unknown") return 98;
+  return 50;
+}
+
 function takeWithActiveProject(projects: ProjectNode[], limit: number, active: SessionInfo | null) {
   const visible = projects.slice(0, Math.max(0, limit));
   if (!active) return visible;
@@ -486,6 +560,7 @@ function readTreePrefs(): TreePrefs {
     const parsed = JSON.parse(raw) as TreePrefs;
     return {
       open: objectOfBooleans(parsed.open),
+      order: objectOfOrder(parsed.order),
       projectLimits: objectOfNumbers(parsed.projectLimits),
       sessionLimits: objectOfNumbers(parsed.sessionLimits),
     };
@@ -516,6 +591,15 @@ function objectOfNumbers(value: unknown) {
   const out: Record<string, number> = {};
   for (const [key, item] of Object.entries(value)) {
     if (typeof item === "number" && Number.isFinite(item) && item > 0) out[key] = Math.floor(item);
+  }
+  return out;
+}
+
+function objectOfOrder(value: unknown) {
+  if (!value || typeof value !== "object") return undefined;
+  const out: Record<string, number> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === "number" && Number.isFinite(item) && item >= 0) out[key] = Math.floor(item);
   }
   return out;
 }

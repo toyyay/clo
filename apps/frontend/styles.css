@@ -1,19 +1,26 @@
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }
+html, body { overflow: hidden; }
 :root {
   color-scheme: light;
+  --app-viewport-height: 100vh;
+  --app-safe-top: env(safe-area-inset-top, 0px);
+  --app-safe-bottom: env(safe-area-inset-bottom, 0px);
   --bg: #f5f6f7;
   --panel: #ffffff;
   --panel-2: #eef0f2;
   --text: #101215;
-  --muted: #4e5661;
-  --line: #c8cdd3;
+  --muted: #3f4650;
+  --line: #b8bec6;
   --accent: #0b66d0;
   --accent-soft: #e8f1ff;
   --success: #2f9e66;
   --project-accent: #0c7a5b;
   --danger: #c93f3f;
   --shadow: 0 10px 30px rgba(20, 25, 35, 0.08);
+}
+@supports (height: 100dvh) {
+  :root { --app-viewport-height: 100dvh; }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
@@ -42,6 +49,8 @@ button, input, textarea { font: inherit; }
 button { color: inherit; background: none; border: 0; cursor: pointer; padding: 0; text-align: left; }
 button:disabled { cursor: default; opacity: 0.55; }
 input, textarea { color: inherit; }
+input::placeholder,
+textarea::placeholder { color: color-mix(in srgb, var(--muted) 84%, transparent); }
 a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 code {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
@@ -60,7 +69,7 @@ pre {
 }
 
 .auth-page {
-  min-height: 100vh;
+  min-height: var(--app-viewport-height);
   display: grid;
   place-items: center;
   padding: 20px;
@@ -116,7 +125,8 @@ pre {
   --ui-density: 1;
   --chat-font-scale: 1;
   --chat-line-width: 920px;
-  height: 100vh;
+  --topbar-height: calc(44px * var(--ui-density) + var(--app-safe-top));
+  height: var(--app-viewport-height);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -124,7 +134,7 @@ pre {
 }
 .build-badge {
   position: fixed;
-  top: 48px;
+  top: calc(var(--topbar-height) + 4px);
   right: 10px;
   z-index: 5;
   max-width: calc(100vw - 20px);
@@ -141,8 +151,8 @@ pre {
 }
 .topbar {
   z-index: 4;
-  min-height: calc(44px * var(--ui-density));
-  padding: calc(5px * var(--ui-density)) calc(8px * var(--ui-density));
+  min-height: var(--topbar-height);
+  padding: calc(5px * var(--ui-density) + var(--app-safe-top)) calc(8px * var(--ui-density)) calc(5px * var(--ui-density));
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -255,11 +265,11 @@ pre {
 }
 .prefs-popover {
   position: fixed;
-  top: calc(52px * var(--ui-density));
+  top: calc(var(--topbar-height) + 6px);
   right: 8px;
   z-index: 19;
   width: min(330px, calc(100vw - 16px));
-  max-height: calc(100vh - 64px);
+  max-height: calc(var(--app-viewport-height) - var(--topbar-height) - 14px - var(--app-safe-bottom));
   display: grid;
   gap: 10px;
   padding: 10px;
@@ -1297,7 +1307,7 @@ body.resizing-sidebar {
   gap: 6px;
   padding: 6px 8px;
   border-top: 1px solid var(--line);
-  background: var(--panel);
+  background: color-mix(in srgb, var(--panel) 86%, var(--panel-2));
 }
 .composer textarea {
   width: 100%;
@@ -1305,13 +1315,16 @@ body.resizing-sidebar {
   max-height: 140px;
   resize: vertical;
   padding: 6px 8px;
-  border: 1px solid var(--line);
+  border: 1px solid color-mix(in srgb, var(--line) 72%, var(--text));
   border-radius: 6px;
-  background: var(--panel-2);
+  background: var(--panel);
   color: var(--text);
   outline: none;
 }
-.composer textarea:focus { border-color: var(--accent); }
+.composer textarea:focus {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 38%, transparent);
+}
 .send-button {
   align-self: end;
   min-height: 34px;
@@ -1326,6 +1339,7 @@ body.resizing-sidebar {
   position: fixed;
   inset: 0;
   z-index: 20;
+  height: var(--app-viewport-height);
   display: grid;
   place-items: center;
   padding: 18px;
@@ -1333,7 +1347,7 @@ body.resizing-sidebar {
 }
 .modal-panel {
   width: min(760px, 100%);
-  max-height: min(82vh, 820px);
+  max-height: min(calc(var(--app-viewport-height) - 36px - var(--app-safe-top) - var(--app-safe-bottom)), 820px);
   display: flex;
   flex-direction: column;
   border: 1px solid var(--line);
@@ -1761,8 +1775,15 @@ body.resizing-sidebar {
 
 @media (max-width: 780px) {
   body { font-size: 14px; }
-  .app-shell { font-size: calc(14px * var(--ui-font-scale)); }
-  .topbar { min-height: calc(42px * var(--ui-density)); padding: calc(4px * var(--ui-density)) calc(5px * var(--ui-density)); gap: 4px; }
+  .app-shell {
+    --topbar-height: calc(42px * var(--ui-density) + var(--app-safe-top));
+    font-size: calc(14px * var(--ui-font-scale));
+  }
+  .topbar {
+    min-height: var(--topbar-height);
+    padding: calc(4px * var(--ui-density) + var(--app-safe-top)) calc(5px * var(--ui-density)) calc(4px * var(--ui-density));
+    gap: 4px;
+  }
   .brand { font-size: calc(14px * var(--ui-font-scale)); }
   .active-inline { display: none; }
   .top-status { display: none; }
@@ -1778,10 +1799,10 @@ body.resizing-sidebar {
     font-size: calc(12px * var(--ui-font-scale));
   }
   .prefs-popover {
-    top: calc(48px * var(--ui-density));
+    top: calc(var(--topbar-height) + 6px);
     right: 6px;
     width: calc(100vw - 12px);
-    max-height: calc(100vh - 56px);
+    max-height: calc(var(--app-viewport-height) - var(--topbar-height) - 12px - var(--app-safe-bottom));
   }
   .download-button { display: none; }
   .layout {
@@ -1790,7 +1811,7 @@ body.resizing-sidebar {
   }
   .sidebar {
     position: fixed;
-    inset: 42px auto 0 0;
+    inset: var(--topbar-height) auto var(--app-safe-bottom) 0;
     z-index: 5;
     width: min(calc(100vw - 28px), var(--sidebar-width, 340px));
     max-width: calc(100vw - 28px);
@@ -1823,7 +1844,7 @@ body.resizing-sidebar {
   .sidebar-backdrop {
     display: block;
     position: fixed;
-    inset: 42px 0 0;
+    inset: var(--topbar-height) 0 0;
     z-index: 4;
     background: rgba(0, 0, 0, 0.25);
   }
@@ -1859,13 +1880,21 @@ body.resizing-sidebar {
     border-radius: 5px;
   }
   .composer {
-    padding: 4px;
+    padding: 4px 4px calc(4px + var(--app-safe-bottom));
     gap: 4px;
   }
   .composer textarea {
     min-height: 38px;
     padding: 5px 6px;
     border-radius: 5px;
+    font-size: 16px;
+  }
+  .search,
+  .filter-select,
+  .settings-range input[type="number"],
+  .audio-retry-controls select,
+  .auth-input {
+    font-size: 16px;
   }
   .audio-item-head,
   .audio-upload-main {
@@ -1889,13 +1918,28 @@ body.resizing-sidebar {
     padding: 5px 8px;
   }
   .modal-backdrop {
+    inset: 0 0 auto;
+    height: var(--app-viewport-height);
     padding: 0;
-    align-items: end;
+    align-items: stretch;
   }
   .modal-panel {
     width: 100%;
-    max-height: calc(100vh - 42px);
-    border-radius: 8px 8px 0 0;
+    height: var(--app-viewport-height);
+    max-height: var(--app-viewport-height);
+    border-radius: 0;
+    border-left: 0;
+    border-right: 0;
+  }
+  .modal-head {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding-top: max(8px, var(--app-safe-top));
+    background: var(--panel);
+  }
+  .modal-body {
+    padding-bottom: calc(10px + var(--app-safe-bottom));
   }
   .url-row {
     grid-template-columns: minmax(0, 1fr) auto;
@@ -1915,16 +1959,16 @@ body.resizing-sidebar {
 :root[data-display="eink"],
 :root[data-display="eink"][data-theme="dark"] {
   color-scheme: light;
-  --bg: #fbfbf8;
+  --bg: #fbfbfb;
   --panel: #ffffff;
-  --panel-2: #eef1f4;
+  --panel-2: #e8eaed;
   --text: #050505;
-  --muted: #3f4650;
-  --line: #9aa1aa;
-  --accent: #075ec2;
-  --accent-soft: #e5f0ff;
-  --success: #087443;
-  --project-accent: #0a7a5a;
+  --muted: #24282f;
+  --line: #5f6670;
+  --accent: #003f8c;
+  --accent-soft: #dbe8fa;
+  --success: #095c37;
+  --project-accent: #075f45;
   --danger: #b42318;
   --shadow: none;
 }
@@ -1943,13 +1987,14 @@ body.resizing-sidebar {
 }
 
 :root[data-display="eink"] .topbar {
-  min-height: calc(40px * var(--ui-density));
-  border-bottom: 1px solid var(--line);
+  min-height: calc(40px * var(--ui-density) + var(--app-safe-top));
+  border-bottom: 2px solid var(--line);
 }
 
 :root[data-display="eink"] .chat-head,
 :root[data-display="eink"] .composer {
   border-color: var(--line);
+  border-width: 2px;
 }
 
 :root[data-display="eink"] .top-action-secondary {
@@ -2034,10 +2079,12 @@ body.resizing-sidebar {
 :root[data-display="eink"] .prefs-mode,
 :root[data-display="eink"] .prefs-range,
 :root[data-display="eink"] .range-step-button,
+:root[data-display="eink"] .toggle-row,
+:root[data-display="eink"] .service-status,
 :root[data-display="eink"] .settings-range,
 :root[data-display="eink"] .composer textarea,
 :root[data-display="eink"] .send-button {
-  border-width: 1px;
+  border-width: 2px;
 }
 
 :root[data-display="eink"] .icon-button,
@@ -2064,7 +2111,7 @@ body.resizing-sidebar {
 }
 
 :root[data-display="eink"] .sidebar {
-  border-right: 1px solid var(--line);
+  border-right: 2px solid var(--line);
   transition: none;
 }
 
@@ -2073,7 +2120,8 @@ body.resizing-sidebar {
 }
 
 :root[data-display="eink"] .tree-action {
-  opacity: 0;
+  opacity: 1;
+  border-color: var(--line);
   background: var(--panel);
   color: var(--text);
 }
@@ -2089,7 +2137,26 @@ body.resizing-sidebar {
 
 :root[data-display="eink"] .tree-session.active {
   font-weight: 750;
-  box-shadow: inset 3px 0 0 var(--accent);
+  background: var(--accent-soft);
+  box-shadow: inset 5px 0 0 var(--accent);
+}
+
+:root[data-display="eink"] .tree-list > .tree-node > .tree-folder.level-0,
+:root[data-display="eink"] .tree-folder.level-1,
+:root[data-display="eink"] .tree-folder.level-2 {
+  border-top-color: var(--line);
+}
+
+:root[data-display="eink"] .tree-folder,
+:root[data-display="eink"] .tree-folder.level-1 .tree-label,
+:root[data-display="eink"] .tree-folder.level-2 .tree-label {
+  color: var(--text);
+}
+
+:root[data-display="eink"] .tree-size {
+  background: var(--panel-2);
+  color: var(--text);
+  outline: 1px solid var(--line);
 }
 
 :root[data-display="eink"] .archive-dot,
@@ -2120,6 +2187,26 @@ body.resizing-sidebar {
   background: var(--panel);
   border-left: 4px solid var(--text);
   border-radius: 0 6px 6px 0;
+}
+
+:root[data-display="eink"] .modal-head,
+:root[data-display="eink"] .settings-section {
+  border-color: var(--line);
+  border-width: 2px;
+}
+
+:root[data-display="eink"] .composer {
+  background: var(--panel-2);
+}
+
+:root[data-display="eink"] .composer textarea {
+  background: var(--panel);
+}
+
+:root[data-display="eink"] input::placeholder,
+:root[data-display="eink"] textarea::placeholder {
+  color: var(--muted);
+  opacity: 1;
 }
 
 :root[data-display="eink"] .markdown blockquote {
@@ -2171,6 +2258,6 @@ body.resizing-sidebar {
 
   :root[data-display="eink"] .sidebar,
   :root[data-display="eink"] .sidebar-backdrop {
-    inset-block-start: 42px;
+    inset-block-start: var(--topbar-height);
   }
 }
