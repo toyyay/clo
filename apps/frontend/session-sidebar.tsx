@@ -25,7 +25,7 @@ import { SIDEBAR_TREE_STORAGE_KEY } from "./storage-prefs";
 
 const DEFAULT_PROJECT_LIMIT = 5;
 const PROJECT_LIMIT_STEP = 5;
-const DEFAULT_SESSION_LIMIT = 5;
+const DEFAULT_SESSION_LIMIT = 3;
 const SESSION_LIMIT_STEP = 10;
 
 type TreePrefs = {
@@ -192,22 +192,27 @@ export function SessionSidebar({
                                     <>
                                       {visibleSessions.map((session) => {
                                         const bytes = sessionStatsById.get(session.id)?.approxBytes ?? session.sizeBytes ?? 0;
+                                        const title = sessionDisplayTitle(session);
                                         return (
                                           <div
                                             key={session.id}
                                             className={`tree-row tree-session level-3 ${active?.id === session.id ? "active" : ""}`}
                                             title={sessionSourceTitle(session)}
                                           >
+                                            <button
+                                              className="tree-size"
+                                              onClick={() => onMuteSession(session)}
+                                              title={`Mute ${title}`}
+                                              aria-label={`Mute ${title}`}
+                                            >
+                                              {formatBytes(bytes)}
+                                            </button>
                                             <button className="tree-main" onClick={() => onSelectSession(session)}>
-                                              <span className={`archive-dot ${session.deletedAt ? "archived" : "active"}`} title={session.deletedAt ? "Archived" : "Active"} />
-                                              <span className="tree-label">{sessionDisplayTitle(session)}</span>
-                                              <span className="tree-time" title={sessionActivityTitle(session)}>
-                                                {formatBytes(bytes)} · {sessionActivityLabel(session, now)}
-                                              </span>
+                                              <span className="tree-label">{title}</span>
                                             </button>
-                                            <button className="tree-action compact-button" onClick={() => onMuteSession(session)}>
-                                              Mute
-                                            </button>
+                                            <span className="tree-time" title={sessionActivityTitle(session)}>
+                                              {sessionActivityLabel(session, now)}
+                                            </span>
                                           </div>
                                         );
                                       })}
