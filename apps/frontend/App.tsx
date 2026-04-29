@@ -500,7 +500,25 @@ export function App() {
     eventWindowLoads.current.older = true;
     const cursor = current.events[0];
     const canFetchRemote = session.id.startsWith("v3:") && isAuthenticated && navigator.onLine !== false;
+    const started = performance.now();
+    void logClientEvent(
+      "debug",
+      "read.session_events.older_start",
+      null,
+      {
+        sessionId: session.id,
+        cursorId: cursor.id,
+        cursorLineNo: cursor.lineNo ?? null,
+        cursorOffset: cursor.offset ?? null,
+        visibleEvents: current.events.length,
+        expectedEvents: session.eventCount,
+        canFetchRemote,
+        online: navigator.onLine,
+      },
+      ["read", "session", "scroll"],
+    ).catch(() => {});
     try {
+      let source: "indexeddb" | "remote" | "empty" = "indexeddb";
       let older = await loadSessionEventsBefore(session.id, cursor, CHAT_EVENT_WINDOW_PAGE);
       let hasOlder = older.length >= CHAT_EVENT_WINDOW_PAGE;
       if (!older.length && canFetchRemote) {
@@ -511,8 +529,11 @@ export function App() {
         );
         older = payload.events;
         hasOlder = payload.hasOlder;
+        source = older.length ? "remote" : "empty";
         setActiveSession(payload.session);
         void cacheSessionEventPage(payload).catch(() => {});
+      } else if (!older.length) {
+        source = "empty";
       }
       setEventState((latest) => {
         if (latest.sessionId !== session.id || latest.events[0]?.id !== cursor.id) return latest;
@@ -525,13 +546,28 @@ export function App() {
         }
         return mergeEventWindow(latest, older, "prepend", hasOlder);
       });
+      void logClientEvent(
+        "debug",
+        "read.session_events.older_complete",
+        null,
+        {
+          sessionId: session.id,
+          cursorId: cursor.id,
+          source,
+          loadedEvents: older.length,
+          hasOlder,
+          durationMs: Math.round(performance.now() - started),
+          visibleEventsBefore: current.events.length,
+        },
+        ["read", "session", "scroll"],
+      ).catch(() => {});
     } catch (error) {
       void logClientEvent(
         "warn",
         "read.session_events.older_failed",
         error instanceof Error ? error.message : String(error),
-        { sessionId: session.id, cursorId: cursor.id, error },
-        ["read", "session"],
+        { sessionId: session.id, cursorId: cursor.id, durationMs: Math.round(performance.now() - started), error },
+        ["read", "session", "scroll"],
       ).catch(() => {});
     } finally {
       eventWindowLoads.current.older = false;
@@ -546,7 +582,26 @@ export function App() {
     eventWindowLoads.current.newer = true;
     const cursor = current.events.at(-1)!;
     const canFetchRemote = session.id.startsWith("v3:") && isAuthenticated && navigator.onLine !== false;
+    const started = performance.now();
+    void logClientEvent(
+      "debug",
+      "read.session_events.newer_start",
+      null,
+      {
+        sessionId: session.id,
+        cursorId: cursor.id,
+        cursorLineNo: cursor.lineNo ?? null,
+        cursorOffset: cursor.offset ?? null,
+        visibleEvents: current.events.length,
+        expectedEvents: session.eventCount,
+        force,
+        canFetchRemote,
+        online: navigator.onLine,
+      },
+      ["read", "session", "scroll"],
+    ).catch(() => {});
     try {
+      let source: "indexeddb" | "remote" | "empty" = "indexeddb";
       let newer = await loadSessionEventsAfter(session.id, cursor, CHAT_EVENT_WINDOW_PAGE);
       let hasNewer = newer.length >= CHAT_EVENT_WINDOW_PAGE;
       if (!newer.length && canFetchRemote) {
@@ -557,8 +612,11 @@ export function App() {
         );
         newer = payload.events;
         hasNewer = payload.hasNewer;
+        source = newer.length ? "remote" : "empty";
         setActiveSession(payload.session);
         void cacheSessionEventPage(payload).catch(() => {});
+      } else if (!newer.length) {
+        source = "empty";
       }
       setEventState((latest) => {
         if (latest.sessionId !== session.id || latest.events.at(-1)?.id !== cursor.id) return latest;
@@ -571,13 +629,29 @@ export function App() {
         }
         return mergeEventWindow(latest, newer, "append", hasNewer);
       });
+      void logClientEvent(
+        "debug",
+        "read.session_events.newer_complete",
+        null,
+        {
+          sessionId: session.id,
+          cursorId: cursor.id,
+          source,
+          loadedEvents: newer.length,
+          hasNewer,
+          force,
+          durationMs: Math.round(performance.now() - started),
+          visibleEventsBefore: current.events.length,
+        },
+        ["read", "session", "scroll"],
+      ).catch(() => {});
     } catch (error) {
       void logClientEvent(
         "warn",
         "read.session_events.newer_failed",
         error instanceof Error ? error.message : String(error),
-        { sessionId: session.id, cursorId: cursor.id, error },
-        ["read", "session"],
+        { sessionId: session.id, cursorId: cursor.id, force, durationMs: Math.round(performance.now() - started), error },
+        ["read", "session", "scroll"],
       ).catch(() => {});
     } finally {
       eventWindowLoads.current.newer = false;

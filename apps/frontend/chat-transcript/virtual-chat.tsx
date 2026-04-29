@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { logClientEvent } from "../client-logs";
 import { INTERFACE_PREFS_BEFORE_CHANGE_EVENT } from "../storage-prefs";
 import { renderChatItem } from "./render-item";
 import type { RenderItem, SavedScroll, ScrollAnchor, UpdateRangeOptions, VirtualRange } from "./types";
@@ -6,8 +7,35 @@ import type { RenderItem, SavedScroll, ScrollAnchor, UpdateRangeOptions, Virtual
 const ROW_OVERSCAN = 8;
 const DEFAULT_ROW_HEIGHT = 96;
 const LOAD_EDGE_PX = 720;
+const SCROLL_IDLE_LOG_MS = 900;
+const SCROLL_EDGE_LOG_COOLDOWN_MS = 1800;
+const SCROLL_JUMP_WARN_MS = 140;
+const SCROLL_JUMP_WARN_MIN_PX = 1200;
+const SCROLL_ANCHOR_LOG_DELTA_PX = 24;
+const SCROLL_ANCHOR_WARN_DELTA_PX = 900;
+const SCROLL_MEASURE_LOG_BATCH_COUNT = 12;
+const SCROLL_MEASURE_LOG_DELTA_PX = 160;
+const SCROLL_MEASURE_WARN_DELTA_PX = 520;
 const SCROLL_STORAGE_PREFIX = "chatview:chat-scroll:";
 const FOLLOW_BOTTOM_STORAGE_KEY = "chatview:chat-follow-bottom";
+
+type ScrollLogLevel = "debug" | "info" | "warn" | "error";
+type ScrollDiagnosticsSnapshot = {
+  itemCount: number;
+  hasOlder: boolean;
+  hasNewer: boolean;
+  range: VirtualRange;
+  layoutTotal: number;
+};
+type ScrollLogState = {
+  idleTimer: number | null;
+  scrollStartedAt: number | null;
+  lastScrollTop: number | null;
+  lastScrollAt: number;
+  lastIdleTop: number | null;
+  lastEdgeOlderAt: number;
+  lastEdgeNewerAt: number;
+};
 
 function estimateItemHeight(item: RenderItem) {
   if (item.kind === "tool_group") return 34;
@@ -85,8 +113,25 @@ export function VirtualChat({
   const pendingHeights = useRef(new Map<string, number>());
   const pendingRangeCapture = useRef(false);
   const previousItemsLength = useRef(0);
+  const previousEdgeKeys = useRef<{ first: string | null; last: string | null }>({ first: null, last: null });
   const resetKeyRef = useRef(resetKey);
   const followBottomRef = useRef(false);
+  const diagnostics = useRef<ScrollDiagnosticsSnapshot>({
+    itemCount: 0,
+    hasOlder: false,
+    hasNewer: false,
+    range: { start: 0, end: 0, top: 0, bottom: 0 },
+    layoutTotal: 0,
+  });
+  const scrollLog = useRef<ScrollLogState>({
+    idleTimer: null,
+    scrollStartedAt: null,
+    lastScrollTop: null,
+    lastScrollAt: 0,
+    lastIdleTop: null,
+    lastEdgeOlderAt: 0,
+    lastEdgeNewerAt: 0,
+  });
   const [measureVersion, setMeasureVersion] = useState(0);
   const [range, setRange] = useState<VirtualRange>({ start: 0, end: 0, top: 0, bottom: 0 });
   const [showBottom, setShowBottom] = useState(false);
@@ -107,6 +152,26 @@ export function VirtualChat({
     offsets[items.length] = total;
     return { offsets, total };
   }, [items, itemKeys, measureVersion]);
+
+  diagnostics.current = { itemCount: items.length, hasOlder, hasNewer, range, layoutTotal: layout.total };
+
+  const logScrollDiagnostic = useCallback((level: ScrollLogLevel, event: string, message?: string | null, context?: Record<string, unknown>) => {
+    const el = scrollRef.current;
+    void logClientEvent(
+      level,
+      event,
+      message ?? null,
+      {
+        resetKey: resetKeyRef.current,
+        scroll: el ? scrollMetrics(el, diagnostics.current) : null,
+        followBottom: followBottomRef.current,
+        nearBottom: nearBottom.current,
+        pendingBottom: pendingBottom.current,
+        ...context,
+      },
+      ["client", "scroll"],
+    ).catch(() => {});
+  }, []);
 
   const updateRange = useCallback((options: UpdateRangeOptions = {}) => {
     const el = scrollRef.current;
@@ -131,6 +196,24 @@ export function VirtualChat({
     setRange((current) => (sameRange(current, nextRange) ? current : nextRange));
   }, [items.length, itemKeys, layout]);
 
+  const scheduleScrollIdleLog = useCallback((reason: string) => {
+    const state = scrollLog.current;
+    if (state.idleTimer !== null) window.clearTimeout(state.idleTimer);
+    state.idleTimer = window.setTimeout(() => {
+      state.idleTimer = null;
+      const el = scrollRef.current;
+      if (!el) return;
+      const scrollTop = Math.round(el.scrollTop);
+      logScrollDiagnostic("debug", "chat.scroll.idle", null, {
+        reason,
+        scrollDurationMs: state.scrollStartedAt === null ? null : Math.round(performance.now() - state.scrollStartedAt),
+        movedSinceLastIdle: state.lastIdleTop === null ? null : scrollTop - state.lastIdleTop,
+      });
+      state.lastIdleTop = scrollTop;
+      state.scrollStartedAt = null;
+    }, SCROLL_IDLE_LOG_MS);
+  }, [logScrollDiagnostic]);
+
   const scheduleRange = useCallback((options: UpdateRangeOptions = {}) => {
     pendingRangeCapture.current = pendingRangeCapture.current || Boolean(options.captureAnchor);
     if (raf.current !== null) return;
@@ -154,22 +237,71 @@ export function VirtualChat({
   const onScroll = useCallback(() => {
     const el = scrollRef.current;
     if (el) {
+      const now = performance.now();
+      const state = scrollLog.current;
+      const previousTop = state.lastScrollTop;
+      const previousAt = state.lastScrollAt;
+      if (state.scrollStartedAt === null) state.scrollStartedAt = now;
+      state.lastScrollTop = el.scrollTop;
+      state.lastScrollAt = now;
+
+      if (previousTop !== null && previousAt > 0) {
+        const deltaTop = el.scrollTop - previousTop;
+        const deltaMs = now - previousAt;
+        const jumpThreshold = Math.max(SCROLL_JUMP_WARN_MIN_PX, el.clientHeight * 1.4);
+        if (deltaMs > 0 && deltaMs < SCROLL_JUMP_WARN_MS && Math.abs(deltaTop) >= jumpThreshold) {
+          logScrollDiagnostic("warn", "chat.scroll.jump", "large scroll offset change", {
+            deltaTop: Math.round(deltaTop),
+            deltaMs: Math.round(deltaMs),
+            jumpThreshold: Math.round(jumpThreshold),
+          });
+        }
+      }
+
       scheduleScrollSave();
       const bottomGap = el.scrollHeight - el.scrollTop - el.clientHeight;
-      if (hasOlder && el.scrollTop < LOAD_EDGE_PX) onLoadOlder?.();
-      if (hasNewer && bottomGap < LOAD_EDGE_PX) onLoadNewer?.();
+      if (hasOlder && el.scrollTop < LOAD_EDGE_PX) {
+        if (now - state.lastEdgeOlderAt > SCROLL_EDGE_LOG_COOLDOWN_MS) {
+          state.lastEdgeOlderAt = now;
+          logScrollDiagnostic("debug", "chat.scroll.edge_load_request", null, {
+            direction: "older",
+            edgeDistancePx: Math.round(el.scrollTop),
+          });
+        }
+        onLoadOlder?.();
+      }
+      if (hasNewer && bottomGap < LOAD_EDGE_PX) {
+        if (now - state.lastEdgeNewerAt > SCROLL_EDGE_LOG_COOLDOWN_MS) {
+          state.lastEdgeNewerAt = now;
+          logScrollDiagnostic("debug", "chat.scroll.edge_load_request", null, {
+            direction: "newer",
+            edgeDistancePx: Math.round(bottomGap),
+          });
+        }
+        onLoadNewer?.();
+      }
+      scheduleScrollIdleLog("user_scroll");
     }
     scheduleRange({ captureAnchor: true });
-  }, [hasNewer, hasOlder, onLoadNewer, onLoadOlder, scheduleRange, scheduleScrollSave]);
+  }, [hasNewer, hasOlder, logScrollDiagnostic, onLoadNewer, onLoadOlder, scheduleRange, scheduleScrollIdleLog, scheduleScrollSave]);
 
-  const scrollToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "auto", reason = "manual") => {
     const el = scrollRef.current;
     if (!el) return;
+    const beforeTop = el.scrollTop;
+    const beforeBottomGap = el.scrollHeight - el.scrollTop - el.clientHeight;
     el.scrollTo({ top: el.scrollHeight, behavior });
+    logScrollDiagnostic("debug", "chat.scroll.to_bottom", null, {
+      reason,
+      behavior,
+      beforeTop: Math.round(beforeTop),
+      beforeBottomGap: Math.round(beforeBottomGap),
+      targetTop: Math.round(el.scrollHeight),
+    });
     nearBottom.current = true;
     setShowBottom(false);
     scheduleRange();
-  }, [scheduleRange]);
+  }, [logScrollDiagnostic, scheduleRange]);
 
   const cancelScrollFrame = useCallback(() => {
     if (scrollRaf.current !== null) {
@@ -194,20 +326,46 @@ export function VirtualChat({
   const toggleFollowBottom = useCallback(() => {
     const next = !followBottomRef.current;
     setFollowBottom(next);
-    if (next) scheduleScrollFrame(() => scrollToBottom("smooth"));
-  }, [scheduleScrollFrame, scrollToBottom]);
+    logScrollDiagnostic("debug", "chat.scroll.follow_bottom", null, { enabled: next });
+    if (next) scheduleScrollFrame(() => scrollToBottom("smooth", "follow_enabled"));
+  }, [logScrollDiagnostic, scheduleScrollFrame, scrollToBottom]);
 
   const flushMeasurements = useCallback(() => {
     measureRaf.current = null;
     let changed = false;
+    let measuredCount = 0;
+    let changedCount = 0;
+    let maxDelta = 0;
+    let totalDelta = 0;
     for (const [key, rounded] of pendingHeights.current) {
-      if (Math.abs((heights.current.get(key) ?? 0) - rounded) < 2) continue;
+      measuredCount += 1;
+      const previous = heights.current.get(key) ?? 0;
+      const delta = previous ? rounded - previous : 0;
+      if (Math.abs(previous - rounded) < 2) continue;
       heights.current.set(key, rounded);
       changed = true;
+      changedCount += 1;
+      maxDelta = Math.max(maxDelta, Math.abs(delta));
+      totalDelta += delta;
     }
     pendingHeights.current.clear();
-    if (changed) setMeasureVersion((version) => version + 1);
-  }, []);
+    if (changed) {
+      if (changedCount >= SCROLL_MEASURE_LOG_BATCH_COUNT || maxDelta >= SCROLL_MEASURE_LOG_DELTA_PX) {
+        logScrollDiagnostic(
+          maxDelta >= SCROLL_MEASURE_WARN_DELTA_PX ? "warn" : "debug",
+          "chat.scroll.measure_batch",
+          null,
+          {
+            measuredCount,
+            changedCount,
+            maxDelta,
+            totalDelta,
+          },
+        );
+      }
+      setMeasureVersion((version) => version + 1);
+    }
+  }, [logScrollDiagnostic]);
 
   const onMeasure = useCallback((key: string, height: number) => {
     pendingHeights.current.set(key, Math.ceil(height));
@@ -231,10 +389,16 @@ export function VirtualChat({
     if (heightScale > 0 && Math.abs(heightScale - 1) > 0.01) {
       heights.current = new Map([...heights.current].map(([key, height]) => [key, Math.max(1, Math.ceil(height * heightScale))]));
     }
+    logScrollDiagnostic("debug", "chat.scroll.capture_anchor", null, {
+      reason: "interface_change",
+      heightScale,
+      anchorKey: scrollAnchor.current?.key ?? null,
+      anchorOffset: scrollAnchor.current ? Math.round(scrollAnchor.current.offset) : null,
+    });
     saveChatScroll(resetKey, el);
     setMeasureVersion((version) => version + 1);
     scheduleRange({ captureAnchor: false });
-  }, [itemKeys, items.length, layout.offsets, resetKey, scheduleRange]);
+  }, [itemKeys, items.length, layout.offsets, logScrollDiagnostic, resetKey, scheduleRange]);
 
   useLayoutEffect(() => {
     cancelScrollFrame();
@@ -242,27 +406,64 @@ export function VirtualChat({
     pendingHeights.current.clear();
     scrollAnchor.current = null;
     nearBottom.current = true;
+    if (scrollLog.current.idleTimer !== null) {
+      window.clearTimeout(scrollLog.current.idleTimer);
+      scrollLog.current.idleTimer = null;
+    }
+    scrollLog.current.scrollStartedAt = null;
+    scrollLog.current.lastScrollTop = null;
+    scrollLog.current.lastScrollAt = 0;
+    scrollLog.current.lastIdleTop = null;
+    scrollLog.current.lastEdgeOlderAt = 0;
+    scrollLog.current.lastEdgeNewerAt = 0;
     const saved = loadChatScroll(resetKey);
     pendingBottom.current = !saved || saved.nearBottom;
     restoredScrollKey.current = null;
     previousItemsLength.current = 0;
+    previousEdgeKeys.current = { first: null, last: null };
     setRange({ start: 0, end: 0, top: 0, bottom: 0 });
     setShowBottom(false);
     setMeasureVersion((version) => version + 1);
-  }, [cancelScrollFrame, resetKey]);
+    logScrollDiagnostic("debug", "chat.scroll.reset", null, {
+      savedTop: saved?.top ?? null,
+      savedNearBottom: saved?.nearBottom ?? null,
+    });
+  }, [cancelScrollFrame, logScrollDiagnostic, resetKey]);
 
   useLayoutEffect(() => {
     if (!items.length) {
       previousItemsLength.current = 0;
+      previousEdgeKeys.current = { first: null, last: null };
       setRange({ start: 0, end: 0, top: 0, bottom: 0 });
       setShowBottom(false);
       return;
     }
     const wasNearBottom = nearBottom.current;
     const wasPendingBottom = pendingBottom.current;
-    const appended = items.length > previousItemsLength.current;
+    const previousLength = previousItemsLength.current;
+    const previousFirstKey = previousEdgeKeys.current.first;
+    const previousLastKey = previousEdgeKeys.current.last;
+    const nextFirstKey = itemKeys[0] ?? null;
+    const nextLastKey = itemKeys.at(-1) ?? null;
+    const appended = items.length > previousLength;
+    const prependedByKey = Boolean(previousFirstKey && nextFirstKey !== previousFirstKey && itemKeys.includes(previousFirstKey));
+    const appendedByKey = Boolean(previousLastKey && nextLastKey !== previousLastKey && itemKeys.includes(previousLastKey));
     previousItemsLength.current = items.length;
+    previousEdgeKeys.current = { first: nextFirstKey, last: nextLastKey };
     updateRange();
+    if (previousLength !== items.length || previousFirstKey !== nextFirstKey || previousLastKey !== nextLastKey) {
+      logScrollDiagnostic("debug", "chat.scroll.items_changed", null, {
+        previousItemCount: previousLength,
+        nextItemCount: items.length,
+        deltaItems: items.length - previousLength,
+        firstKeyChanged: previousFirstKey !== nextFirstKey,
+        lastKeyChanged: previousLastKey !== nextLastKey,
+        prependedByKey,
+        appendedByKey,
+        wasNearBottom,
+        wasPendingBottom,
+      });
+    }
     const savedScroll = loadChatScroll(resetKey);
     if (savedScroll && !savedScroll.nearBottom && restoredScrollKey.current !== resetKey) {
       restoredScrollKey.current = resetKey;
@@ -274,18 +475,25 @@ export function VirtualChat({
         el.scrollTop = nextTop;
         scrollAnchor.current = anchorForScroll(layout.offsets, itemKeys, nextTop, items.length);
         updateRange();
+        logScrollDiagnostic("debug", "chat.scroll.restore", null, {
+          savedTop: Math.round(savedScroll.top),
+          appliedTop: Math.round(nextTop),
+          maxTop: Math.round(Math.max(0, el.scrollHeight - el.clientHeight)),
+          anchorKey: scrollAnchor.current?.key ?? null,
+          anchorOffset: scrollAnchor.current ? Math.round(scrollAnchor.current.offset) : null,
+        });
       });
       return;
     }
     if (wasPendingBottom) {
       pendingBottom.current = false;
-      scheduleScrollFrame(scrollToBottom);
+      scheduleScrollFrame(() => scrollToBottom("auto", "pending_bottom"));
     } else if (appended && followBottomRef.current) {
-      scheduleScrollFrame(() => scrollToBottom("smooth"));
+      scheduleScrollFrame(() => scrollToBottom("smooth", "follow_append"));
     } else if (appended && wasNearBottom) {
       setShowBottom(true);
     }
-  }, [items.length, itemKeys, layout.total, resetKey, scheduleScrollFrame, scrollToBottom, updateRange]);
+  }, [items.length, itemKeys, layout.offsets, layout.total, logScrollDiagnostic, resetKey, scheduleScrollFrame, scrollToBottom, updateRange]);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -300,9 +508,26 @@ export function VirtualChat({
       Math.max(0, el.scrollHeight - el.clientHeight),
     );
     if (Math.abs(nextTop - el.scrollTop) < 1) return;
+    const previousTop = el.scrollTop;
     el.scrollTop = nextTop;
     updateRange();
-  }, [items.length, itemKeys, layout, updateRange]);
+    const deltaTop = nextTop - previousTop;
+    if (Math.abs(deltaTop) >= SCROLL_ANCHOR_LOG_DELTA_PX) {
+      logScrollDiagnostic(
+        Math.abs(deltaTop) >= Math.max(SCROLL_ANCHOR_WARN_DELTA_PX, el.clientHeight) ? "warn" : "debug",
+        "chat.scroll.anchor_adjust",
+        null,
+        {
+          anchorKey: anchor.key,
+          anchorOffset: Math.round(anchor.offset),
+          anchorIndex: index,
+          previousTop: Math.round(previousTop),
+          nextTop: Math.round(nextTop),
+          deltaTop: Math.round(deltaTop),
+        },
+      );
+    }
+  }, [items.length, itemKeys, layout, logScrollDiagnostic, updateRange]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -331,6 +556,7 @@ export function VirtualChat({
       if (scrollRaf.current !== null) window.cancelAnimationFrame(scrollRaf.current);
       if (scrollSaveRaf.current !== null) window.cancelAnimationFrame(scrollSaveRaf.current);
       if (measureRaf.current !== null) window.cancelAnimationFrame(measureRaf.current);
+      if (scrollLog.current.idleTimer !== null) window.clearTimeout(scrollLog.current.idleTimer);
     };
   }, []);
 
@@ -347,7 +573,7 @@ export function VirtualChat({
       <div className="virtual-spacer" style={{ height: range.bottom }} />
       {items.length > 0 && (
         <div className="bottom-controls">
-          <button className="bottom-button" onClick={() => scrollToBottom("smooth")} disabled={!showBottom} title="Scroll to bottom">
+          <button className="bottom-button" onClick={() => scrollToBottom("smooth", "button")} disabled={!showBottom} title="Scroll to bottom">
             Bottom
           </button>
           <button
@@ -409,6 +635,30 @@ function writeFollowBottom(value: boolean) {
   } catch {
     return;
   }
+}
+
+function scrollMetrics(el: HTMLDivElement, snapshot: ScrollDiagnosticsSnapshot) {
+  const scrollTop = Math.max(0, Math.round(el.scrollTop));
+  const scrollHeight = Math.max(0, Math.round(el.scrollHeight));
+  const clientHeight = Math.max(0, Math.round(el.clientHeight));
+  const maxScrollTop = Math.max(0, scrollHeight - clientHeight);
+  const bottomGap = Math.max(0, Math.round(scrollHeight - el.scrollTop - el.clientHeight));
+  return {
+    itemCount: snapshot.itemCount,
+    hasOlder: snapshot.hasOlder,
+    hasNewer: snapshot.hasNewer,
+    range: snapshot.range,
+    renderedCount: Math.max(0, snapshot.range.end - snapshot.range.start),
+    layoutTotal: Math.round(snapshot.layoutTotal),
+    scrollTop,
+    scrollHeight,
+    clientHeight,
+    maxScrollTop,
+    bottomGap,
+    scrollRatio: maxScrollTop > 0 ? Math.round((scrollTop / maxScrollTop) * 1000) / 1000 : 1,
+    nearTopEdge: scrollTop < LOAD_EDGE_PX,
+    nearBottomEdge: bottomGap < LOAD_EDGE_PX,
+  };
 }
 
 function lowerBound(offsets: number[], value: number) {
