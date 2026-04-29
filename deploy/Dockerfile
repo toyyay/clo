@@ -7,7 +7,7 @@ COPY package.json bun.lock tsconfig.json ./
 RUN --mount=type=cache,target=/root/.bun/install/cache \
     bun install --frozen-lockfile
 
-COPY index.html ./
+COPY index.html manifest.webmanifest app-icon.svg ./
 COPY apps ./apps
 COPY packages ./packages
 
@@ -26,7 +26,7 @@ COPY package.json bun.lock tsconfig.json ./
 RUN --mount=type=cache,target=/root/.bun/install/cache \
     bun install --frozen-lockfile --production
 
-COPY server.ts index.html ./
+COPY server.ts index.html manifest.webmanifest app-icon.svg ./
 COPY apps ./apps
 COPY packages ./packages
 COPY --from=builder /app/dist ./dist

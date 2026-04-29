@@ -18,7 +18,7 @@ export function sameEntityList<T extends object>(current: T[], next: T[], keyOf:
 }
 
 export async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const response = await fetch(url, { cache: "no-store", ...init });
   if (!response.ok) throw new Error(await response.text());
   return (await response.json()) as T;
 }

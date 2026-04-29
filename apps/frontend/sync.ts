@@ -132,7 +132,7 @@ class ReadApiError extends Error {
 }
 
 async function readJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const response = await fetch(url, { cache: "no-store", ...init });
   if (!response.ok) throw new ReadApiError(url, response.status, await response.text());
   return (await response.json()) as T;
 }
@@ -198,6 +198,7 @@ async function fetchBatch(
     const metadataMode = metadataOnly ? metadataModeForCursor(metadataCursor) : undefined;
     const response = await fetch(READ_API_ENDPOINTS.sync, {
       method: "POST",
+      cache: "no-store",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ cursor, limitBytes, metadataOnly, metadataCursor, metadataMode, eventMode, backfillCursor, lookbackDays }),
       signal: controller.signal,

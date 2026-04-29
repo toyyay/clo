@@ -42,6 +42,7 @@ export type CacheStats = {
   indexedDb: Record<StoreName, number>;
   storageUsageBytes?: number;
   storageQuotaBytes?: number;
+  storagePersisted?: boolean;
   cacheNames: string[];
   serviceWorkers: number;
 };
@@ -597,6 +598,7 @@ export async function loadCacheStats(): Promise<CacheStats> {
     ),
   ) as Record<StoreName, number>;
   const estimate: StorageEstimate = navigator.storage?.estimate ? await navigator.storage.estimate().catch(() => ({})) : {};
+  const storagePersisted = navigator.storage?.persisted ? await navigator.storage.persisted().catch(() => undefined) : undefined;
   const cacheNames = "caches" in window ? await caches.keys().catch(() => []) : [];
   const registrations = navigator.serviceWorker?.getRegistrations
     ? await navigator.serviceWorker.getRegistrations().catch(() => [])
@@ -606,6 +608,7 @@ export async function loadCacheStats(): Promise<CacheStats> {
     indexedDb,
     storageUsageBytes: estimate.usage,
     storageQuotaBytes: estimate.quota,
+    storagePersisted,
     cacheNames,
     serviceWorkers: registrations.length,
   };
@@ -626,8 +629,9 @@ export async function resetIndexedDbCache() {
 export async function clearBrowserCaches() {
   if (!("caches" in window)) return 0;
   const names = await caches.keys();
-  await Promise.all(names.map((name) => caches.delete(name)));
-  return names.length;
+  const chatviewNames = names.filter((name) => name.startsWith("chatview-"));
+  await Promise.all(chatviewNames.map((name) => caches.delete(name)));
+  return chatviewNames.length;
 }
 
 export async function unregisterServiceWorkers() {

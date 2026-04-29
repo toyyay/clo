@@ -1,6 +1,7 @@
 import type { ReactElement } from "react";
 import type { AppSettingsInfo, SyncExclusionInfo, SyncExclusionKind } from "../../packages/shared/types";
 import type { CacheStats } from "./db";
+import type { ServiceWorkerStatus } from "./sw-client";
 
 function formatBytes(value?: number | null) {
   if (!value) return "0 B";
@@ -70,6 +71,35 @@ function openRouterSummary(settings: AppSettingsInfo | null) {
   return `${configured} / ${model} / ${reasoning}`;
 }
 
+function formatBuildVersion(value: string | null) {
+  if (!value) return "unknown";
+  return value === "unknown" ? value : value.slice(0, 8);
+}
+
+function serviceWorkerStatusLabel(status: ServiceWorkerStatus) {
+  if (!status.supported) return "missing";
+  if (status.lastError) return "error";
+  if (status.updateReady) return "ready";
+  if (status.installing) return "checking";
+  if (status.registered) return "ready";
+  return "checking";
+}
+
+function serviceWorkerSummary(status: ServiceWorkerStatus) {
+  if (!status.supported) return "Service workers are not supported in this browser";
+  if (status.lastError) return status.lastError;
+  if (status.updateReady) return "A new offline shell is ready to install";
+  if (status.installing) return "Installing offline shell";
+  if (status.registered) return "Offline shell is registered";
+  return "Waiting for browser registration";
+}
+
+function storagePersistenceLabel(cacheStats: CacheStats | null) {
+  if (cacheStats?.storagePersisted === true) return "persistent";
+  if (cacheStats?.storagePersisted === false) return "best effort";
+  return "unknown";
+}
+
 function ModalFrame({
   title,
   children,
@@ -106,9 +136,15 @@ export function SettingsModal({
   onCopy,
   onCreateToken,
   onCheckOpenRouter,
+  serviceWorker,
+  resetServiceWorkerUrl,
+  onCheckServiceWorkerUpdate,
+  onApplyServiceWorkerUpdate,
+  onResetOfflineShell,
+  onCopyResetServiceWorkerUrl,
+  onRequestPersistentStorage,
   onResetIndexedDb,
   onClearCaches,
-  onUnregisterServiceWorkers,
   onRestoreMutedSource,
   groupByProject,
   sidebarWidth,
@@ -128,9 +164,15 @@ export function SettingsModal({
   onCopy: (value: string) => void;
   onCreateToken: () => void;
   onCheckOpenRouter: () => void;
+  serviceWorker: ServiceWorkerStatus;
+  resetServiceWorkerUrl: string;
+  onCheckServiceWorkerUpdate: () => void;
+  onApplyServiceWorkerUpdate: () => void;
+  onResetOfflineShell: () => void;
+  onCopyResetServiceWorkerUrl: () => void;
+  onRequestPersistentStorage: () => void;
   onResetIndexedDb: () => void;
   onClearCaches: () => void;
-  onUnregisterServiceWorkers: () => void;
   onRestoreMutedSource: (id: string) => void;
   groupByProject: boolean;
   sidebarWidth: number;
@@ -202,6 +244,45 @@ export function SettingsModal({
                 <b>{formatDate(openRouter?.checkedAt)}</b>
               </div>
             </details>
+          </div>
+        </div>
+
+        <div className="settings-section">
+          <div className="section-title">Offline & Updates</div>
+          <div className={`service-status ${serviceWorkerStatusLabel(serviceWorker)}`}>
+            <span>{serviceWorkerStatusLabel(serviceWorker)}</span>
+            <b>
+              {serviceWorkerSummary(serviceWorker)}
+              <small>
+                active {formatBuildVersion(serviceWorker.activeVersion)} / waiting {formatBuildVersion(serviceWorker.waitingVersion)}
+                {serviceWorker.lastCheckAt ? ` / checked ${formatDate(serviceWorker.lastCheckAt)}` : ""}
+              </small>
+            </b>
+          </div>
+          <div className="kv-grid kv-grid-compact">
+            <span>Controlled</span>
+            <b>{serviceWorker.controlled ? "yes" : "not yet"}</b>
+            <span>Storage</span>
+            <b>{storagePersistenceLabel(cacheStats)}</b>
+            <span>Reset link</span>
+            <b>{resetServiceWorkerUrl}</b>
+          </div>
+          <div className="settings-actions">
+            <button className="icon-button" onClick={onCheckServiceWorkerUpdate} disabled={loading || !serviceWorker.supported}>
+              Check update
+            </button>
+            <button className="icon-button" onClick={onApplyServiceWorkerUpdate} disabled={loading || !serviceWorker.updateReady}>
+              Install update
+            </button>
+            <button className="icon-button" onClick={onRequestPersistentStorage} disabled={loading || !navigator.storage?.persist}>
+              Keep offline storage
+            </button>
+            <button className="icon-button" onClick={onCopyResetServiceWorkerUrl} disabled={loading}>
+              Copy reset link
+            </button>
+            <button className="icon-button" onClick={onResetOfflineShell} disabled={loading}>
+              Reset offline shell
+            </button>
           </div>
         </div>
 
@@ -299,6 +380,8 @@ export function SettingsModal({
             <b>{cacheStats?.cacheNames.length ?? 0}</b>
             <span>Service workers</span>
             <b>{cacheStats?.serviceWorkers ?? 0}</b>
+            <span>Persistence</span>
+            <b>{storagePersistenceLabel(cacheStats)}</b>
           </div>
           <div className="settings-actions">
             <button className="icon-button" onClick={onRefresh} disabled={loading}>
@@ -309,9 +392,6 @@ export function SettingsModal({
             </button>
             <button className="icon-button" onClick={onClearCaches} disabled={loading}>
               Clear caches
-            </button>
-            <button className="icon-button" onClick={onUnregisterServiceWorkers} disabled={loading}>
-              Reset service workers
             </button>
           </div>
         </div>

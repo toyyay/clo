@@ -86,6 +86,12 @@ const transcriptionConcurrency = envPositiveInteger(process.env, ["TRANSCRIPTION
 const webAuthCookie = "chatview_token";
 const webAuthCookieMaxAge = 60 * 60 * 24 * 30;
 const gitSha = process.env.GIT_SHA ?? "unknown";
+const APP_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#f7f8fa"/>
+  <path d="M128 136h256c35 0 64 29 64 64v112c0 35-29 64-64 64H244l-78 54c-11 8-26 0-26-13v-41h-12c-35 0-64-29-64-64V200c0-35 29-64 64-64z" fill="#20242c"/>
+  <path d="M149 210h214M149 258h168M149 306h226" stroke="#f7f8fa" stroke-width="28" stroke-linecap="round"/>
+</svg>
+`;
 const encoder = new TextEncoder();
 const STREAM_HEARTBEAT_MS = 5000;
 const streamClients = new Set<ReadableStreamDefaultController<Uint8Array>>();
@@ -160,6 +166,9 @@ Bun.serve<{ docIds: Set<string> }>({
   port,
   routes: withApiRequestLogging({
     "/": index,
+    "/service-worker.js": async (req: Request) => serviceWorkerResponse(req),
+    "/manifest.webmanifest": (req: Request) => webManifestResponse(req),
+    "/app-icon.svg": () => appIconResponse(),
     "/api/health": () => json({ ok: true, commit_sha: gitSha }),
     "/api/auth/status": (req: Request) => {
       const authenticated = isWebAuthorized(req);
@@ -705,11 +714,13 @@ function newRequestId() {
 }
 
 function json(value: unknown, status = 200, headers?: HeadersInit) {
-  return Response.json(value, { status, headers });
+  const nextHeaders = new Headers(headers);
+  if (!nextHeaders.has("cache-control")) nextHeaders.set("cache-control", "no-store");
+  return Response.json(value, { status, headers: nextHeaders });
 }
 
 function text(value: string, status = 200) {
-  return new Response(value, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
+  return new Response(value, { status, headers: { "cache-control": "no-store", "content-type": "text/plain; charset=utf-8" } });
 }
 
 class HttpError extends Error {
@@ -1134,6 +1145,57 @@ function requestOrigin(req: Request) {
   const proto = forwardedProto || url.protocol.replace(/:$/, "");
   const host = forwardedHost || req.headers.get("host") || url.host;
   return `${proto}://${host}`;
+}
+
+async function serviceWorkerResponse(req: Request) {
+  if (req.method !== "GET") return text("method not allowed", 405);
+  const source = await readFile(new URL("../frontend/service-worker.js", import.meta.url), "utf8");
+  const body = source.replaceAll("__CHATVIEW_BUILD_SHA__", gitSha);
+  return new Response(body, {
+    headers: {
+      "cache-control": "no-store, no-cache, must-revalidate",
+      "content-type": "application/javascript; charset=utf-8",
+      "service-worker-allowed": "/",
+    },
+  });
+}
+
+function webManifestResponse(req: Request) {
+  const origin = requestOrigin(req);
+  const body = {
+    id: "/",
+    name: "Chatview",
+    short_name: "Chatview",
+    description: "Local-first chat history viewer",
+    start_url: "/#/",
+    scope: "/",
+    display: "standalone",
+    background_color: "#f7f8fa",
+    theme_color: "#f7f8fa",
+    icons: [
+      {
+        src: new URL("/app-icon.svg", origin).pathname,
+        sizes: "any",
+        type: "image/svg+xml",
+        purpose: "any maskable",
+      },
+    ],
+  };
+  return new Response(`${JSON.stringify(body, null, 2)}\n`, {
+    headers: {
+      "cache-control": "no-cache",
+      "content-type": "application/manifest+json; charset=utf-8",
+    },
+  });
+}
+
+function appIconResponse() {
+  return new Response(APP_ICON_SVG, {
+    headers: {
+      "cache-control": "public, max-age=86400",
+      "content-type": "image/svg+xml; charset=utf-8",
+    },
+  });
 }
 
 function makeImportUrl(origin: string, path: string, token: string) {

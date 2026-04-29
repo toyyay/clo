@@ -40,7 +40,6 @@ import {
   pruneMutedSources,
   resetIndexedDbCache,
   setMeta,
-  unregisterServiceWorkers,
   type CacheStats,
   type SessionCacheStat,
 } from "./db";
@@ -91,6 +90,7 @@ import {
 } from "./sync";
 import { useAudioImports } from "./use-audio-imports";
 import { useSessionEventsCache } from "./use-session-events-cache";
+import { resetServiceWorkerUrl, useServiceWorkerLifecycle } from "./sw-client";
 import { useStartupCache } from "./use-startup-cache";
 import {
   docIdForSession,
@@ -179,6 +179,8 @@ export function App() {
   const settingsOpen = route.panel === "settings";
   const audioOpen = route.panel === "audio";
   const audio = useAudioImports({ isAuthenticated, audioOpen });
+  const serviceWorker = useServiceWorkerLifecycle();
+  const offlineShellResetUrl = useMemo(() => resetServiceWorkerUrl(), []);
   const activeId = active?.id ?? null;
   const events = eventState.sessionId === activeId ? eventState.events : [];
   const resolvedDisplayMode = interfacePrefs.displayMode === "auto" ? autoDisplayMode : interfacePrefs.displayMode;
@@ -863,7 +865,7 @@ export function App() {
     try {
       const count = await clearBrowserCaches();
       await refreshSettings();
-      setSettingsMessage(`Cleared ${count} browser caches`);
+      setSettingsMessage(`Cleared ${count} Chatview browser caches`);
     } catch (error) {
       setSettingsMessage(error instanceof Error ? error.message : "Could not clear caches");
     } finally {
@@ -871,19 +873,63 @@ export function App() {
     }
   }, [refreshSettings]);
 
-  const resetServiceWorkers = useCallback(async () => {
+  const checkServiceWorkerUpdate = useCallback(async () => {
     setSettingsBusy(true);
     setSettingsMessage("");
     try {
-      const count = await unregisterServiceWorkers();
+      await serviceWorker.checkForUpdate();
       await refreshSettings();
-      setSettingsMessage(`Unregistered ${count} service workers`);
+      setSettingsMessage("Offline update check complete");
     } catch (error) {
-      setSettingsMessage(error instanceof Error ? error.message : "Could not reset service workers");
+      setSettingsMessage(error instanceof Error ? error.message : "Could not check offline update");
+    } finally {
+      setSettingsBusy(false);
+    }
+  }, [refreshSettings, serviceWorker]);
+
+  const applyServiceWorkerUpdate = useCallback(async () => {
+    setSettingsBusy(true);
+    setSettingsMessage("Installing offline update");
+    try {
+      await serviceWorker.applyUpdate();
+    } catch (error) {
+      setSettingsMessage(error instanceof Error ? error.message : "Could not install offline update");
+      setSettingsBusy(false);
+    }
+  }, [serviceWorker]);
+
+  const requestPersistentStorage = useCallback(async () => {
+    setSettingsBusy(true);
+    setSettingsMessage("");
+    try {
+      if (!navigator.storage?.persist) {
+        setSettingsMessage("This browser does not support persistent storage requests");
+        return;
+      }
+      const persisted = await navigator.storage.persist();
+      await refreshSettings();
+      setSettingsMessage(persisted ? "Offline storage is persistent" : "Browser kept offline storage as best effort");
+    } catch (error) {
+      setSettingsMessage(error instanceof Error ? error.message : "Could not request persistent storage");
     } finally {
       setSettingsBusy(false);
     }
   }, [refreshSettings]);
+
+  const copyResetServiceWorkerLink = useCallback(() => {
+    void copyText(offlineShellResetUrl);
+  }, [copyText, offlineShellResetUrl]);
+
+  const resetOfflineShell = useCallback(async () => {
+    setSettingsBusy(true);
+    setSettingsMessage("Resetting offline shell");
+    try {
+      await serviceWorker.resetOfflineShell();
+    } catch (error) {
+      setSettingsMessage(error instanceof Error ? error.message : "Could not reset offline shell");
+      setSettingsBusy(false);
+    }
+  }, [serviceWorker]);
 
   const insertTranscriptIntoDraft = useCallback(
     (text: string) => {
@@ -2086,9 +2132,15 @@ export function App() {
           onCopy={copyText}
           onCreateToken={createImportToken}
           onCheckOpenRouter={checkOpenRouter}
+          serviceWorker={serviceWorker.status}
+          resetServiceWorkerUrl={offlineShellResetUrl}
+          onCheckServiceWorkerUpdate={checkServiceWorkerUpdate}
+          onApplyServiceWorkerUpdate={applyServiceWorkerUpdate}
+          onResetOfflineShell={resetOfflineShell}
+          onCopyResetServiceWorkerUrl={copyResetServiceWorkerLink}
+          onRequestPersistentStorage={requestPersistentStorage}
           onResetIndexedDb={resetIndexedDb}
           onClearCaches={clearCaches}
-          onUnregisterServiceWorkers={resetServiceWorkers}
           onRestoreMutedSource={restoreMuted}
           groupByProject={groupByProject}
           sidebarWidth={sidebarWidth}

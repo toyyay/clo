@@ -149,6 +149,15 @@ It writes `~/Library/LaunchAgents/com.chatview.agent.plist` and prints the `laun
 
 ## Offline UI
 
-The frontend is already IndexedDB-backed and works from cached data after the shell has loaded once. A prepared service worker lives at `apps/frontend/service-worker.js`, but the app does not register it yet.
+The frontend is IndexedDB-backed and renders cached data first. A root-scoped service worker is served at `/service-worker.js` and registered by the browser UI after the first app load.
 
-Service worker/PWA activation is intentionally deferred for now so normal web deploys remain simple during active staging development.
+The service worker only owns the app shell:
+
+- navigations use network-first HTML with a cached shell fallback;
+- static shell assets are cached under `chatview-shell-<GIT_SHA>`;
+- `/api/*`, `/clo/*`, auth, sync, streams, and WebSocket-adjacent requests stay network-only;
+- old `chatview-shell-*` caches are removed on activation.
+
+Updates are intentionally user-approved. When a new worker reaches the waiting state, Settings shows an update action; applying it sends `SKIP_WAITING` and reloads once on `controllerchange`. The emergency reset URL is `/?reset-sw=1`, which unregisters same-origin service workers, deletes `chatview-*` Cache API entries, removes the reset flag, and reloads.
+
+Offline data is still limited to what IndexedDB has already cached. Use Settings to check storage usage, request persistent offline storage when the browser supports it, and reset the offline shell without deleting IndexedDB chat data.
