@@ -73,7 +73,7 @@ function DisplayModeControl({ value, onChange }: { value: DisplayMode; onChange:
   const options: Array<{ value: DisplayMode; label: string }> = [
     { value: "auto", label: "Auto" },
     { value: "desktop", label: "Desktop" },
-    { value: "eink", label: "E-ink" },
+    { value: "eink", label: "Color e-ink" },
   ];
   return (
     <div className="prefs-mode" role="group" aria-label="Display mode">

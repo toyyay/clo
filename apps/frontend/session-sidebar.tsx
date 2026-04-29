@@ -27,6 +27,7 @@ const DEFAULT_PROJECT_LIMIT = 5;
 const PROJECT_LIMIT_STEP = 5;
 const DEFAULT_SESSION_LIMIT = 3;
 const SESSION_LIMIT_STEP = 10;
+const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"] as const;
 
 type TreePrefs = {
   open?: Record<string, boolean>;
@@ -205,7 +206,7 @@ export function SessionSidebar({
                                               title={`Mute ${title}`}
                                               aria-label={`Mute ${title}`}
                                             >
-                                              {formatBytes(bytes)}
+                                              <BytesLabel bytes={bytes} />
                                             </button>
                                             <button className="tree-main" onClick={() => onSelectSession(session)}>
                                               <span className="tree-label">{title}</span>
@@ -279,8 +280,9 @@ function FolderRow({
         <span className="tree-label">{label}</span>
         <span className="tree-meta">
           {archivedCount > 0 && <span className="archive-dot archived" title={`${archivedCount.toLocaleString()} archived`} />}
-          {formatBytes(bytes)} · {count.toLocaleString()}
-          {updatedAt ? ` · ${relativeActivityLabel(updatedAt, now)}` : ""}
+          <BytesLabel bytes={bytes} />
+          <span className="tree-count">{count.toLocaleString()}</span>
+          {updatedAt && <span className="tree-stamp">{relativeActivityLabel(updatedAt, now)}</span>}
         </span>
       </button>
       {onMute && (
@@ -393,16 +395,52 @@ function deviceTreeKey(session: SessionInfo) {
   return `device:agent:${session.agentId}`;
 }
 
+function BytesLabel({ bytes, className }: { bytes?: number | null; className?: string }) {
+  const formatted = formatBytes(bytes);
+  const classes = ["byte-label", className].filter(Boolean).join(" ");
+  return (
+    <span className={classes} title={formatted.title}>
+      <span className="byte-amount">{formatted.amount}</span>
+      <span className="byte-unit">{formatted.unit}</span>
+    </span>
+  );
+}
+
 function formatBytes(value?: number | null) {
-  if (!value) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
-  let size = value;
+  const bytes = typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
+  if (!bytes) return { amount: "0", unit: "B", title: "0 B" };
+  let size = bytes;
   let unit = 0;
-  while (size >= 1024 && unit < units.length - 1) {
+  while (size >= 1024 && unit < BYTE_UNITS.length - 1) {
     size /= 1024;
     unit += 1;
   }
-  return `${size.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+  if (unit === 1 && size >= 950) {
+    return {
+      amount: "1",
+      unit: "MB",
+      title: preciseByteLabel(size, unit),
+    };
+  }
+  return {
+    amount: compactByteAmount(size, unit),
+    unit: BYTE_UNITS[unit],
+    title: preciseByteLabel(size, unit),
+  };
+}
+
+function compactByteAmount(size: number, unit: number) {
+  if (unit === 0) return Math.round(size).toLocaleString();
+  if (unit === 1) {
+    if (size < 10) return Math.max(1, Math.round(size)).toLocaleString();
+    const step = size < 100 ? 10 : 100;
+    return Math.max(step, Math.round(size / step) * step).toLocaleString();
+  }
+  return Math.max(1, Math.round(size)).toLocaleString();
+}
+
+function preciseByteLabel(size: number, unit: number) {
+  return `${size.toLocaleString(undefined, { maximumFractionDigits: unit ? 1 : 0 })} ${BYTE_UNITS[unit]}`;
 }
 
 function compareDevices(a: DeviceNode, b: DeviceNode) {

@@ -10,6 +10,8 @@ html, body, #root { height: 100%; margin: 0; }
   --line: #c8cdd3;
   --accent: #0b66d0;
   --accent-soft: #e8f1ff;
+  --success: #2f9e66;
+  --project-accent: #0c7a5b;
   --danger: #c93f3f;
   --shadow: 0 10px 30px rgba(20, 25, 35, 0.08);
 }
@@ -23,6 +25,8 @@ html, body, #root { height: 100%; margin: 0; }
   --line: #303641;
   --accent: #7cb7ff;
   --accent-soft: #17304d;
+  --success: #72d391;
+  --project-accent: #80d3b1;
   --danger: #ff7676;
   --shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
 }
@@ -417,8 +421,8 @@ pre {
   height: 100%;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 6px 4px 6px 6px;
+  gap: 4px;
+  padding: 4px 0;
   overflow: hidden;
   background: var(--panel);
   border-right: 1px solid var(--line);
@@ -461,8 +465,9 @@ body.resizing-sidebar {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   flex-shrink: 0;
+  padding: 0 4px;
 }
 .sidebar-search > span {
   color: var(--muted);
@@ -582,63 +587,86 @@ body.resizing-sidebar {
 .session-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 0;
   min-height: 0;
   overflow-y: auto;
   padding-right: 0;
 }
 .tree-list {
-  gap: 1px;
+  gap: 0;
 }
 .tree-node {
   display: grid;
-  gap: 1px;
+  gap: 0;
   min-width: 0;
 }
 .tree-row {
+  position: relative;
   width: 100%;
   min-width: 0;
-  min-height: 30px;
+  min-height: 26px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
-  gap: 5px;
-  border-radius: 6px;
+  gap: 0;
+  border-top: 1px solid transparent;
+  border-radius: 0;
   color: var(--text);
   text-decoration: none;
 }
-.tree-row.level-0 { padding: 4px 3px 4px 5px; }
-.tree-row.level-1 { padding: 4px 3px 4px 17px; }
-.tree-row.level-2 { padding: 4px 3px 4px 29px; }
-.tree-row.level-3 { padding: 3px 2px 3px 60px; }
+.tree-row.level-0 { padding: 2px 3px 2px 5px; }
+.tree-row.level-1 { padding: 2px 3px 2px 14px; }
+.tree-row.level-2 { padding: 2px 3px 2px 23px; }
+.tree-row.level-3 { padding: 2px 4px 2px 48px; }
+.tree-list > .tree-node > .tree-folder.level-0 {
+  border-top-color: color-mix(in srgb, var(--line) 72%, transparent);
+}
+.tree-list > .tree-node:first-child > .tree-folder.level-0 {
+  border-top-color: transparent;
+}
+.tree-folder.level-1 {
+  border-top-color: color-mix(in srgb, var(--line) 34%, transparent);
+}
+.tree-folder.level-2 {
+  border-top-color: color-mix(in srgb, var(--line) 48%, transparent);
+}
 .tree-folder {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 700;
 }
 .tree-folder.open {
   color: var(--text);
 }
-.tree-row:hover,
-.tree-session.active {
-  background: var(--panel-2);
+.tree-folder.level-1 .tree-label {
+  color: color-mix(in srgb, var(--accent) 78%, var(--text));
+}
+.tree-folder.level-2 .tree-label {
+  color: color-mix(in srgb, var(--project-accent) 80%, var(--text));
+}
+.tree-row:hover {
+  background: color-mix(in srgb, var(--accent) 6%, var(--panel));
 }
 .tree-session.active {
-  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 13%, var(--panel));
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.tree-session.active {
+  color: color-mix(in srgb, var(--accent) 74%, var(--text));
   font-weight: 650;
 }
 .tree-main {
   min-width: 0;
-  min-height: 24px;
+  min-height: 22px;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
 }
 .tree-session {
   position: relative;
   grid-template-columns: minmax(0, 1fr) auto;
-  column-gap: 5px;
+  column-gap: 4px;
 }
 .tree-session .tree-main {
   grid-template-columns: minmax(0, 1fr);
@@ -648,14 +676,14 @@ body.resizing-sidebar {
   position: absolute;
   left: 4px;
   top: 50%;
-  width: 52px;
+  width: 39px;
   min-width: 0;
-  min-height: 22px;
-  padding: 1px 3px;
+  min-height: 18px;
+  padding: 1px 2px;
   transform: translateY(-50%);
-  border-radius: 5px;
+  border-radius: 4px;
   color: var(--muted);
-  font-size: 10.5px;
+  font-size: 10px;
   font-weight: 650;
   line-height: 1;
   overflow: hidden;
@@ -669,9 +697,13 @@ body.resizing-sidebar {
   outline: 1px solid var(--line);
 }
 .tree-action {
+  position: absolute;
+  top: 50%;
+  right: 3px;
+  transform: translateY(-50%);
   justify-self: end;
   min-height: 23px;
-  padding: 1px 7px;
+  padding: 1px 6px;
   border: 1px solid var(--line);
   border-radius: 5px;
   color: var(--muted);
@@ -688,10 +720,10 @@ body.resizing-sidebar {
   background: var(--panel);
 }
 .tree-chevron {
-  width: 10px;
+  width: 9px;
   color: var(--muted);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 11px;
+  font-size: 10px;
 }
 .tree-label {
   min-width: 0;
@@ -703,41 +735,76 @@ body.resizing-sidebar {
   display: -webkit-box;
   max-height: 2.34em;
   white-space: normal;
-  font-size: 13px;
+  font-size: calc(12.6px * var(--ui-font-scale));
   font-weight: 560;
-  line-height: 1.17;
+  line-height: 1.14;
   overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+}
+.byte-label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 1px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+.byte-amount {
+  font-weight: 750;
+}
+.byte-unit {
+  margin-left: 1px;
+  font-size: 0.72em;
+  font-weight: 750;
+  opacity: 0.7;
+}
+.tree-size .byte-label {
+  width: 100%;
+  justify-content: flex-end;
+}
+.tree-meta .byte-label {
+  color: color-mix(in srgb, var(--accent) 58%, var(--muted));
 }
 .tree-meta,
 .tree-time {
   display: inline-flex;
   align-items: center;
   justify-self: end;
-  gap: 5px;
+  gap: 4px;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 600;
   white-space: nowrap;
 }
+.tree-count,
+.tree-stamp {
+  font-variant-numeric: tabular-nums;
+}
 .tree-session .tree-time {
   align-self: center;
-  font-size: 10.5px;
+  min-width: 25px;
+  font-size: 10px;
+  text-align: right;
+}
+.tree-session.active .tree-label,
+.tree-session.active .tree-time,
+.tree-session.active .tree-size {
+  color: color-mix(in srgb, var(--accent) 82%, var(--text));
 }
 .tree-show-more {
-  min-height: 28px;
-  border-radius: 6px;
+  min-height: 24px;
+  border-radius: 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 650;
 }
 .tree-show-more:hover {
   color: var(--text);
   background: var(--panel-2);
 }
-.tree-show-more.level-2 { padding: 3px 6px 3px 48px; }
-.tree-show-more.level-3 { padding: 3px 6px 3px 60px; }
+.tree-show-more.level-2 { padding: 2px 6px 2px 42px; }
+.tree-show-more.level-3 { padding: 2px 6px 2px 48px; }
 .archive-dot {
   width: 7px;
   height: 7px;
@@ -747,7 +814,7 @@ body.resizing-sidebar {
   opacity: 0.55;
 }
 .archive-dot.active {
-  background: #2f9e66;
+  background: var(--success);
   opacity: 0.85;
 }
 .archive-dot.archived {
@@ -1727,17 +1794,17 @@ body.resizing-sidebar {
     z-index: 5;
     width: min(calc(100vw - 28px), var(--sidebar-width, 340px));
     max-width: calc(100vw - 28px);
-    gap: 5px;
-    padding: 5px 2px 5px 5px;
+    gap: 4px;
+    padding: 4px 0;
     box-shadow: var(--shadow);
   }
   .tree-row.level-0 { padding-right: 2px; }
   .tree-row.level-1 { padding-right: 2px; }
   .tree-row.level-2 { padding-right: 2px; }
-  .tree-row.level-3 { padding: 2px 1px 2px 55px; }
+  .tree-row.level-3 { padding: 2px 3px 2px 45px; }
   .tree-size {
-    left: 2px;
-    width: 49px;
+    left: 4px;
+    width: 37px;
   }
   .tree-session {
     column-gap: 4px;
@@ -1850,13 +1917,15 @@ body.resizing-sidebar {
   color-scheme: light;
   --bg: #fbfbf8;
   --panel: #ffffff;
-  --panel-2: #eeeeec;
+  --panel-2: #eef1f4;
   --text: #050505;
-  --muted: #242424;
-  --line: #565656;
-  --accent: #000000;
-  --accent-soft: #dededb;
-  --danger: #000000;
+  --muted: #3f4650;
+  --line: #9aa1aa;
+  --accent: #075ec2;
+  --accent-soft: #e5f0ff;
+  --success: #087443;
+  --project-accent: #0a7a5a;
+  --danger: #b42318;
   --shadow: none;
 }
 
@@ -1875,12 +1944,12 @@ body.resizing-sidebar {
 
 :root[data-display="eink"] .topbar {
   min-height: calc(40px * var(--ui-density));
-  border-bottom: 2px solid var(--text);
+  border-bottom: 1px solid var(--line);
 }
 
 :root[data-display="eink"] .chat-head,
 :root[data-display="eink"] .composer {
-  border-color: var(--text);
+  border-color: var(--line);
 }
 
 :root[data-display="eink"] .top-action-secondary {
@@ -1968,7 +2037,7 @@ body.resizing-sidebar {
 :root[data-display="eink"] .settings-range,
 :root[data-display="eink"] .composer textarea,
 :root[data-display="eink"] .send-button {
-  border-width: 2px;
+  border-width: 1px;
 }
 
 :root[data-display="eink"] .icon-button,
@@ -1990,12 +2059,12 @@ body.resizing-sidebar {
 :root[data-display="eink"] .prefs-mode button.active,
 :root[data-display="eink"] .follow-button.active {
   background: var(--accent-soft);
-  color: var(--text);
-  box-shadow: inset 0 0 0 1px var(--text);
+  color: color-mix(in srgb, var(--accent) 82%, var(--text));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 42%, var(--line));
 }
 
 :root[data-display="eink"] .sidebar {
-  border-right: 2px solid var(--text);
+  border-right: 1px solid var(--line);
   transition: none;
 }
 
@@ -2004,9 +2073,14 @@ body.resizing-sidebar {
 }
 
 :root[data-display="eink"] .tree-action {
-  opacity: 1;
+  opacity: 0;
   background: var(--panel);
   color: var(--text);
+}
+
+:root[data-display="eink"] .tree-row:hover .tree-action,
+:root[data-display="eink"] .tree-row:focus-within .tree-action {
+  opacity: 1;
 }
 
 :root[data-display="eink"] .tree-row:hover {
@@ -2015,24 +2089,27 @@ body.resizing-sidebar {
 
 :root[data-display="eink"] .tree-session.active {
   font-weight: 750;
-  box-shadow: inset 4px 0 0 var(--text);
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 :root[data-display="eink"] .archive-dot,
 :root[data-display="eink"] .sync-dot {
   opacity: 1;
-  outline: 1px solid var(--text);
+  outline: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
 }
 
 :root[data-display="eink"] .archive-dot.active,
 :root[data-display="eink"] .sync-dot.online {
-  background: #0f6b3a;
+  background: var(--success);
 }
 
 :root[data-display="eink"] .archive-dot.archived,
-:root[data-display="eink"] .sync-dot.offline,
+:root[data-display="eink"] .sync-dot.offline {
+  background: var(--muted);
+}
+
 :root[data-display="eink"] .sync-dot.error {
-  background: var(--text);
+  background: var(--danger);
 }
 
 :root[data-display="eink"] .chat-scroll {
