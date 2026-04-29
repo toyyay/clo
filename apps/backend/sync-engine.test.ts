@@ -299,6 +299,59 @@ describe("sync engine helpers", () => {
     expect(event.normalized.source).toEqual({ rawKind: "message<nul>item" });
   });
 
+  test("compacts oversized normalized events instead of rejecting the append", () => {
+    const result = validateAppendPayload({
+      agent,
+      source: {
+        provider: "codex",
+        sourcePath: "/Users/example/.codex/sessions/huge.jsonl",
+      },
+      chunks: [
+        {
+          chunkId: "chunk-huge-normalized",
+          events: [
+            {
+              eventUid: "event-huge",
+              eventType: "message",
+              role: "assistant",
+              sourceLineNo: 73,
+              sourceOffset: 122049,
+              normalized: {
+                kind: "message",
+                role: "assistant",
+                display: true,
+                parts: [{ kind: "text", text: "large normal transcript text ".repeat(6000) }],
+                source: { provider: "codex", lineNo: 73, byteOffset: 122049, rawKind: "agent_message" },
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const event = result.chunks[0].events[0];
+    expect(event.eventUid).toBe("event-huge");
+    expect(event.sourceLineNo).toBe(73);
+    expect(event.sourceOffset).toBe(122049);
+    expect(event.normalized).toMatchObject({
+      kind: "error",
+      role: "system",
+      display: false,
+      source: { provider: "codex", lineNo: 73, byteOffset: 122049, rawKind: "agent_message" },
+    });
+    expect(event.normalized.parts).toEqual([
+      {
+        kind: "event",
+        name: "normalized_too_large",
+        data: expect.objectContaining({
+          reason: "normalized_too_large",
+          maxBytes: syncEnginePolicy.requestLimits.normalizedEventBytes,
+          sourceGeneration: 1,
+        }),
+      },
+    ]);
+  });
+
   test("validation errors carry http status", () => {
     try {
       validateHelloPayload({ agent: {} });

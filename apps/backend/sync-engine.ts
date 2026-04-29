@@ -806,9 +806,9 @@ function normalizeAppendChunk(value: unknown, label: string, sourceGeneration: n
 function normalizeNormalizedEvent(value: unknown, label: string, sourceGeneration: number): NormalizedEventInput {
   const event = assertObject(value, label);
   const source = isPlainObject(event.source) ? event.source : {};
-  const normalized = limitMetadata(safeNormalizedEvent(event), `${label}.normalized`, syncEnginePolicy.requestLimits.normalizedEventBytes);
   const sourceOffset = optionalNonNegativeInteger(event.sourceOffset ?? event.offset ?? source.byteOffset ?? source.offset, `${label}.sourceOffset`);
   const sourceLineNo = optionalNonNegativeInteger(event.sourceLineNo ?? event.lineNo ?? source.lineNo, `${label}.sourceLineNo`);
+  const normalized = normalizedEventWithinLimit(event, label, sourceGeneration, sourceLineNo, sourceOffset);
   const contentSha256 = optionalSha256(event.contentSha256 ?? event.sha256) ?? sha256Hex(Buffer.from(JSON.stringify(normalized), "utf8"));
   return {
     eventUid:
@@ -828,6 +828,49 @@ function normalizeNormalizedEvent(value: unknown, label: string, sourceGeneratio
     },
     normalized,
   };
+}
+
+function normalizedEventWithinLimit(
+  event: Record<string, unknown>,
+  label: string,
+  sourceGeneration: number,
+  sourceLineNo: number | null,
+  sourceOffset: number | null,
+) {
+  const normalized = safeNormalizedEvent(event);
+  const bytes = Buffer.byteLength(JSON.stringify(normalized), "utf8");
+  if (bytes <= syncEnginePolicy.requestLimits.normalizedEventBytes) return normalized;
+
+  const source = isPlainObject(normalized.source) ? normalized.source : isPlainObject(event.source) ? event.source : undefined;
+  const safeSource: Record<string, unknown> = {};
+  if (source) copyAllowed(safeSource, source, ["provider", "sourcePath", "lineNo", "byteOffset", "rawType", "rawKind"]);
+  if (sourceLineNo != null) safeSource.lineNo = sourceLineNo;
+  if (sourceOffset != null) safeSource.byteOffset = sourceOffset;
+
+  return limitMetadata(
+    {
+      kind: "error",
+      role: "system",
+      display: false,
+      parts: [
+        {
+          kind: "event",
+          name: "normalized_too_large",
+          data: {
+            reason: "normalized_too_large",
+            message: `Normalized event exceeds ${syncEnginePolicy.requestLimits.normalizedEventBytes} bytes and was compacted`,
+            normalizedBytes: bytes,
+            maxBytes: syncEnginePolicy.requestLimits.normalizedEventBytes,
+            normalizedSha256: sha256Hex(Buffer.from(JSON.stringify(normalized), "utf8")),
+            sourceGeneration,
+          },
+        },
+      ],
+      ...(Object.keys(safeSource).length ? { source: redactMetadata(safeSource) } : {}),
+    },
+    `${label}.normalized.compacted`,
+    syncEnginePolicy.requestLimits.normalizedEventBytes,
+  );
 }
 
 function readRawChunk(chunk: Record<string, unknown>, label: string, options: NormalizeAppendOptions) {
