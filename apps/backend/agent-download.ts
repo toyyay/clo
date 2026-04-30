@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { envValue } from "../../packages/shared/env";
+import { attachmentContentDisposition } from "./http-headers";
 
 const DEFAULT_PUBLIC_URL = "https://clo.vf.lc";
 const EXECUTABLE_NAME = "chatview-agent";
@@ -38,7 +39,7 @@ export async function downloadAgentArchiveResponse(req: Request, agentToken: str
     status: 200,
     headers: {
       "content-type": "application/zip",
-      "content-disposition": `attachment; filename="${artifact.filename}"`,
+      "content-disposition": attachmentContentDisposition(artifact.filename) ?? "attachment",
       "cache-control": "private, no-store, max-age=0",
     },
   });

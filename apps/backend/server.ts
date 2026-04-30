@@ -59,6 +59,7 @@ import {
 } from "./v2-read-model";
 import { envFlag, envPositiveInteger, envValue } from "../../packages/shared/env";
 import { prepareDatabase, sql, toId, toNumber } from "./db";
+import { inlineContentDisposition, safeContentType } from "./http-headers";
 import { detectMedia, fileExtension, filenameFromContentDisposition } from "./media-detect";
 import {
   extractOpenRouterMessageContent,
@@ -67,6 +68,12 @@ import {
   parseJsonObjectLoose,
   validateStoredTranscript,
 } from "./openrouter-transcript";
+import {
+  sanitizeOptionalPostgresText,
+  sanitizePostgresJson,
+  sanitizePostgresRecord,
+  sanitizePostgresText,
+} from "./postgres-sanitize";
 
 const isProduction = process.env.NODE_ENV === "production";
 const port = Number(envValue(process.env, "PORT", "CHATVIEW_PORT") ?? 3737);
@@ -607,9 +614,11 @@ Bun.serve<{ docIds: Set<string> }>({
       }
 
       if (message.type === "update") {
+        const docId = normalizeYjsDocId(message.docId);
+        if (!docId) return;
         const update = fromBase64(message.update);
-        await mergeYjsUpdate(message.docId, update, message.sessionDbId);
-        broadcastYjsUpdate(message.docId, message.update, ws);
+        await mergeYjsUpdate(docId, update, message.sessionDbId);
+        broadcastYjsUpdate(docId, message.update, ws);
       }
     },
     close(ws) {
@@ -751,16 +760,15 @@ async function createSyncExclusion(req: Request): Promise<SyncExclusionInfo> {
     metadata?: unknown;
   };
   const kind = parseSyncExclusionKind(body.kind);
-  const targetId = typeof body.targetId === "string" ? body.targetId.trim() : "";
+  const targetId = typeof body.targetId === "string" ? sanitizePostgresText(body.targetId).trim() : "";
   if (!kind || !targetId) throw new HttpError(400, "invalid sync exclusion");
-  const label = typeof body.label === "string" && body.label.trim() ? body.label.trim().slice(0, 500) : null;
-  const metadata = body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
-    ? body.metadata as Record<string, unknown>
-    : {};
+  const rawLabel = typeof body.label === "string" ? sanitizePostgresText(body.label).trim() : "";
+  const label = rawLabel ? rawLabel.slice(0, 500) : null;
+  const metadata = sanitizePostgresRecord(body.metadata);
   const id = syncExclusionId(kind, targetId);
   const rows = await sql`
     insert into sync_exclusions (id, kind, target_id, label, metadata, restored_at)
-    values (${id}, ${kind}, ${targetId}, ${label}, ${JSON.stringify(metadata)}::jsonb, null)
+    values (${id}, ${kind}, ${targetId}, ${label}, ${metadata}::jsonb, null)
     on conflict (id) do update
     set label = excluded.label,
         metadata = excluded.metadata,
@@ -1340,10 +1348,11 @@ async function getImportedMediaFile(req: Request) {
   const row = rows[0];
   const bytes = await loadStoredBlob(row);
   const headers = new Headers({
-    "content-type": row.content_type || "application/octet-stream",
+    "content-type": safeContentType(row.content_type),
     "cache-control": "private, max-age=3600",
   });
-  if (row.filename) headers.set("content-disposition", `inline; filename="${String(row.filename).replace(/"/g, "")}"`);
+  const disposition = inlineContentDisposition(row.filename);
+  if (disposition) headers.set("content-disposition", disposition);
   return new Response(bytes, { headers });
 }
 
@@ -1532,15 +1541,15 @@ async function processAudioTranscription(transcriptionId: string) {
           source_format = ${row.detected_format ?? row.content_type ?? null},
           mp3_sha256 = ${sha256Hex(mp3)},
           mp3_bytes = ${mp3.length},
-          detected_language = ${transcript.detectedLanguage ?? null},
-          transcript = ${transcript}::jsonb,
+          detected_language = ${sanitizeOptionalPostgresText(transcript.detectedLanguage)},
+          transcript = ${sanitizePostgresJson(transcript)}::jsonb,
           error = null,
           completed_at = now(),
           updated_at = now()
       where id = ${transcriptionId}
     `;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = sanitizePostgresText(error instanceof Error ? error.message : String(error));
     await sql`
       update import_media_transcriptions
       set status = 'failed',
@@ -1672,7 +1681,7 @@ async function transcribeWithOpenRouter(input: OpenRouterTranscriptionRequest): 
     temperature: 0,
   };
 
-  const logRequestJson = redactAudioFromOpenRouterRequest(requestJson, input.mp3);
+  const logRequestJson = sanitizePostgresJson(redactAudioFromOpenRouterRequest(requestJson, input.mp3));
   const logRows = await sql`
     insert into openrouter_call_logs (
       media_id,
@@ -1703,20 +1712,21 @@ async function transcribeWithOpenRouter(input: OpenRouterTranscriptionRequest): 
       body: JSON.stringify(requestJson),
     });
     const bodyText = await response.text();
-    const responseJson = parseJsonObject(bodyText) ?? { raw: truncateForLog(bodyText, 20000) };
+    const responseJson = sanitizePostgresJson(parseJsonObject(bodyText) ?? { raw: truncateForLog(bodyText, 20000) });
+    const responseError = response.ok ? null : openRouterErrorMessage(responseJson, bodyText);
     const durationMs = Math.round(performance.now() - started);
 
     await sql`
       update openrouter_call_logs
       set response_status = ${response.status},
           response_json = ${responseJson}::jsonb,
-          error = ${response.ok ? null : openRouterErrorMessage(responseJson, bodyText)},
+          error = ${responseError},
           duration_ms = ${durationMs},
           completed_at = now()
       where id = ${logId}
     `;
 
-    if (!response.ok) throw new Error(`OpenRouter failed (${response.status}): ${openRouterErrorMessage(responseJson, bodyText)}`);
+    if (!response.ok) throw new Error(`OpenRouter failed (${response.status}): ${responseError}`);
     assertOpenRouterProcessedAudio(responseJson);
     const messageContent = extractOpenRouterMessageContent(responseJson);
     if (!messageContent) throw new Error("OpenRouter returned no message content");
@@ -1725,7 +1735,7 @@ async function transcribeWithOpenRouter(input: OpenRouterTranscriptionRequest): 
     validateStoredTranscript(transcript);
     return transcript;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = sanitizePostgresText(error instanceof Error ? error.message : String(error));
     await sql`
       update openrouter_call_logs
       set error = ${message},
@@ -1800,7 +1810,8 @@ function openRouterErrorMessage(responseJson: any, fallback: string) {
 }
 
 function truncateForLog(value: string, max: number) {
-  return value.length > max ? `${value.slice(0, max)}...` : value;
+  const sanitized = sanitizePostgresText(value);
+  return sanitized.length > max ? `${sanitized.slice(0, max)}...` : sanitized;
 }
 
 function readImportToken(req: Request, url: URL) {
@@ -1910,11 +1921,11 @@ async function createImportRequestLog(
       ${tokenId},
       ${tokenValue ? sha256Hex(Buffer.from(tokenValue, "utf8")) : null},
       ${req.method},
-      ${redactSensitiveUrl(url)},
-      ${url.pathname},
-      ${queryToJson(url, redactedQueryNames)}::jsonb,
-      ${headersToJson(req.headers)}::jsonb,
-      ${req.headers.get("content-type")},
+      ${sanitizePostgresText(redactSensitiveUrl(url))},
+      ${sanitizePostgresText(url.pathname)},
+      ${sanitizePostgresJson(queryToJson(url, redactedQueryNames))}::jsonb,
+      ${sanitizePostgresJson(headersToJson(req.headers))}::jsonb,
+      ${sanitizeOptionalPostgresText(req.headers.get("content-type"))},
       ${storedRequestBody},
       ${sha256Hex(rawBody)},
       ${rawBody.length}
@@ -1928,13 +1939,13 @@ async function finishImportResponse(requestId: unknown, payload: Record<string, 
   const body = Buffer.from(`${JSON.stringify(payload)}\n`, "utf8");
   const storedBody = importStoreBody ? body : Buffer.alloc(0);
   const headers = { "content-type": "application/json; charset=utf-8" };
-  const error = payload.ok === false ? String(payload.error ?? "request failed") : null;
+  const error = payload.ok === false ? sanitizePostgresText(String(payload.error ?? "request failed")) : null;
 
   await sql`
     update import_requests
     set
       response_status = ${status},
-      response_headers = ${headers}::jsonb,
+      response_headers = ${sanitizePostgresJson(headers)}::jsonb,
       response_body = ${storedBody},
       response_body_sha256 = ${sha256Hex(body)},
       response_body_bytes = ${body.length},
@@ -1959,6 +1970,10 @@ async function ingestImportMedia(req: Request, rawBody: Buffer, requestId: unkno
       ...candidate.metadata,
       ...detection.metadata,
     };
+    const storedMetadata = sanitizePostgresRecord(metadata);
+    const storedContentType = sanitizeOptionalPostgresText(candidate.contentType);
+    const storedFilename = sanitizeOptionalPostgresText(candidate.filename);
+    const storedDetectedFormat = sanitizePostgresText(detection.format);
     const mediaSha256 = sha256Hex(candidate.bytes);
     const storage = await storeBlob("import-media", mediaSha256, candidate.bytes);
     const mediaRows = await sql`
@@ -1981,11 +1996,11 @@ async function ingestImportMedia(req: Request, rawBody: Buffer, requestId: unkno
         ${storage.dbBytes},
         ${storage.storageKey},
         ${candidate.bytes.length},
-        ${candidate.contentType ?? null},
-        ${candidate.filename ?? null},
-        ${fileExtension(candidate.filename) ?? null},
-        ${detection.format},
-        ${metadata}::jsonb,
+        ${storedContentType},
+        ${storedFilename},
+        ${fileExtension(storedFilename ?? undefined) ?? null},
+        ${storedDetectedFormat},
+        ${storedMetadata}::jsonb,
         now()
       )
       on conflict (sha256) do update set
@@ -2019,10 +2034,10 @@ async function ingestImportMedia(req: Request, rawBody: Buffer, requestId: unkno
         ${candidate.partIndex},
         ${candidate.partName ?? null},
         ${candidate.sourceKind},
-        ${candidate.filename ?? null},
-        ${candidate.contentType ?? null},
+        ${storedFilename},
+        ${storedContentType},
         ${candidate.bytes.length},
-        ${metadata}::jsonb
+        ${storedMetadata}::jsonb
       )
       on conflict (request_id, part_index) do nothing
     `;
@@ -2035,7 +2050,7 @@ async function ingestImportMedia(req: Request, rawBody: Buffer, requestId: unkno
       contentType: media.content_type,
       filename: media.filename,
       detectedFormat: media.detected_format,
-      createdAt: typeof metadata.createdAt === "string" ? metadata.createdAt : null,
+      createdAt: typeof storedMetadata.createdAt === "string" ? storedMetadata.createdAt : null,
     });
 
     const transcription = await ensureAutoAudioTranscription(toId(media.id));
@@ -2071,14 +2086,14 @@ async function saveImportRequestParts(requestId: unknown, parts: ImportRequestPa
       values (
         ${requestId},
         ${part.partIndex},
-        ${part.partName ?? null},
-        ${part.sourceKind},
-        ${part.filename ?? null},
-        ${part.contentType ?? null},
+        ${sanitizeOptionalPostgresText(part.partName)},
+        ${sanitizePostgresText(part.sourceKind)},
+        ${sanitizeOptionalPostgresText(part.filename)},
+        ${sanitizeOptionalPostgresText(part.contentType)},
         ${part.sizeBytes},
         ${part.valueSha256 ?? null},
-        ${part.valueText ?? null},
-        ${part.metadata}::jsonb
+        ${sanitizeOptionalPostgresText(part.valueText)},
+        ${sanitizePostgresJson(part.metadata)}::jsonb
       )
     `;
   }
@@ -2309,7 +2324,8 @@ function pushBase64MediaCandidates(
 function headersToJson(headers: Headers) {
   const out: Record<string, string> = {};
   for (const [key, value] of headers.entries()) {
-    out[key] = redactedHeaderNames.has(key.toLowerCase()) ? "<redacted>" : value;
+    const safeKey = sanitizePostgresText(key);
+    out[safeKey] = redactedHeaderNames.has(key.toLowerCase()) ? "<redacted>" : sanitizePostgresText(value);
   }
   return out;
 }
@@ -2317,11 +2333,12 @@ function headersToJson(headers: Headers) {
 function queryToJson(url: URL, redactedKeys = new Set<string>()) {
   const out: Record<string, string | string[]> = {};
   for (const [key, value] of url.searchParams.entries()) {
-    const sanitizedValue = redactedKeys.has(key) ? "<redacted>" : value;
-    const current = out[key];
+    const sanitizedKey = sanitizePostgresText(key);
+    const sanitizedValue = redactedKeys.has(key) ? "<redacted>" : sanitizePostgresText(value);
+    const current = out[sanitizedKey];
     if (Array.isArray(current)) current.push(sanitizedValue);
-    else if (current !== undefined) out[key] = [current, sanitizedValue];
-    else out[key] = sanitizedValue;
+    else if (current !== undefined) out[sanitizedKey] = [current, sanitizedValue];
+    else out[sanitizedKey] = sanitizedValue;
   }
   return out;
 }
@@ -3194,6 +3211,7 @@ function mapSession(row: any): SessionInfo {
 }
 
 async function ingestBatch(body: IngestBatchRequest): Promise<IngestBatchResponse> {
+  body = sanitizePostgresJson(body) as IngestBatchRequest;
   validateBatch(body);
 
   let acceptedEvents = 0;
@@ -3385,24 +3403,25 @@ async function syncYjs(body: YjsSyncRequest): Promise<YjsSyncResponse> {
   const docs = [];
 
   for (const doc of body.docs.slice(0, 100)) {
-    if (!doc.docId || typeof doc.docId !== "string") throw new Error("invalid yjs doc id");
+    const docId = normalizeYjsDocId(doc.docId);
+    if (!docId) throw new Error("invalid yjs doc id");
 
     if (doc.update) {
       const update = fromBase64(doc.update);
-      await mergeYjsUpdate(doc.docId, update, doc.sessionDbId);
-      broadcastYjsUpdate(doc.docId, doc.update);
+      await mergeYjsUpdate(docId, update, doc.sessionDbId);
+      broadcastYjsUpdate(docId, doc.update);
     }
 
-    const stored = await readYjsDocument(doc.docId);
+    const stored = await readYjsDocument(docId);
     if (!stored) {
-      docs.push({ docId: doc.docId });
+      docs.push({ docId });
       continue;
     }
 
     const stateVector = doc.stateVector ? fromBase64(doc.stateVector) : null;
     const diff = stateVector ? Y.diffUpdate(stored.update, stateVector) : stored.update;
     docs.push({
-      docId: doc.docId,
+      docId,
       update: diff.length ? toBase64(diff) : undefined,
       updatedAt: stored.updatedAt,
     });
@@ -3598,18 +3617,26 @@ function publish(message: StreamMessage) {
 }
 
 function subscribeYjsSocket(ws: YjsWebSocket, docIds: string[]) {
+  if (!Array.isArray(docIds)) return;
   const current = docIdsBySocket.get(ws) ?? new Set<string>();
   for (const docId of docIds.slice(0, 100)) {
-    if (!docId) continue;
-    current.add(docId);
-    let sockets = yjsSocketsByDoc.get(docId);
+    const safeDocId = normalizeYjsDocId(docId);
+    if (!safeDocId) continue;
+    current.add(safeDocId);
+    let sockets = yjsSocketsByDoc.get(safeDocId);
     if (!sockets) {
       sockets = new Set();
-      yjsSocketsByDoc.set(docId, sockets);
+      yjsSocketsByDoc.set(safeDocId, sockets);
     }
     sockets.add(ws);
   }
   docIdsBySocket.set(ws, current);
+}
+
+function normalizeYjsDocId(value: unknown) {
+  if (typeof value !== "string") return null;
+  const docId = sanitizePostgresText(value).trim();
+  return docId && docId.length <= 500 ? docId : null;
 }
 
 function unsubscribeYjsSocket(ws: YjsWebSocket) {

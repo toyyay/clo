@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { envValue } from "../../packages/shared/env";
+import { inlineContentDisposition } from "./http-headers";
 
 const DEFAULT_PUBLIC_URL = "https://clo.vf.lc";
 const DEFAULT_UPDATE_TOKEN = "clo-home-update-v1";
@@ -182,7 +183,7 @@ function javascriptResponse(bytes: Uint8Array, filename: string) {
   return new Response(toArrayBuffer(bytes), {
     headers: {
       "content-type": "application/javascript; charset=utf-8",
-      "content-disposition": `inline; filename="${filename}"`,
+      "content-disposition": inlineContentDisposition(filename) ?? "inline",
       "cache-control": "private, no-store, max-age=0",
     },
   });

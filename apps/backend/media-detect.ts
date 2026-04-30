@@ -1,3 +1,5 @@
+import { sanitizePostgresText } from "./postgres-sanitize";
+
 export type MediaDetection = {
   kind: "audio";
   format: string;
@@ -28,9 +30,9 @@ export function detectMedia(bytes: Uint8Array, contentType?: string, filename?: 
 export function filenameFromContentDisposition(value: string | null) {
   if (!value) return undefined;
   const utf8 = value.match(/filename\*=UTF-8''([^;]+)/i);
-  if (utf8) return decodeURIComponent(utf8[1].trim().replace(/^"|"$/g, ""));
+  if (utf8) return cleanHeaderFilename(decodeURIComponentSafe(utf8[1].trim().replace(/^"|"$/g, "")));
   const ascii = value.match(/filename="?([^";]+)"?/i);
-  return ascii?.[1];
+  return cleanHeaderFilename(ascii?.[1]);
 }
 
 export function fileExtension(filename?: string) {
@@ -186,4 +188,17 @@ function startsWithAscii(bytes: Uint8Array, offset: number, value: string) {
     if (bytes[offset + i] !== value.charCodeAt(i)) return false;
   }
   return true;
+}
+
+function decodeURIComponentSafe(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function cleanHeaderFilename(value?: string) {
+  const clean = value ? sanitizePostgresText(value).trim() : "";
+  return clean || undefined;
 }

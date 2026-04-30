@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, normalize } from "node:path";
 import { envValue } from "../../packages/shared/env";
+import { sanitizePostgresText } from "./postgres-sanitize";
 
 export const syncEnginePolicy = {
   protocol: "agent-v1",
@@ -1374,7 +1375,7 @@ function redactValue(value: unknown, path: string, seen: Set<object>): unknown {
 }
 
 function sanitizePostgresString(value: string) {
-  return value.replace(/\u0000/g, "<nul>");
+  return sanitizePostgresText(value);
 }
 
 function sha256Hex(bytes: Uint8Array) {

@@ -1,4 +1,5 @@
 import type { AudioTranscriptPayload } from "../../packages/shared/types";
+import { sanitizePostgresText } from "./postgres-sanitize";
 
 export function parseJsonObject(raw: string): any | null {
   try {
@@ -35,8 +36,8 @@ export function normalizeStoredTranscript(value: unknown): AudioTranscriptPayloa
   const raw = typeof value === "string" ? parseJsonObjectLoose(value) : value;
   const object = raw && typeof raw === "object" ? (raw as Record<string, any>) : {};
   return {
-    detectedLanguage: typeof object.detectedLanguage === "string" ? object.detectedLanguage : null,
-    detectedLanguageName: typeof object.detectedLanguageName === "string" ? object.detectedLanguageName : null,
+    detectedLanguage: typeof object.detectedLanguage === "string" ? sanitizePostgresText(object.detectedLanguage) : null,
+    detectedLanguageName: typeof object.detectedLanguageName === "string" ? sanitizePostgresText(object.detectedLanguageName) : null,
     ru: normalizeTranscriptLevel(object.ru),
     en: normalizeTranscriptLevel(object.en),
   };
@@ -70,9 +71,9 @@ function stripJsonCodeFence(raw: string) {
 function normalizeTranscriptLevel(value: unknown) {
   const object = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
   return {
-    literal: typeof object.literal === "string" ? object.literal : "",
-    clean: typeof object.clean === "string" ? object.clean : "",
-    summary: typeof object.summary === "string" ? object.summary : "",
-    brief: typeof object.brief === "string" ? object.brief : "",
+    literal: typeof object.literal === "string" ? sanitizePostgresText(object.literal) : "",
+    clean: typeof object.clean === "string" ? sanitizePostgresText(object.clean) : "",
+    summary: typeof object.summary === "string" ? sanitizePostgresText(object.summary) : "",
+    brief: typeof object.brief === "string" ? sanitizePostgresText(object.brief) : "",
   };
 }
