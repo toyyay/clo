@@ -285,6 +285,9 @@ export function App() {
         "--ui-font-scale": String(interfacePrefs.uiScale),
         "--ui-density": String(interfacePrefs.density),
         "--chat-font-scale": String(interfacePrefs.chatScale),
+        "--chat-line-height": String(chatLineHeight(interfacePrefs.density)),
+        "--chat-code-line-height": String(chatCodeLineHeight(interfacePrefs.density)),
+        "--chat-block-gap": `${chatBlockGap(interfacePrefs.density)}px`,
         "--chat-line-width": `${effectiveChatWidth(interfacePrefs, resolvedDisplayMode)}px`,
       }) as CSSProperties,
     [interfacePrefs, resolvedDisplayMode, sidebarWidth],
@@ -2326,7 +2329,27 @@ function estimateChatHeightScale(current: InterfacePrefs, next: InterfacePrefs) 
   const textRatio = nextText / currentText;
   const densityRatio = Math.max(0.1, next.density) / Math.max(0.1, current.density);
   const widthRatio = Math.max(0.1, current.chatWidth) / Math.max(0.1, next.chatWidth);
-  return Math.min(1.8, Math.max(0.5, textRatio * 0.68 + densityRatio * 0.14 + widthRatio * 0.18));
+  return Math.min(1.8, Math.max(0.5, textRatio * 0.62 + densityRatio * 0.2 + widthRatio * 0.18));
+}
+
+function chatLineHeight(density: number) {
+  return roundCssNumber(1.1 + clampNumber(density, 0.62, 1.22) * 0.4);
+}
+
+function chatCodeLineHeight(density: number) {
+  return roundCssNumber(1.05 + clampNumber(density, 0.62, 1.22) * 0.35);
+}
+
+function chatBlockGap(density: number) {
+  return Math.round(10 * clampNumber(density, 0.62, 1.22));
+}
+
+function roundCssNumber(value: number) {
+  return Number(value.toFixed(3));
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function mergeSyncOptions(current: SyncNowOptions | null, next: SyncNowOptions): SyncNowOptions {

@@ -781,7 +781,7 @@ function saveChatScroll(resetKey: string, el: HTMLDivElement) {
       top: Math.max(0, Math.round(el.scrollTop)),
       nearBottom: bottomGap < 160,
     };
-    sessionStorage.setItem(`${SCROLL_STORAGE_PREFIX}${resetKey}`, JSON.stringify(payload));
+    localStorage.setItem(`${SCROLL_STORAGE_PREFIX}${resetKey}`, JSON.stringify(payload));
   } catch {
     return;
   }
@@ -789,8 +789,16 @@ function saveChatScroll(resetKey: string, el: HTMLDivElement) {
 
 function loadChatScroll(resetKey: string): SavedScroll | null {
   try {
-    const raw = sessionStorage.getItem(`${SCROLL_STORAGE_PREFIX}${resetKey}`);
+    const key = `${SCROLL_STORAGE_PREFIX}${resetKey}`;
+    const raw = localStorage.getItem(key) ?? sessionStorage.getItem(key);
     if (raw === null) return null;
+    if (localStorage.getItem(key) === null) {
+      try {
+        localStorage.setItem(key, raw);
+      } catch {
+        // Scroll restore can still use the session value even if persistent storage is unavailable.
+      }
+    }
     if (/^\d+$/.test(raw)) {
       const top = Number(raw);
       return Number.isFinite(top) ? { top, nearBottom: false } : null;
