@@ -4,6 +4,10 @@ html, body { overflow: hidden; }
 :root {
   color-scheme: light;
   --app-viewport-height: 100vh;
+  --app-viewport-width: 100vw;
+  --app-viewport-offset-top: 0px;
+  --app-viewport-offset-left: 0px;
+  --app-keyboard-inset: 0px;
   --app-safe-top: env(safe-area-inset-top, 0px);
   --app-safe-bottom: env(safe-area-inset-bottom, 0px);
   --bg: #f5f6f7;
@@ -134,20 +138,40 @@ pre {
 }
 .build-badge {
   position: fixed;
-  top: calc(var(--topbar-height) + 4px);
-  right: 10px;
-  z-index: 5;
-  max-width: calc(100vw - 20px);
-  padding: 1px 4px;
-  color: color-mix(in srgb, var(--muted) 76%, transparent);
+  top: calc(var(--app-safe-top) + 5px);
+  left: 50%;
+  z-index: 6;
+  max-width: min(calc(var(--app-viewport-width) - 20px), 280px);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transform: translateX(-50%);
+  color: color-mix(in srgb, var(--muted) 82%, transparent);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 10px;
   line-height: 1.2;
   letter-spacing: 0;
-  opacity: 0.68;
-  pointer-events: none;
+  opacity: 0.86;
   user-select: none;
   -webkit-user-select: none;
+}
+.build-badge-code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--panel) 78%, transparent);
+}
+.build-update-button {
+  min-height: 20px;
+  padding: 1px 5px 2px;
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--line));
+  border-radius: 5px;
+  background: var(--panel);
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 1.1;
+  text-align: center;
+  white-space: nowrap;
 }
 .topbar {
   z-index: 4;
@@ -1954,6 +1978,31 @@ body.resizing-sidebar {
   .kv-grid {
     grid-template-columns: minmax(88px, auto) minmax(0, 1fr);
   }
+
+  :root[data-keyboard="open"] .app-shell {
+    --topbar-height: calc(34px * var(--ui-density) + var(--app-safe-top));
+  }
+
+  :root[data-keyboard="open"] .topbar {
+    padding: calc(3px * var(--ui-density) + var(--app-safe-top)) calc(5px * var(--ui-density)) calc(3px * var(--ui-density));
+  }
+
+  :root[data-keyboard="open"] .brand {
+    display: none;
+  }
+
+  :root[data-keyboard="open"] .chat-head {
+    display: none;
+  }
+
+  :root[data-keyboard="open"] .chat-scroll {
+    padding-bottom: calc(3px * var(--ui-density));
+  }
+
+  :root[data-keyboard="open"] .composer textarea {
+    min-height: 34px;
+    max-height: min(92px, calc(var(--app-viewport-height) * 0.32));
+  }
 }
 
 :root[data-display="eink"],
@@ -2259,5 +2308,9 @@ body.resizing-sidebar {
   :root[data-display="eink"] .sidebar,
   :root[data-display="eink"] .sidebar-backdrop {
     inset-block-start: var(--topbar-height);
+  }
+
+  :root[data-display="eink"][data-keyboard="open"] .topbar {
+    min-height: var(--topbar-height);
   }
 }

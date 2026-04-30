@@ -181,6 +181,7 @@ export function App() {
   const audio = useAudioImports({ isAuthenticated, audioOpen });
   const serviceWorker = useServiceWorkerLifecycle();
   const offlineShellResetUrl = useMemo(() => resetServiceWorkerUrl(), []);
+  const displayedBuildSha = serviceWorker.status.activeVersion ?? buildSha;
   const activeId = active?.id ?? null;
   const events = eventState.sessionId === activeId ? eventState.events : [];
   const resolvedDisplayMode = interfacePrefs.displayMode === "auto" ? autoDisplayMode : interfacePrefs.displayMode;
@@ -896,6 +897,13 @@ export function App() {
       setSettingsMessage(error instanceof Error ? error.message : "Could not install offline update");
       setSettingsBusy(false);
     }
+  }, [serviceWorker]);
+
+  const applyVisibleServiceWorkerUpdate = useCallback(() => {
+    void serviceWorker.applyUpdate().catch((error) => {
+      setSettingsMessage(error instanceof Error ? error.message : "Could not install offline update");
+      console.error(error);
+    });
   }, [serviceWorker]);
 
   const requestPersistentStorage = useCallback(async () => {
@@ -1757,22 +1765,54 @@ export function App() {
   }, [resolvedDisplayMode]);
 
   useEffect(() => {
-    const updateViewportHeight = () => {
-      const height = window.visualViewport?.height ?? window.innerHeight;
+    let raf: number | null = null;
+    let textInputFocused = isEditableElement(document.activeElement);
+    const updateViewport = () => {
+      raf = null;
+      textInputFocused = isEditableElement(document.activeElement);
+      const viewport = window.visualViewport;
+      const layoutHeight = window.innerHeight;
+      const layoutWidth = window.innerWidth;
+      const height = viewport?.height ?? layoutHeight;
+      const width = viewport?.width ?? layoutWidth;
+      const offsetTop = viewport?.offsetTop ?? 0;
+      const offsetLeft = viewport?.offsetLeft ?? 0;
+      const hiddenBottom = viewport ? Math.max(0, layoutHeight - height - offsetTop) : 0;
+      const touchMobileFocused =
+        textInputFocused && window.matchMedia("(max-width: 780px)").matches && window.matchMedia("(hover: none), (pointer: coarse)").matches;
+      const keyboardOpen = hiddenBottom >= Math.max(80, layoutHeight * 0.18) || touchMobileFocused;
+      const root = document.documentElement;
       if (Number.isFinite(height) && height > 0) {
-        document.documentElement.style.setProperty("--app-viewport-height", `${Math.round(height)}px`);
+        root.style.setProperty("--app-viewport-height", `${Math.round(height)}px`);
       }
+      if (Number.isFinite(width) && width > 0) root.style.setProperty("--app-viewport-width", `${Math.round(width)}px`);
+      root.style.setProperty("--app-viewport-offset-top", `${Math.round(offsetTop)}px`);
+      root.style.setProperty("--app-viewport-offset-left", `${Math.round(offsetLeft)}px`);
+      root.style.setProperty("--app-keyboard-inset", `${Math.round(hiddenBottom)}px`);
+      root.dataset.keyboard = keyboardOpen ? "open" : "closed";
     };
-    updateViewportHeight();
-    window.addEventListener("resize", updateViewportHeight);
-    window.addEventListener("orientationchange", updateViewportHeight);
-    window.visualViewport?.addEventListener("resize", updateViewportHeight);
-    window.visualViewport?.addEventListener("scroll", updateViewportHeight);
+    const scheduleViewportUpdate = () => {
+      if (raf !== null) return;
+      raf = window.requestAnimationFrame(updateViewport);
+    };
+    const updateFocusState = () => {
+      scheduleViewportUpdate();
+    };
+    updateViewport();
+    window.addEventListener("resize", scheduleViewportUpdate);
+    window.addEventListener("orientationchange", scheduleViewportUpdate);
+    window.addEventListener("focusin", updateFocusState);
+    window.addEventListener("focusout", updateFocusState);
+    window.visualViewport?.addEventListener("resize", scheduleViewportUpdate);
+    window.visualViewport?.addEventListener("scroll", scheduleViewportUpdate);
     return () => {
-      window.removeEventListener("resize", updateViewportHeight);
-      window.removeEventListener("orientationchange", updateViewportHeight);
-      window.visualViewport?.removeEventListener("resize", updateViewportHeight);
-      window.visualViewport?.removeEventListener("scroll", updateViewportHeight);
+      if (raf !== null) window.cancelAnimationFrame(raf);
+      window.removeEventListener("resize", scheduleViewportUpdate);
+      window.removeEventListener("orientationchange", scheduleViewportUpdate);
+      window.removeEventListener("focusin", updateFocusState);
+      window.removeEventListener("focusout", updateFocusState);
+      window.visualViewport?.removeEventListener("resize", scheduleViewportUpdate);
+      window.visualViewport?.removeEventListener("scroll", scheduleViewportUpdate);
     };
   }, []);
 
@@ -2073,14 +2113,14 @@ export function App() {
           onTokenChange={setAuthToken}
           onLogin={login}
         />
-        <BuildBadge sha={buildSha} />
+        <BuildBadge sha={displayedBuildSha} updateReady={serviceWorker.status.updateReady} onUpdate={applyVisibleServiceWorkerUpdate} />
       </>
     );
   }
 
   return (
     <div className={`app-shell display-${resolvedDisplayMode} ${sidebarOpen ? "" : "sidebar-closed"}`} style={appShellStyle}>
-      <BuildBadge sha={buildSha} />
+      <BuildBadge sha={displayedBuildSha} updateReady={serviceWorker.status.updateReady} onUpdate={applyVisibleServiceWorkerUpdate} />
       <Topbar
         active={active}
         syncState={syncState}
@@ -2197,10 +2237,19 @@ export function App() {
   );
 }
 
-function BuildBadge({ sha }: { sha: string | null }) {
+function BuildBadge({ sha, updateReady, onUpdate }: { sha: string | null; updateReady?: boolean; onUpdate?: () => void }) {
   const shortSha = formatBuildSha(sha);
-  if (!shortSha) return null;
-  return <div className="build-badge" aria-hidden="true">{`build ${shortSha}`}</div>;
+  if (!shortSha && !updateReady) return null;
+  return (
+    <div className="build-badge" aria-label={shortSha ? `Build ${shortSha}` : "Build status"}>
+      {shortSha && <span className="build-badge-code">{shortSha}</span>}
+      {updateReady && onUpdate && (
+        <button type="button" className="build-update-button" onClick={onUpdate}>
+          обновить
+        </button>
+      )}
+    </div>
+  );
 }
 
 function mutedSessionMatcher(exclusions: SyncExclusionInfo[]) {
@@ -2259,7 +2308,16 @@ function numberMetadata(value: unknown) {
 function formatBuildSha(sha: string | null) {
   const clean = sha?.trim();
   if (!clean || clean === "unknown") return null;
-  return clean.slice(0, 8);
+  return clean.slice(0, 4);
+}
+
+function isEditableElement(element: Element | null) {
+  if (!(element instanceof HTMLElement)) return false;
+  if (element instanceof HTMLTextAreaElement) return true;
+  if (element instanceof HTMLInputElement) {
+    return !["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"].includes(element.type);
+  }
+  return element.isContentEditable;
 }
 
 function estimateChatHeightScale(current: InterfacePrefs, next: InterfacePrefs) {

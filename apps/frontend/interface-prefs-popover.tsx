@@ -1,4 +1,4 @@
-import type { DisplayMode, InterfacePrefs } from "./storage-prefs";
+import { INTERFACE_PREF_LIMITS, type DisplayMode, type InterfacePrefs } from "./storage-prefs";
 
 type InterfacePrefsPopoverProps = {
   open: boolean;
@@ -29,36 +29,36 @@ export function InterfacePrefsPopover({ open, prefs, onToggle, onClose, onChange
             <RangeControl
               label="Interface"
               value={prefs.uiScale}
-              min={0.88}
-              max={1.22}
-              step={0.01}
+              min={INTERFACE_PREF_LIMITS.uiScale.min}
+              max={INTERFACE_PREF_LIMITS.uiScale.max}
+              step={INTERFACE_PREF_LIMITS.uiScale.step}
               display={`${Math.round(prefs.uiScale * 100)}%`}
               onChange={(uiScale) => onChange({ uiScale })}
             />
             <RangeControl
               label="Chat text"
               value={prefs.chatScale}
-              min={0.9}
-              max={1.36}
-              step={0.01}
+              min={INTERFACE_PREF_LIMITS.chatScale.min}
+              max={INTERFACE_PREF_LIMITS.chatScale.max}
+              step={INTERFACE_PREF_LIMITS.chatScale.step}
               display={`${Math.round(prefs.chatScale * 100)}%`}
               onChange={(chatScale) => onChange({ chatScale })}
             />
             <RangeControl
               label="Spacing"
               value={prefs.density}
-              min={0.82}
-              max={1.22}
-              step={0.01}
+              min={INTERFACE_PREF_LIMITS.density.min}
+              max={INTERFACE_PREF_LIMITS.density.max}
+              step={INTERFACE_PREF_LIMITS.density.step}
               display={`${Math.round(prefs.density * 100)}%`}
               onChange={(density) => onChange({ density })}
             />
             <RangeControl
               label="Line width"
               value={prefs.chatWidth}
-              min={560}
-              max={1120}
-              step={20}
+              min={INTERFACE_PREF_LIMITS.chatWidth.min}
+              max={INTERFACE_PREF_LIMITS.chatWidth.max}
+              step={INTERFACE_PREF_LIMITS.chatWidth.step}
               display={`${prefs.chatWidth}px`}
               onChange={(chatWidth) => onChange({ chatWidth })}
             />

@@ -35,6 +35,12 @@ export const DEFAULT_INTERFACE_PREFS: InterfacePrefs = {
 
 export const EINK_CHAT_WIDTH_DEFAULT = 760;
 export const EINK_CHAT_WIDTH_MAX = 860;
+export const INTERFACE_PREF_LIMITS = {
+  uiScale: { min: 0.72, max: 1.22, step: 0.01 },
+  chatScale: { min: 0.72, max: 1.36, step: 0.01 },
+  density: { min: 0.62, max: 1.22, step: 0.01 },
+  chatWidth: { min: 320, max: 1120, step: 20 },
+} as const;
 
 export function readLocalStorageString(key: string, fallback: string) {
   try {
@@ -62,10 +68,12 @@ export function readLocalStorageBoolean(key: string, fallback: boolean) {
 export function clampInterfacePrefs(value: Partial<InterfacePrefs>): InterfacePrefs {
   return {
     displayMode: clampDisplayMode(value.displayMode),
-    uiScale: clampNumber(value.uiScale, 0.88, 1.22, DEFAULT_INTERFACE_PREFS.uiScale),
-    chatScale: clampNumber(value.chatScale, 0.9, 1.36, DEFAULT_INTERFACE_PREFS.chatScale),
-    density: clampNumber(value.density, 0.82, 1.22, DEFAULT_INTERFACE_PREFS.density),
-    chatWidth: Math.round(clampNumber(value.chatWidth, 560, 1120, DEFAULT_INTERFACE_PREFS.chatWidth)),
+    uiScale: clampNumber(value.uiScale, INTERFACE_PREF_LIMITS.uiScale.min, INTERFACE_PREF_LIMITS.uiScale.max, DEFAULT_INTERFACE_PREFS.uiScale),
+    chatScale: clampNumber(value.chatScale, INTERFACE_PREF_LIMITS.chatScale.min, INTERFACE_PREF_LIMITS.chatScale.max, DEFAULT_INTERFACE_PREFS.chatScale),
+    density: clampNumber(value.density, INTERFACE_PREF_LIMITS.density.min, INTERFACE_PREF_LIMITS.density.max, DEFAULT_INTERFACE_PREFS.density),
+    chatWidth: Math.round(
+      clampNumber(value.chatWidth, INTERFACE_PREF_LIMITS.chatWidth.min, INTERFACE_PREF_LIMITS.chatWidth.max, DEFAULT_INTERFACE_PREFS.chatWidth),
+    ),
   };
 }
 

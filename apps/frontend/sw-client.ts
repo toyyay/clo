@@ -104,6 +104,22 @@ export function useServiceWorkerLifecycle() {
         registrationRef.current = registration;
         observeRegistration(registration, refreshStatus);
         await refreshStatus(registration, { registered: true, lastError: null });
+        registration
+          .update()
+          .then((updated) => {
+            if (disposed) return;
+            registrationRef.current = updated;
+            lastAutoCheckAt.current = Date.now();
+            void refreshStatus(updated, { lastCheckAt: new Date().toISOString(), lastError: null });
+          })
+          .catch((error) => {
+            if (disposed) return;
+            setStatus((current) => ({
+              ...current,
+              lastCheckAt: new Date().toISOString(),
+              lastError: error instanceof Error ? error.message : "Could not check for update",
+            }));
+          });
       } catch (error) {
         if (!disposed) {
           setStatus((current) => ({
