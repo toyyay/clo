@@ -22,6 +22,7 @@ export type InterfacePrefs = {
   uiScale: number;
   chatScale: number;
   density: number;
+  lineHeight: number;
   chatWidth: number;
 };
 
@@ -30,6 +31,7 @@ export const DEFAULT_INTERFACE_PREFS: InterfacePrefs = {
   uiScale: 1,
   chatScale: 1,
   density: 1,
+  lineHeight: 1.5,
   chatWidth: 920,
 };
 
@@ -39,6 +41,7 @@ export const INTERFACE_PREF_LIMITS = {
   uiScale: { min: 0.72, max: 1.22, step: 0.01 },
   chatScale: { min: 0.72, max: 1.36, step: 0.01 },
   density: { min: 0.62, max: 1.22, step: 0.01 },
+  lineHeight: { min: 1.12, max: 1.72, step: 0.01 },
   chatWidth: { min: 320, max: 1120, step: 20 },
 } as const;
 
@@ -71,6 +74,12 @@ export function clampInterfacePrefs(value: Partial<InterfacePrefs>): InterfacePr
     uiScale: clampNumber(value.uiScale, INTERFACE_PREF_LIMITS.uiScale.min, INTERFACE_PREF_LIMITS.uiScale.max, DEFAULT_INTERFACE_PREFS.uiScale),
     chatScale: clampNumber(value.chatScale, INTERFACE_PREF_LIMITS.chatScale.min, INTERFACE_PREF_LIMITS.chatScale.max, DEFAULT_INTERFACE_PREFS.chatScale),
     density: clampNumber(value.density, INTERFACE_PREF_LIMITS.density.min, INTERFACE_PREF_LIMITS.density.max, DEFAULT_INTERFACE_PREFS.density),
+    lineHeight: clampNumber(
+      value.lineHeight,
+      INTERFACE_PREF_LIMITS.lineHeight.min,
+      INTERFACE_PREF_LIMITS.lineHeight.max,
+      DEFAULT_INTERFACE_PREFS.lineHeight,
+    ),
     chatWidth: Math.round(
       clampNumber(value.chatWidth, INTERFACE_PREF_LIMITS.chatWidth.min, INTERFACE_PREF_LIMITS.chatWidth.max, DEFAULT_INTERFACE_PREFS.chatWidth),
     ),

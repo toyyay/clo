@@ -217,6 +217,7 @@ export function App() {
         next.uiScale === current.uiScale &&
         next.chatScale === current.chatScale &&
         next.density === current.density &&
+        next.lineHeight === current.lineHeight &&
         next.chatWidth === current.chatWidth
       ) {
         return current;
@@ -285,8 +286,8 @@ export function App() {
         "--ui-font-scale": String(interfacePrefs.uiScale),
         "--ui-density": String(interfacePrefs.density),
         "--chat-font-scale": String(interfacePrefs.chatScale),
-        "--chat-line-height": String(chatLineHeight(interfacePrefs.density)),
-        "--chat-code-line-height": String(chatCodeLineHeight(interfacePrefs.density)),
+        "--chat-line-height": String(chatLineHeight(interfacePrefs.lineHeight)),
+        "--chat-code-line-height": String(chatCodeLineHeight(interfacePrefs.lineHeight)),
         "--chat-block-gap": `${chatBlockGap(interfacePrefs.density)}px`,
         "--chat-line-width": `${effectiveChatWidth(interfacePrefs, resolvedDisplayMode)}px`,
       }) as CSSProperties,
@@ -2328,16 +2329,17 @@ function estimateChatHeightScale(current: InterfacePrefs, next: InterfacePrefs) 
   const nextText = Math.max(0.1, next.uiScale * next.chatScale);
   const textRatio = nextText / currentText;
   const densityRatio = Math.max(0.1, next.density) / Math.max(0.1, current.density);
+  const lineRatio = Math.max(0.1, next.lineHeight) / Math.max(0.1, current.lineHeight);
   const widthRatio = Math.max(0.1, current.chatWidth) / Math.max(0.1, next.chatWidth);
-  return Math.min(1.8, Math.max(0.5, textRatio * 0.62 + densityRatio * 0.2 + widthRatio * 0.18));
+  return Math.min(1.8, Math.max(0.5, textRatio * 0.54 + lineRatio * 0.2 + densityRatio * 0.1 + widthRatio * 0.16));
 }
 
-function chatLineHeight(density: number) {
-  return roundCssNumber(1.1 + clampNumber(density, 0.62, 1.22) * 0.4);
+function chatLineHeight(lineHeight: number) {
+  return roundCssNumber(clampNumber(lineHeight, 1.12, 1.72));
 }
 
-function chatCodeLineHeight(density: number) {
-  return roundCssNumber(1.05 + clampNumber(density, 0.62, 1.22) * 0.35);
+function chatCodeLineHeight(lineHeight: number) {
+  return roundCssNumber(clampNumber(lineHeight - 0.1, 1.08, 1.58));
 }
 
 function chatBlockGap(density: number) {

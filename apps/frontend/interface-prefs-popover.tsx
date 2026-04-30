@@ -54,6 +54,15 @@ export function InterfacePrefsPopover({ open, prefs, onToggle, onClose, onChange
               onChange={(density) => onChange({ density })}
             />
             <RangeControl
+              label="Line spacing"
+              value={prefs.lineHeight}
+              min={INTERFACE_PREF_LIMITS.lineHeight.min}
+              max={INTERFACE_PREF_LIMITS.lineHeight.max}
+              step={INTERFACE_PREF_LIMITS.lineHeight.step}
+              display={`${prefs.lineHeight.toFixed(2)}x`}
+              onChange={(lineHeight) => onChange({ lineHeight })}
+            />
+            <RangeControl
               label="Line width"
               value={prefs.chatWidth}
               min={INTERFACE_PREF_LIMITS.chatWidth.min}
