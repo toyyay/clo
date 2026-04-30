@@ -16,10 +16,26 @@ const SCROLL_ANCHOR_WARN_DELTA_PX = 900;
 const SCROLL_MEASURE_LOG_BATCH_COUNT = 12;
 const SCROLL_MEASURE_LOG_DELTA_PX = 160;
 const SCROLL_MEASURE_WARN_DELTA_PX = 520;
+const SCROLL_PROGRAMMATIC_EXPECT_MS = 700;
+const SCROLL_PROGRAMMATIC_FAST_WINDOW_MS = 1000;
+const SCROLL_PROGRAMMATIC_STEADY_WINDOW_MS = 10000;
+const SCROLL_PROGRAMMATIC_FAST_COUNT = 3;
+const SCROLL_PROGRAMMATIC_STEADY_COUNT = 4;
+const SCROLL_PROGRAMMATIC_STEADY_INTERVAL_MS = 3000;
+const SCROLL_FRAME_CANCEL_WINDOW_MS = 2000;
+const SCROLL_FRAME_CANCEL_COUNT = 3;
+const SCROLL_ANCHOR_CHURN_WINDOW_MS = 3000;
+const SCROLL_ANCHOR_CHURN_COUNT = 3;
+const SCROLL_DIRECTION_WINDOW_MS = 1800;
+const SCROLL_DIRECTION_MIN_DELTA_PX = 24;
+const SCROLL_DIRECTION_FLIP_COUNT = 4;
+const SCROLL_ANOMALY_COOLDOWN_MS = 10000;
 const SCROLL_STORAGE_PREFIX = "chatview:chat-scroll:";
 const FOLLOW_BOTTOM_STORAGE_KEY = "chatview:chat-follow-bottom";
 
 type ScrollLogLevel = "debug" | "info" | "warn" | "error";
+type ScrollOrigin = "user" | "programmatic";
+type ScrollAnomalyKind = "programmatic_churn" | "frame_cancel_churn" | "anchor_churn" | "direction_churn";
 type ScrollDiagnosticsSnapshot = {
   itemCount: number;
   hasOlder: boolean;
@@ -35,7 +51,20 @@ type ScrollLogState = {
   lastIdleTop: number | null;
   lastEdgeOlderAt: number;
   lastEdgeNewerAt: number;
+  expectedProgrammaticUntil: number;
+  expectedProgrammaticReason: string | null;
+  pendingFrameReason: string | null;
+  programmaticCalls: ProgrammaticScrollCall[];
+  frameCancels: FrameCancelSample[];
+  anchorAdjustments: AnchorAdjustmentSample[];
+  directionFlips: DirectionFlipSample[];
+  lastDirection: -1 | 0 | 1;
+  lastAnomalyAt: Partial<Record<ScrollAnomalyKind, number>>;
 };
+type ProgrammaticScrollCall = { at: number; reason: string; behavior: ScrollBehavior; beforeTop: number; targetTop: number };
+type FrameCancelSample = { at: number; previousReason: string | null; nextReason: string };
+type AnchorAdjustmentSample = { at: number; deltaTop: number };
+type DirectionFlipSample = { at: number; from: -1 | 1; to: -1 | 1; deltaTop: number; origin: ScrollOrigin; reason: string | null };
 
 function estimateItemHeight(item: RenderItem) {
   if (item.kind === "tool_group") return 34;
@@ -131,6 +160,15 @@ export function VirtualChat({
     lastIdleTop: null,
     lastEdgeOlderAt: 0,
     lastEdgeNewerAt: 0,
+    expectedProgrammaticUntil: 0,
+    expectedProgrammaticReason: null,
+    pendingFrameReason: null,
+    programmaticCalls: [],
+    frameCancels: [],
+    anchorAdjustments: [],
+    directionFlips: [],
+    lastDirection: 0,
+    lastAnomalyAt: {},
   });
   const [measureVersion, setMeasureVersion] = useState(0);
   const [range, setRange] = useState<VirtualRange>({ start: 0, end: 0, top: 0, bottom: 0 });
@@ -172,6 +210,117 @@ export function VirtualChat({
       ["client", "scroll"],
     ).catch(() => {});
   }, []);
+
+  const logScrollAnomaly = useCallback((kind: ScrollAnomalyKind, message: string, context?: Record<string, unknown>) => {
+    const now = performance.now();
+    const state = scrollLog.current;
+    const lastLoggedAt = state.lastAnomalyAt[kind] ?? 0;
+    if (now - lastLoggedAt < SCROLL_ANOMALY_COOLDOWN_MS) return;
+    state.lastAnomalyAt[kind] = now;
+    logScrollDiagnostic("warn", `chat.scroll.anomaly.${kind}`, message, context);
+  }, [logScrollDiagnostic]);
+
+  const noteProgrammaticScroll = useCallback(
+    (reason: string, behavior: ScrollBehavior, beforeTop: number, targetTop: number) => {
+      const now = performance.now();
+      const state = scrollLog.current;
+      state.expectedProgrammaticUntil = now + SCROLL_PROGRAMMATIC_EXPECT_MS;
+      state.expectedProgrammaticReason = reason;
+      state.programmaticCalls = trimSamples(
+        [...state.programmaticCalls, { at: now, reason, behavior, beforeTop, targetTop }],
+        now - SCROLL_PROGRAMMATIC_STEADY_WINDOW_MS,
+      );
+
+      const fastCalls = state.programmaticCalls.filter((call) => now - call.at <= SCROLL_PROGRAMMATIC_FAST_WINDOW_MS);
+      const steadyCalls = state.programmaticCalls.slice(-SCROLL_PROGRAMMATIC_STEADY_COUNT);
+      const steadyIntervals = pairIntervals(steadyCalls);
+      const steadyChurn =
+        steadyCalls.length >= SCROLL_PROGRAMMATIC_STEADY_COUNT &&
+        steadyIntervals.every((interval) => interval <= SCROLL_PROGRAMMATIC_STEADY_INTERVAL_MS);
+
+      if (fastCalls.length >= SCROLL_PROGRAMMATIC_FAST_COUNT || steadyChurn) {
+        logScrollAnomaly("programmatic_churn", "programmatic scroll calls are happening too often", {
+          reason,
+          behavior,
+          fastCount: fastCalls.length,
+          recentCount: state.programmaticCalls.length,
+          steadyIntervalsMs: steadyIntervals.map(Math.round),
+          recentReasons: state.programmaticCalls.slice(-6).map((call) => call.reason),
+          beforeTop: Math.round(beforeTop),
+          targetTop: Math.round(targetTop),
+        });
+      }
+    },
+    [logScrollAnomaly],
+  );
+
+  const noteFrameCancel = useCallback((nextReason: string) => {
+    const now = performance.now();
+    const state = scrollLog.current;
+    state.frameCancels = trimSamples(
+      [...state.frameCancels, { at: now, previousReason: state.pendingFrameReason, nextReason }],
+      now - SCROLL_FRAME_CANCEL_WINDOW_MS,
+    );
+    if (state.frameCancels.length >= SCROLL_FRAME_CANCEL_COUNT) {
+      logScrollAnomaly("frame_cancel_churn", "scheduled scroll frames are being replaced before they run", {
+        cancelCount: state.frameCancels.length,
+        nextReason,
+        recentFrames: state.frameCancels.map((sample) => ({
+          previousReason: sample.previousReason,
+          nextReason: sample.nextReason,
+          ageMs: Math.round(now - sample.at),
+        })),
+      });
+    }
+  }, [logScrollAnomaly]);
+
+  const noteAnchorAdjustment = useCallback((deltaTop: number) => {
+    const now = performance.now();
+    const state = scrollLog.current;
+    state.anchorAdjustments = trimSamples(
+      [...state.anchorAdjustments, { at: now, deltaTop }],
+      now - SCROLL_ANCHOR_CHURN_WINDOW_MS,
+    );
+    const totalAbsDelta = state.anchorAdjustments.reduce((total, sample) => total + Math.abs(sample.deltaTop), 0);
+    const viewport = scrollRef.current?.clientHeight ?? 0;
+    if (state.anchorAdjustments.length >= SCROLL_ANCHOR_CHURN_COUNT || (viewport > 0 && totalAbsDelta >= viewport * 2)) {
+      logScrollAnomaly("anchor_churn", "scroll anchor is being corrected repeatedly", {
+        adjustmentCount: state.anchorAdjustments.length,
+        totalAbsDelta: Math.round(totalAbsDelta),
+        viewport,
+        recentDeltas: state.anchorAdjustments.map((sample) => Math.round(sample.deltaTop)),
+      });
+    }
+  }, [logScrollAnomaly]);
+
+  const noteScrollDirection = useCallback((deltaTop: number, origin: ScrollOrigin, reason: string | null) => {
+    if (Math.abs(deltaTop) < SCROLL_DIRECTION_MIN_DELTA_PX) return;
+    const now = performance.now();
+    const state = scrollLog.current;
+    const direction: -1 | 1 = deltaTop > 0 ? 1 : -1;
+    if (state.lastDirection && state.lastDirection !== direction) {
+      state.directionFlips = trimSamples(
+        [...state.directionFlips, { at: now, from: state.lastDirection, to: direction, deltaTop, origin, reason }],
+        now - SCROLL_DIRECTION_WINDOW_MS,
+      );
+      if (state.directionFlips.length >= SCROLL_DIRECTION_FLIP_COUNT) {
+        logScrollAnomaly("direction_churn", "scroll direction is flipping rapidly", {
+          flipCount: state.directionFlips.length,
+          origin,
+          reason,
+          recentFlips: state.directionFlips.map((sample) => ({
+            from: sample.from,
+            to: sample.to,
+            deltaTop: Math.round(sample.deltaTop),
+            origin: sample.origin,
+            reason: sample.reason,
+            ageMs: Math.round(now - sample.at),
+          })),
+        });
+      }
+    }
+    state.lastDirection = direction;
+  }, [logScrollAnomaly]);
 
   const updateRange = useCallback((options: UpdateRangeOptions = {}) => {
     const el = scrollRef.current;
@@ -244,16 +393,22 @@ export function VirtualChat({
       if (state.scrollStartedAt === null) state.scrollStartedAt = now;
       state.lastScrollTop = el.scrollTop;
       state.lastScrollAt = now;
+      const origin: ScrollOrigin = now <= state.expectedProgrammaticUntil ? "programmatic" : "user";
+      const programmaticReason = origin === "programmatic" ? state.expectedProgrammaticReason : null;
+      if (origin === "user") state.expectedProgrammaticReason = null;
 
       if (previousTop !== null && previousAt > 0) {
         const deltaTop = el.scrollTop - previousTop;
         const deltaMs = now - previousAt;
+        noteScrollDirection(deltaTop, origin, programmaticReason);
         const jumpThreshold = Math.max(SCROLL_JUMP_WARN_MIN_PX, el.clientHeight * 1.4);
         if (deltaMs > 0 && deltaMs < SCROLL_JUMP_WARN_MS && Math.abs(deltaTop) >= jumpThreshold) {
           logScrollDiagnostic("warn", "chat.scroll.jump", "large scroll offset change", {
             deltaTop: Math.round(deltaTop),
             deltaMs: Math.round(deltaMs),
             jumpThreshold: Math.round(jumpThreshold),
+            origin,
+            programmaticReason,
           });
         }
       }
@@ -280,42 +435,48 @@ export function VirtualChat({
         }
         onLoadNewer?.();
       }
-      scheduleScrollIdleLog("user_scroll");
+      scheduleScrollIdleLog(origin === "programmatic" ? `programmatic:${programmaticReason ?? "unknown"}` : "user_scroll");
     }
     scheduleRange({ captureAnchor: true });
-  }, [hasNewer, hasOlder, logScrollDiagnostic, onLoadNewer, onLoadOlder, scheduleRange, scheduleScrollIdleLog, scheduleScrollSave]);
+  }, [hasNewer, hasOlder, logScrollDiagnostic, noteScrollDirection, onLoadNewer, onLoadOlder, scheduleRange, scheduleScrollIdleLog, scheduleScrollSave]);
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "auto", reason = "manual") => {
     const el = scrollRef.current;
     if (!el) return;
     const beforeTop = el.scrollTop;
     const beforeBottomGap = el.scrollHeight - el.scrollTop - el.clientHeight;
-    el.scrollTo({ top: el.scrollHeight, behavior });
+    const targetTop = Math.max(0, el.scrollHeight - el.clientHeight);
+    noteProgrammaticScroll(reason, behavior, beforeTop, targetTop);
+    el.scrollTo({ top: targetTop, behavior });
     logScrollDiagnostic("debug", "chat.scroll.to_bottom", null, {
       reason,
       behavior,
       beforeTop: Math.round(beforeTop),
       beforeBottomGap: Math.round(beforeBottomGap),
-      targetTop: Math.round(el.scrollHeight),
+      targetTop: Math.round(targetTop),
     });
     nearBottom.current = true;
     setShowBottom(false);
     scheduleRange();
-  }, [logScrollDiagnostic, scheduleRange]);
+  }, [logScrollDiagnostic, noteProgrammaticScroll, scheduleRange]);
 
-  const cancelScrollFrame = useCallback(() => {
+  const cancelScrollFrame = useCallback((nextReason = "cancel") => {
     if (scrollRaf.current !== null) {
+      noteFrameCancel(nextReason);
       window.cancelAnimationFrame(scrollRaf.current);
       scrollRaf.current = null;
+      scrollLog.current.pendingFrameReason = null;
     }
-  }, []);
+  }, [noteFrameCancel]);
 
   const scheduleScrollFrame = useCallback(
-    (callback: () => void) => {
-      cancelScrollFrame();
+    (callback: () => void, reason = "programmatic") => {
+      cancelScrollFrame(reason);
       const expectedResetKey = resetKeyRef.current;
+      scrollLog.current.pendingFrameReason = reason;
       scrollRaf.current = window.requestAnimationFrame(() => {
         scrollRaf.current = null;
+        scrollLog.current.pendingFrameReason = null;
         if (resetKeyRef.current !== expectedResetKey) return;
         callback();
       });
@@ -327,7 +488,7 @@ export function VirtualChat({
     const next = !followBottomRef.current;
     setFollowBottom(next);
     logScrollDiagnostic("debug", "chat.scroll.follow_bottom", null, { enabled: next });
-    if (next) scheduleScrollFrame(() => scrollToBottom("smooth", "follow_enabled"));
+    if (next) scheduleScrollFrame(() => scrollToBottom("smooth", "follow_enabled"), "follow_enabled");
   }, [logScrollDiagnostic, scheduleScrollFrame, scrollToBottom]);
 
   const flushMeasurements = useCallback(() => {
@@ -401,7 +562,7 @@ export function VirtualChat({
   }, [itemKeys, items.length, layout.offsets, logScrollDiagnostic, resetKey, scheduleRange]);
 
   useLayoutEffect(() => {
-    cancelScrollFrame();
+    cancelScrollFrame("reset");
     heights.current.clear();
     pendingHeights.current.clear();
     scrollAnchor.current = null;
@@ -416,6 +577,14 @@ export function VirtualChat({
     scrollLog.current.lastIdleTop = null;
     scrollLog.current.lastEdgeOlderAt = 0;
     scrollLog.current.lastEdgeNewerAt = 0;
+    scrollLog.current.expectedProgrammaticUntil = 0;
+    scrollLog.current.expectedProgrammaticReason = null;
+    scrollLog.current.pendingFrameReason = null;
+    scrollLog.current.programmaticCalls = [];
+    scrollLog.current.frameCancels = [];
+    scrollLog.current.anchorAdjustments = [];
+    scrollLog.current.directionFlips = [];
+    scrollLog.current.lastDirection = 0;
     const saved = loadChatScroll(resetKey);
     pendingBottom.current = !saved || saved.nearBottom;
     restoredScrollKey.current = null;
@@ -472,6 +641,7 @@ export function VirtualChat({
         const el = scrollRef.current;
         if (!el) return;
         const nextTop = Math.min(savedScroll.top, Math.max(0, el.scrollHeight - el.clientHeight));
+        noteProgrammaticScroll("restore", "auto", el.scrollTop, nextTop);
         el.scrollTop = nextTop;
         scrollAnchor.current = anchorForScroll(layout.offsets, itemKeys, nextTop, items.length);
         updateRange();
@@ -482,18 +652,29 @@ export function VirtualChat({
           anchorKey: scrollAnchor.current?.key ?? null,
           anchorOffset: scrollAnchor.current ? Math.round(scrollAnchor.current.offset) : null,
         });
-      });
+      }, "restore");
       return;
     }
     if (wasPendingBottom) {
       pendingBottom.current = false;
-      scheduleScrollFrame(() => scrollToBottom("auto", "pending_bottom"));
+      scheduleScrollFrame(() => scrollToBottom("auto", "pending_bottom"), "pending_bottom");
     } else if (appended && followBottomRef.current) {
-      scheduleScrollFrame(() => scrollToBottom("smooth", "follow_append"));
+      scheduleScrollFrame(() => scrollToBottom("smooth", "follow_append"), "follow_append");
     } else if (appended && wasNearBottom) {
       setShowBottom(true);
     }
-  }, [items.length, itemKeys, layout.offsets, layout.total, logScrollDiagnostic, resetKey, scheduleScrollFrame, scrollToBottom, updateRange]);
+  }, [
+    items.length,
+    itemKeys,
+    layout.offsets,
+    layout.total,
+    logScrollDiagnostic,
+    noteProgrammaticScroll,
+    resetKey,
+    scheduleScrollFrame,
+    scrollToBottom,
+    updateRange,
+  ]);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -509,9 +690,11 @@ export function VirtualChat({
     );
     if (Math.abs(nextTop - el.scrollTop) < 1) return;
     const previousTop = el.scrollTop;
+    noteProgrammaticScroll("anchor_adjust", "auto", previousTop, nextTop);
     el.scrollTop = nextTop;
     updateRange();
     const deltaTop = nextTop - previousTop;
+    noteAnchorAdjustment(deltaTop);
     if (Math.abs(deltaTop) >= SCROLL_ANCHOR_LOG_DELTA_PX) {
       logScrollDiagnostic(
         Math.abs(deltaTop) >= Math.max(SCROLL_ANCHOR_WARN_DELTA_PX, el.clientHeight) ? "warn" : "debug",
@@ -527,7 +710,7 @@ export function VirtualChat({
         },
       );
     }
-  }, [items.length, itemKeys, layout, logScrollDiagnostic, updateRange]);
+  }, [items.length, itemKeys, layout, logScrollDiagnostic, noteAnchorAdjustment, noteProgrammaticScroll, updateRange]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -635,6 +818,18 @@ function writeFollowBottom(value: boolean) {
   } catch {
     return;
   }
+}
+
+function trimSamples<T extends { at: number }>(samples: T[], after: number) {
+  return samples.filter((sample) => sample.at >= after);
+}
+
+function pairIntervals(samples: readonly { at: number }[]) {
+  const intervals: number[] = [];
+  for (let index = 1; index < samples.length; index += 1) {
+    intervals.push(samples[index].at - samples[index - 1].at);
+  }
+  return intervals;
 }
 
 function scrollMetrics(el: HTMLDivElement, snapshot: ScrollDiagnosticsSnapshot) {
