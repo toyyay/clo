@@ -20,12 +20,12 @@ export function InterfacePrefsPopover({ open, prefs, onToggle, onClose, onChange
           <button className="prefs-backdrop" aria-label="Close display settings" onClick={onClose} />
           <section className="prefs-popover" role="dialog" aria-label="Display settings">
             <div className="prefs-head">
-              <h2>Display</h2>
-              <button className="icon-button compact-button" onClick={onReset}>
+              <h2>Aa</h2>
+              <DisplayModeControl value={prefs.displayMode} onChange={(displayMode) => onChange({ displayMode })} />
+              <button className="icon-button compact-button prefs-reset" onClick={onReset}>
                 Reset
               </button>
             </div>
-            <DisplayModeControl value={prefs.displayMode} onChange={(displayMode) => onChange({ displayMode })} />
             <RangeControl
               label="Interface"
               value={prefs.uiScale}
@@ -82,7 +82,7 @@ function DisplayModeControl({ value, onChange }: { value: DisplayMode; onChange:
   const options: Array<{ value: DisplayMode; label: string }> = [
     { value: "auto", label: "Auto" },
     { value: "desktop", label: "Desktop" },
-    { value: "eink", label: "Color e-ink" },
+    { value: "eink", label: "E-ink" },
   ];
   return (
     <div className="prefs-mode" role="group" aria-label="Display mode">
