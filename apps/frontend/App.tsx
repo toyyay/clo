@@ -2118,14 +2118,14 @@ export function App() {
           onTokenChange={setAuthToken}
           onLogin={login}
         />
-        <BuildBadge sha={displayedBuildSha} updateReady={serviceWorker.status.updateReady} onUpdate={applyVisibleServiceWorkerUpdate} />
+        <BuildBadge sha={displayedBuildSha} />
       </>
     );
   }
 
   return (
     <div className={`app-shell display-${resolvedDisplayMode} ${sidebarOpen ? "" : "sidebar-closed"}`} style={appShellStyle}>
-      <BuildBadge sha={displayedBuildSha} updateReady={serviceWorker.status.updateReady} onUpdate={applyVisibleServiceWorkerUpdate} />
+      <BuildBadge sha={displayedBuildSha} />
       <Topbar
         active={active}
         syncState={syncState}
@@ -2135,11 +2135,13 @@ export function App() {
         theme={theme}
         interfacePrefs={interfacePrefs}
         interfacePrefsOpen={interfacePrefsOpen}
+        updateReady={serviceWorker.status.updateReady}
         onToggleSidebar={() => setSidebarOpen((open) => !open)}
         onToggleInterfacePrefs={() => setInterfacePrefsOpen((open) => !open)}
         onCloseInterfacePrefs={() => setInterfacePrefsOpen(false)}
         onInterfacePrefsChange={updateInterfacePrefs}
         onResetInterfacePrefs={resetInterfacePrefs}
+        onUpdate={applyVisibleServiceWorkerUpdate}
         onOpenAudio={() => openPanel("audio")}
         onOpenSettings={() => openPanel("settings")}
         onSync={() => syncNow({ metadataOnly: true, reason: "manual_topbar" })}
@@ -2242,17 +2244,11 @@ export function App() {
   );
 }
 
-function BuildBadge({ sha, updateReady, onUpdate }: { sha: string | null; updateReady?: boolean; onUpdate?: () => void }) {
-  const shortSha = formatBuildSha(sha);
-  if (!shortSha && !updateReady) return null;
+function BuildBadge({ sha }: { sha: string | null }) {
+  const shortSha = formatBuildSha(sha) || "dev";
   return (
     <div className="build-badge" aria-label={shortSha ? `Build ${shortSha}` : "Build status"}>
-      {shortSha && <span className="build-badge-code">{shortSha}</span>}
-      {updateReady && onUpdate && (
-        <button type="button" className="build-update-button" onClick={onUpdate}>
-          обновить
-        </button>
-      )}
+      <span className="build-badge-code">{shortSha}</span>
     </div>
   );
 }

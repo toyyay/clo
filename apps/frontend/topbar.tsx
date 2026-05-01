@@ -1,7 +1,16 @@
 import type { SessionInfo } from "../../packages/shared/types";
 import type { SyncHealth, SyncState } from "./app-types";
 import { InterfacePrefsPopover } from "./interface-prefs-popover";
-import { relativeActivityLabel } from "./session-utils";
+import {
+  projectLabel,
+  relativeActivityLabel,
+  sessionActivityDateLabel,
+  sessionActivityLabel,
+  sessionActivityTitle,
+  sessionDisplayTitle,
+  sessionSourceTitle,
+  sourceProviderLabel,
+} from "./session-utils";
 import type { InterfacePrefs } from "./storage-prefs";
 
 type TopbarProps = {
@@ -13,11 +22,13 @@ type TopbarProps = {
   theme: "light" | "dark";
   interfacePrefs: InterfacePrefs;
   interfacePrefsOpen: boolean;
+  updateReady: boolean;
   onToggleSidebar: () => void;
   onToggleInterfacePrefs: () => void;
   onCloseInterfacePrefs: () => void;
   onInterfacePrefsChange: (patch: Partial<InterfacePrefs>) => void;
   onResetInterfacePrefs: () => void;
+  onUpdate: () => void;
   onOpenAudio: () => void;
   onOpenSettings: () => void;
   onSync: () => void;
@@ -34,11 +45,13 @@ export function Topbar({
   theme,
   interfacePrefs,
   interfacePrefsOpen,
+  updateReady,
   onToggleSidebar,
   onToggleInterfacePrefs,
   onCloseInterfacePrefs,
   onInterfacePrefsChange,
   onResetInterfacePrefs,
+  onUpdate,
   onOpenAudio,
   onOpenSettings,
   onSync,
@@ -48,29 +61,60 @@ export function Topbar({
   const healthClass = syncHealth.online ? (syncState === "error" ? "error" : "online") : "offline";
   const detailText = syncDetailLabel(syncState, syncHealth, now);
   const title = syncTitle(syncHealth);
+  const shortSync = syncShortLabel(syncState, syncHealth);
 
   return (
     <header className="topbar">
-      <div className="top-left">
-        <button className="icon-button menu-button" onClick={onToggleSidebar} title="Toggle chats">
-          Chats
-        </button>
-        <div>
-          <div className="brand">Chatview</div>
-          {active && (
-            <div className="active-inline">
-              {active.hostname} / {active.projectName}
+      <button className="top-chat-toggle" onClick={onToggleSidebar} title="Toggle chats" aria-label="Toggle chats">
+        ☰
+      </button>
+      <div className="top-chat-summary" title={active ? sessionSourceTitle(active) : "No cached chats yet"}>
+        {active ? (
+          <>
+            <div className="top-chat-title">{sessionDisplayTitle(active)}</div>
+            <div className="top-chat-meta" title={sessionActivityTitle(active)}>
+              <span>{sessionActivityDateLabel(active)}</span>
+              {sessionActivityLabel(active, now) ? <span>{sessionActivityLabel(active, now)}</span> : null}
             </div>
-          )}
-        </div>
+            <div className="top-chat-micro">
+              <span>{formatEventCount(active.eventCount)}</span>
+              <span>{formatBytes(active.sizeBytes)}</span>
+              <span>{sourceProviderLabel(active)}</span>
+              <span>{projectLabel(active)}</span>
+            </div>
+          </>
+        ) : (
+          <div className="top-chat-title empty-title">No chats</div>
+        )}
       </div>
-      <div className="top-status">
-        <div className={`sync-line ${syncState}`} title={title} aria-live="polite">
+      <details className="sync-popover-wrap">
+        <summary className={`sync-pill ${syncState}`} title={title} aria-label="Sync details">
           <span className={`sync-dot ${healthClass}`} />
-          <span className="sync-main">{statusText}</span>
-          <span className="sync-detail">{detailText}</span>
+          <span>{shortSync}</span>
+        </summary>
+        <div className="sync-popover" role="status">
+          <div>
+            <b>{statusText}</b>
+            <span>{detailText}</span>
+          </div>
+          <dl>
+            <dt>Browser</dt>
+            <dd>{syncHealth.online ? "online" : "offline"}</dd>
+            <dt>Attempt</dt>
+            <dd>{formatDateTime(syncHealth.lastAttemptAt)}</dd>
+            <dt>Success</dt>
+            <dd>{formatDateTime(syncHealth.lastSuccessAt)}</dd>
+            <dt>Cache</dt>
+            <dd>{syncHealth.online ? "live + local" : "local only"}</dd>
+            {syncHealth.lastError && (
+              <>
+                <dt>Error</dt>
+                <dd>{syncHealth.lastError}</dd>
+              </>
+            )}
+          </dl>
         </div>
-      </div>
+      </details>
       <div className="top-actions">
         <InterfacePrefsPopover
           open={interfacePrefsOpen}
@@ -80,27 +124,17 @@ export function Topbar({
           onChange={onInterfacePrefsChange}
           onReset={onResetInterfacePrefs}
         />
-        <button className="icon-button top-action-secondary" onClick={onOpenAudio} title="Uploaded audio">
-          Audio
-        </button>
-        <button className="icon-button top-action-secondary" onClick={onOpenSettings} title="Settings">
-          Settings
-        </button>
-        <a className="icon-button download-button top-action-secondary" href="/api/agent/download?arch=arm64">
-          Download Mac Agent (M1)
-        </a>
-        <button className="icon-button" onClick={onSync} disabled={syncState === "syncing"} title="Sync now">
-          Sync
-        </button>
-        <button className="icon-button top-action-secondary" onClick={onToggleTheme} title="Toggle theme">
-          {theme === "dark" ? "Light" : "Dark"}
-        </button>
-        <button className="icon-button top-action-secondary" onClick={onLogout} title="Sign out">
-          Logout
-        </button>
         <details className="top-more">
-          <summary className="icon-button top-more-summary">More</summary>
+          <summary className="icon-button top-more-summary" aria-label="More actions">⋯</summary>
           <div className="top-more-menu">
+            {updateReady && (
+              <button className="icon-button update-menu-button" onClick={onUpdate}>
+                обновить
+              </button>
+            )}
+            <button className="icon-button" onClick={onSync} disabled={syncState === "syncing"} title="Sync now">
+              Sync now
+            </button>
             <button className="icon-button" onClick={onOpenAudio} title="Uploaded audio">
               Audio
             </button>
@@ -132,6 +166,14 @@ function syncDetailLabel(syncState: SyncState, syncHealth: SyncHealth, now: numb
   return `Online · ${checked}`;
 }
 
+function syncShortLabel(syncState: SyncState, syncHealth: SyncHealth) {
+  if (!syncHealth.online) return "off";
+  if (syncState === "syncing") return "sync";
+  if (syncState === "error") return "err";
+  if (syncState === "loading") return "load";
+  return "ok";
+}
+
 function syncTitle(syncHealth: SyncHealth) {
   return [
     `Browser: ${syncHealth.online ? "online" : "offline"}`,
@@ -141,4 +183,24 @@ function syncTitle(syncHealth: SyncHealth) {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function formatEventCount(value?: number | null) {
+  const count = Math.max(0, value ?? 0);
+  if (count >= 1000) return `${Math.round(count / 100) / 10}k msg`;
+  return `${count} msg`;
+}
+
+function formatBytes(value?: number | null) {
+  const bytes = Math.max(0, value ?? 0);
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 102.4) / 10} KB`;
+  return `${Math.round(bytes / 1024 / 102.4) / 10} MB`;
+}
+
+function formatDateTime(value?: string | null) {
+  if (!value) return "never";
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return "unknown";
+  return new Date(parsed).toLocaleString();
 }
