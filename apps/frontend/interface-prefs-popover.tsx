@@ -63,6 +63,15 @@ export function InterfacePrefsPopover({ open, prefs, onToggle, onClose, onChange
               onChange={(lineHeight) => onChange({ lineHeight })}
             />
             <RangeControl
+              label="Paragraphs"
+              value={prefs.paragraphSpacing}
+              min={INTERFACE_PREF_LIMITS.paragraphSpacing.min}
+              max={INTERFACE_PREF_LIMITS.paragraphSpacing.max}
+              step={INTERFACE_PREF_LIMITS.paragraphSpacing.step}
+              display={`${Math.round(prefs.paragraphSpacing)}px`}
+              onChange={(paragraphSpacing) => onChange({ paragraphSpacing })}
+            />
+            <RangeControl
               label="Line width"
               value={prefs.chatWidth}
               min={INTERFACE_PREF_LIMITS.chatWidth.min}

@@ -218,6 +218,7 @@ export function App() {
         next.chatScale === current.chatScale &&
         next.density === current.density &&
         next.lineHeight === current.lineHeight &&
+        next.paragraphSpacing === current.paragraphSpacing &&
         next.chatWidth === current.chatWidth
       ) {
         return current;
@@ -288,7 +289,7 @@ export function App() {
         "--chat-font-scale": String(interfacePrefs.chatScale),
         "--chat-line-height": String(chatLineHeight(interfacePrefs.lineHeight)),
         "--chat-code-line-height": String(chatCodeLineHeight(interfacePrefs.lineHeight)),
-        "--chat-block-gap": `${chatBlockGap(interfacePrefs.density)}px`,
+        "--chat-block-gap": `${chatBlockGap(interfacePrefs.paragraphSpacing)}px`,
         "--chat-line-width": `${effectiveChatWidth(interfacePrefs, resolvedDisplayMode)}px`,
       }) as CSSProperties,
     [interfacePrefs, resolvedDisplayMode, sidebarWidth],
@@ -2330,8 +2331,9 @@ function estimateChatHeightScale(current: InterfacePrefs, next: InterfacePrefs) 
   const textRatio = nextText / currentText;
   const densityRatio = Math.max(0.1, next.density) / Math.max(0.1, current.density);
   const lineRatio = Math.max(0.1, next.lineHeight) / Math.max(0.1, current.lineHeight);
+  const blockRatio = (next.paragraphSpacing + 4) / Math.max(1, current.paragraphSpacing + 4);
   const widthRatio = Math.max(0.1, current.chatWidth) / Math.max(0.1, next.chatWidth);
-  return Math.min(1.8, Math.max(0.5, textRatio * 0.54 + lineRatio * 0.2 + densityRatio * 0.1 + widthRatio * 0.16));
+  return Math.min(1.8, Math.max(0.5, textRatio * 0.52 + lineRatio * 0.2 + densityRatio * 0.08 + blockRatio * 0.06 + widthRatio * 0.14));
 }
 
 function chatLineHeight(lineHeight: number) {
@@ -2342,8 +2344,8 @@ function chatCodeLineHeight(lineHeight: number) {
   return roundCssNumber(clampNumber(lineHeight - 0.1, 1.08, 1.58));
 }
 
-function chatBlockGap(density: number) {
-  return Math.round(10 * clampNumber(density, 0.62, 1.22));
+function chatBlockGap(paragraphSpacing: number) {
+  return Math.round(clampNumber(paragraphSpacing, 0, 18));
 }
 
 function roundCssNumber(value: number) {

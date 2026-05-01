@@ -23,6 +23,7 @@ export type InterfacePrefs = {
   chatScale: number;
   density: number;
   lineHeight: number;
+  paragraphSpacing: number;
   chatWidth: number;
 };
 
@@ -32,6 +33,7 @@ export const DEFAULT_INTERFACE_PREFS: InterfacePrefs = {
   chatScale: 1,
   density: 1,
   lineHeight: 1.5,
+  paragraphSpacing: 10,
   chatWidth: 920,
 };
 
@@ -42,6 +44,7 @@ export const INTERFACE_PREF_LIMITS = {
   chatScale: { min: 0.72, max: 1.36, step: 0.01 },
   density: { min: 0.62, max: 1.22, step: 0.01 },
   lineHeight: { min: 1.12, max: 1.72, step: 0.01 },
+  paragraphSpacing: { min: 0, max: 18, step: 1 },
   chatWidth: { min: 320, max: 1120, step: 20 },
 } as const;
 
@@ -79,6 +82,14 @@ export function clampInterfacePrefs(value: Partial<InterfacePrefs>): InterfacePr
       INTERFACE_PREF_LIMITS.lineHeight.min,
       INTERFACE_PREF_LIMITS.lineHeight.max,
       DEFAULT_INTERFACE_PREFS.lineHeight,
+    ),
+    paragraphSpacing: Math.round(
+      clampNumber(
+        value.paragraphSpacing,
+        INTERFACE_PREF_LIMITS.paragraphSpacing.min,
+        INTERFACE_PREF_LIMITS.paragraphSpacing.max,
+        DEFAULT_INTERFACE_PREFS.paragraphSpacing,
+      ),
     ),
     chatWidth: Math.round(
       clampNumber(value.chatWidth, INTERFACE_PREF_LIMITS.chatWidth.min, INTERFACE_PREF_LIMITS.chatWidth.max, DEFAULT_INTERFACE_PREFS.chatWidth),

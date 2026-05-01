@@ -292,14 +292,15 @@ pre {
 }
 .prefs-popover {
   position: fixed;
-  top: calc(var(--topbar-height) + 6px);
-  right: 8px;
+  top: calc(var(--topbar-height) + 4px);
+  right: 4px;
   z-index: 19;
-  width: min(300px, calc(100vw - 16px));
-  max-height: calc(var(--app-viewport-height) - var(--topbar-height) - 14px - var(--app-safe-bottom));
+  width: clamp(240px, 66vw, 360px);
+  max-width: calc(100vw - 8px);
+  max-height: calc(var(--app-viewport-height) - var(--topbar-height) - 8px - var(--app-safe-bottom));
   display: grid;
-  gap: 3px;
-  padding: 6px;
+  gap: 1px;
+  padding: 4px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
@@ -312,15 +313,15 @@ pre {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 5px;
-  min-height: 30px;
-  padding-bottom: 3px;
+  gap: 4px;
+  min-height: 26px;
+  padding-bottom: 2px;
   border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
 }
 .prefs-head h2 {
   margin: 0;
-  min-width: 28px;
-  font-size: calc(13px * var(--ui-font-scale));
+  min-width: 22px;
+  font-size: calc(12px * var(--ui-font-scale));
   line-height: 1;
 }
 .prefs-mode {
@@ -336,11 +337,11 @@ pre {
 .prefs-mode button {
   flex: 1;
   min-width: 0;
-  min-height: 24px;
-  padding: 2px 4px;
+  min-height: 22px;
+  padding: 1px 3px;
   border-radius: 4px;
   text-align: center;
-  font-size: calc(11px * var(--ui-font-scale));
+  font-size: calc(10.5px * var(--ui-font-scale));
   line-height: 1.05;
 }
 .prefs-mode button.active {
@@ -349,17 +350,17 @@ pre {
   font-weight: 700;
 }
 .prefs-reset {
-  min-height: 26px;
-  padding: 2px 5px;
-  font-size: calc(11px * var(--ui-font-scale));
+  min-height: 23px;
+  padding: 1px 4px;
+  font-size: calc(10.5px * var(--ui-font-scale));
 }
 .prefs-range {
   display: grid;
-  grid-template-columns: 74px minmax(0, 1fr);
+  grid-template-columns: 58px minmax(0, 1fr);
   align-items: center;
-  gap: 4px;
-  min-height: 32px;
-  padding: 2px 1px 2px 4px;
+  gap: 3px;
+  min-height: 27px;
+  padding: 1px 0 1px 3px;
   border-bottom: 1px solid color-mix(in srgb, var(--line) 34%, transparent);
   background: transparent;
 }
@@ -370,7 +371,7 @@ pre {
   min-width: 0;
   display: grid;
   gap: 0;
-  font-size: calc(10.5px * var(--ui-font-scale));
+  font-size: calc(9.5px * var(--ui-font-scale));
   line-height: 1.05;
 }
 .prefs-range b {
@@ -384,24 +385,24 @@ pre {
 .prefs-range output {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
-  font-size: calc(10px * var(--ui-font-scale));
+  font-size: calc(9px * var(--ui-font-scale));
 }
 .range-stepper {
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr) 24px;
+  grid-template-columns: 22px minmax(0, 1fr) 22px;
   align-items: center;
-  gap: 4px;
+  gap: 3px;
 }
 .range-step-button {
-  min-width: 24px;
-  min-height: 24px;
+  min-width: 22px;
+  min-height: 22px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   border: 1px solid var(--line);
   border-radius: 5px;
   background: var(--panel);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 700;
   line-height: 1;
 }
@@ -411,7 +412,7 @@ pre {
   accent-color: var(--accent);
   appearance: none;
   -webkit-appearance: none;
-  height: 24px;
+  height: 22px;
   background: transparent;
 }
 .prefs-range input[type="range"]::-webkit-slider-runnable-track,
@@ -422,9 +423,9 @@ pre {
 }
 .prefs-range input[type="range"]::-webkit-slider-thumb,
 .settings-range input[type="range"]::-webkit-slider-thumb {
-  width: 14px;
-  height: 14px;
-  margin-top: -5.5px;
+  width: 12px;
+  height: 12px;
+  margin-top: -4.5px;
   border: 2px solid var(--text);
   border-radius: 999px;
   background: var(--panel);
@@ -1864,10 +1865,11 @@ body.resizing-sidebar {
     font-size: calc(12px * var(--ui-font-scale));
   }
   .prefs-popover {
-    top: calc(var(--topbar-height) + 6px);
-    right: 6px;
-    width: calc(100vw - 12px);
-    max-height: calc(var(--app-viewport-height) - var(--topbar-height) - 12px - var(--app-safe-bottom));
+    top: calc(var(--topbar-height) + 4px);
+    right: 4px;
+    width: clamp(240px, 66vw, 360px);
+    max-width: calc(100vw - 8px);
+    max-height: calc(var(--app-viewport-height) - var(--topbar-height) - 8px - var(--app-safe-bottom));
   }
   .download-button { display: none; }
   .layout {
