@@ -132,7 +132,7 @@ pre {
   --chat-code-line-height: 1.4;
   --chat-block-gap: 10px;
   --chat-line-width: 920px;
-  --topbar-height: calc(58px * var(--ui-density) + var(--app-safe-top));
+  --topbar-height: calc(66px * var(--ui-density) + var(--app-safe-top));
   height: var(--app-viewport-height);
   display: flex;
   flex-direction: column;
@@ -201,23 +201,23 @@ pre {
 .top-chat-summary {
   min-width: 0;
   display: grid;
-  gap: 1px;
+  gap: 2px;
 }
 .top-chat-title {
   min-width: 0;
+  display: -webkit-box;
   color: var(--text);
   font-weight: 750;
   font-size: calc(13px * var(--ui-font-scale));
-  line-height: 1.12;
+  line-height: 1.13;
   overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 .top-chat-title.empty-title {
   color: var(--muted);
   font-weight: 650;
 }
-.top-chat-meta,
 .top-chat-micro {
   min-width: 0;
   display: flex;
@@ -229,13 +229,11 @@ pre {
   overflow: hidden;
   white-space: nowrap;
 }
-.top-chat-meta span,
 .top-chat-micro span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.top-chat-meta span + span::before,
 .top-chat-micro span + span::before {
   content: "·";
   margin-right: 5px;
@@ -1969,7 +1967,7 @@ body.resizing-sidebar {
 @media (max-width: 780px) {
   body { font-size: 14px; }
   .app-shell {
-    --topbar-height: calc(54px * var(--ui-density) + var(--app-safe-top));
+    --topbar-height: calc(64px * var(--ui-density) + var(--app-safe-top));
     font-size: calc(14px * var(--ui-font-scale));
   }
   .topbar {
@@ -1986,12 +1984,10 @@ body.resizing-sidebar {
   .top-chat-title {
     font-size: calc(12.5px * var(--ui-font-scale));
   }
-  .top-chat-meta,
   .top-chat-micro {
     gap: 4px;
     font-size: calc(9.5px * var(--ui-font-scale));
   }
-  .top-chat-meta span + span::before,
   .top-chat-micro span + span::before {
     margin-right: 4px;
   }
@@ -2175,7 +2171,6 @@ body.resizing-sidebar {
     padding: calc(3px * var(--ui-density) + var(--app-safe-top)) calc(5px * var(--ui-density)) calc(3px * var(--ui-density));
   }
 
-  :root[data-keyboard="open"] .top-chat-meta,
   :root[data-keyboard="open"] .top-chat-micro {
     display: none;
   }

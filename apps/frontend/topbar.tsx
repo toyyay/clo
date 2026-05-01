@@ -4,7 +4,6 @@ import { InterfacePrefsPopover } from "./interface-prefs-popover";
 import {
   projectLabel,
   relativeActivityLabel,
-  sessionActivityDateLabel,
   sessionActivityLabel,
   sessionActivityTitle,
   sessionDisplayTitle,
@@ -72,11 +71,8 @@ export function Topbar({
         {active ? (
           <>
             <div className="top-chat-title">{sessionDisplayTitle(active)}</div>
-            <div className="top-chat-meta" title={sessionActivityTitle(active)}>
-              <span>{sessionActivityDateLabel(active)}</span>
-              {sessionActivityLabel(active, now) ? <span>{sessionActivityLabel(active, now)}</span> : null}
-            </div>
             <div className="top-chat-micro">
+              <span>{compactActivityLabel(active, now)}</span>
               <span>{formatEventCount(active.eventCount)}</span>
               <span>{formatBytes(active.sizeBytes)}</span>
               <span>{sourceProviderLabel(active)}</span>
@@ -203,4 +199,35 @@ function formatDateTime(value?: string | null) {
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) return "unknown";
   return new Date(parsed).toLocaleString();
+}
+
+function compactActivityLabel(session: SessionInfo, now: number) {
+  const compactDate = formatCompactDate(sessionActivityTimestamp(session));
+  const relative = sessionActivityLabel(session, now);
+  return [compactDate, relative].filter(Boolean).join(" ");
+}
+
+function formatCompactDate(value?: string | null) {
+  if (!value) return "";
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return "";
+  const date = new Date(parsed);
+  const day = String(date.getDate()).padStart(2, "0");
+  const month = date.toLocaleString(undefined, { month: "short" }).toLowerCase().replace(/\.$/, "");
+  const hour = String(date.getHours()).padStart(2, "0");
+  const minute = String(date.getMinutes()).padStart(2, "0");
+  return `${day}${month} ${hour}:${minute}`;
+}
+
+function sessionActivityTimestamp(session: SessionInfo) {
+  if (session.id.startsWith("v3:") && Number.isFinite(session.mtimeMs) && session.mtimeMs > 0) {
+    return new Date(session.mtimeMs).toISOString();
+  }
+  return session.lastSeenAt || timestampFromPath(session.sourcePath);
+}
+
+function timestampFromPath(path: string) {
+  const match = path.match(/rollout-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})/);
+  if (!match) return null;
+  return `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}`;
 }
