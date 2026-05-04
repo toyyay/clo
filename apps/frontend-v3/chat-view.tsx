@@ -277,9 +277,17 @@ function ActiveChat({ chatId }: { chatId: string }) {
         const el2 = scrollRef.current;
         if (!el2) return;
         if (userScrolled.current || initialScrollDone.current) return;
-        el2.scrollTop = el2.scrollHeight; // browser clamps to max — that's fine
+        // Mark anchoring so onScroll won't latch userScrolled from our own
+        // programmatic assignment — otherwise we lock in at scrollHeight that
+        // was correct BEFORE heights hydrated, and end up ~845px short of
+        // bottom once measurements come in.
+        anchoringActive.current = true;
+        el2.scrollTop = el2.scrollHeight;
         const distFromBottom = el2.scrollHeight - el2.scrollTop - el2.clientHeight;
         if (distFromBottom < 4) initialScrollDone.current = true;
+        requestAnimationFrame(() => {
+          anchoringActive.current = false;
+        });
       });
     });
   }, [chatId, items.length, layout.total]);
