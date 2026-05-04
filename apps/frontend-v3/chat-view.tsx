@@ -6,6 +6,7 @@ import * as idb from "./idb";
 import { RenderItemView } from "./render";
 import { useStore, useStoreState } from "./store-hook";
 import { formatBytes, formatRelative } from "./format";
+import { BEFORE_VISUAL_CHANGE, AFTER_VISUAL_CHANGE } from "./settings";
 
 const ROW_OVERSCAN = 6;
 const LOAD_EDGE_PX = 720;
@@ -49,6 +50,20 @@ function ActiveChat({ chatId }: { chatId: string }) {
   const heightsHydrated = useRef(false);
   const initialScrollDone = useRef(false);
 
+  // ---- Scroll anchoring ----------------------------------------------------
+  // Before any layout-shifting operation we capture the top-visible item key
+  // and the offset of scrollTop within that item. After the layout pass we
+  // find the same item's NEW offset and re-pin scrollTop. This is what keeps
+  // the visible content perfectly stable when:
+  //   • measurements arrive and rows get taller/shorter
+  //   • loadOlder prepends a batch of items
+  //   • font-scale changes
+  //   • the user collapses/expands a tool group (future)
+  // Without this, scrollTop is interpreted as absolute pixels into a list
+  // that just changed underneath, so the user sees content jump.
+  const anchorRef = useRef<{ key: string; withinItem: number } | null>(null);
+  const anchoringActive = useRef(false);
+
   const [measureVersion, setMeasureVersion] = useState(0);
   const [range, setRange] = useState<{ start: number; end: number; topPad: number; botPad: number }>({
     start: 0,
@@ -85,6 +100,65 @@ function ActiveChat({ chatId }: { chatId: string }) {
     offsets[items.length] = total;
     return { offsets, total };
   }, [items, itemKeys, measureVersion]);
+
+  /** Capture the topmost visible item + offset within it, BEFORE any layout
+   *  shift. Sets anchoringActive=true so onScroll knows the upcoming
+   *  scrollTop change is programmatic and not user-driven. */
+  const captureAnchor = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el || !items.length) return;
+    const top = el.scrollTop;
+    const i = lowerBound(layout.offsets, top);
+    const idx = Math.max(0, i - (layout.offsets[i] === top ? 0 : 1));
+    const key = itemKeys[idx];
+    if (!key) return;
+    const offset = layout.offsets[idx] ?? 0;
+    anchorRef.current = { key, withinItem: top - offset };
+    anchoringActive.current = true;
+  }, [items.length, itemKeys, layout]);
+
+  /** PREPEND DETECT — must run before the anchor restore useLayoutEffect so
+   *  the anchor is set in time. Whenever items.length grew AND an old key
+   *  is now at a non-zero index, that's a prepend (loadOlder) and we anchor. */
+  const prevItemKeysRef = useRef<string[]>([]);
+  const prevScrollTopRef = useRef(0);
+  useLayoutEffect(() => {
+    const prev = prevItemKeysRef.current;
+    if (prev.length && items.length > prev.length) {
+      const firstPrevKey = prev[0]!;
+      const newIdx = itemKeys.indexOf(firstPrevKey);
+      if (newIdx > 0) {
+        anchorRef.current = { key: firstPrevKey, withinItem: prevScrollTopRef.current };
+        anchoringActive.current = true;
+      }
+    }
+    prevItemKeysRef.current = itemKeys;
+    prevScrollTopRef.current = scrollRef.current?.scrollTop ?? 0;
+  });  // every render — cheap
+
+  /** ANCHOR RESTORE — after layout has changed, find the anchored key's
+   *  new offset and set scrollTop to keep the visible content pinned. */
+  useLayoutEffect(() => {
+    const a = anchorRef.current;
+    if (!a) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const idx = itemKeys.indexOf(a.key);
+    if (idx < 0) {
+      anchorRef.current = null;
+      anchoringActive.current = false;
+      return;
+    }
+    const newOffset = layout.offsets[idx] ?? 0;
+    const newTop = newOffset + a.withinItem;
+    if (Math.abs(el.scrollTop - newTop) > 0.5) {
+      el.scrollTop = newTop;
+    }
+    anchorRef.current = null;
+    requestAnimationFrame(() => {
+      anchoringActive.current = false;
+    });
+  }, [itemKeys, layout]);
 
   const updateRange = useCallback(
     (checkEdgeLoad = false) => {
@@ -154,7 +228,12 @@ function ActiveChat({ chatId }: { chatId: string }) {
   }, [chatId, items.length, layout.total]);
 
   const onScroll = useCallback(() => {
-    // Mark user-driven scroll so initial auto-scroll stops re-snapping.
+    // Programmatic scroll from anchor restore should not be treated as user
+    // scroll, otherwise we cancel the still-running initial auto-scroll.
+    if (anchoringActive.current) {
+      requestAnimationFrame(() => updateRange(false));
+      return;
+    }
     if (initialScrollDone.current === false) userScrolled.current = true;
     requestAnimationFrame(() => updateRange(true));
   }, [updateRange]);
@@ -187,6 +266,8 @@ function ActiveChat({ chatId }: { chatId: string }) {
   const flushMeasurements = useCallback(() => {
     measureRaf.current = null;
     if (!pendingHeights.current.size) return;
+    // Capture anchor BEFORE applying new heights — old layout still in DOM.
+    captureAnchor();
     const updates: idb.HeightRow[] = [];
     for (const [key, h] of pendingHeights.current) {
       heightsRef.current.set(key, h);
@@ -195,7 +276,27 @@ function ActiveChat({ chatId }: { chatId: string }) {
     pendingHeights.current.clear();
     setMeasureVersion((v) => v + 1);
     void idb.bulkPutHeights(updates);
-  }, [chatId]);
+  }, [chatId, captureAnchor]);
+
+  // Visual changes (font-scale, theme) invalidate measured heights — anchor +
+  // clear so layout re-measures on next paint without scroll jump.
+  useEffect(() => {
+    const onBefore = () => {
+      captureAnchor();
+    };
+    const onAfter = () => {
+      heightsRef.current.clear();
+      // Drop persisted heights for this chat too — they'll be re-measured.
+      void idb.bulkPutHeights([]); // no-op safety
+      setMeasureVersion((v) => v + 1);
+    };
+    window.addEventListener(BEFORE_VISUAL_CHANGE, onBefore);
+    window.addEventListener(AFTER_VISUAL_CHANGE, onAfter);
+    return () => {
+      window.removeEventListener(BEFORE_VISUAL_CHANGE, onBefore);
+      window.removeEventListener(AFTER_VISUAL_CHANGE, onAfter);
+    };
+  }, [captureAnchor]);
 
   // Save unflushed heights on tab unload too.
   useEffect(() => {
@@ -341,15 +442,56 @@ function estimateHeight(item: RenderItem): number {
   switch (item.k) {
     case "tg":
       return 32;
-    case "th":
-      return 60;
-    case "tu":
-    case "tr":
-      return 90;
-    case "t": {
-      const lines = Math.ceil(item.txt.length / 96) + (item.txt.match(/\n/g)?.length ?? 0);
-      return Math.max(48, Math.min(420, 24 + lines * 22));
+    case "th": {
+      const lines = textLines(item.txt, 96);
+      return Math.max(44, Math.min(320, 24 + lines * 18));
     }
+    case "tu": {
+      const inputStr = typeof item.in === "string" ? item.in : safeJson(item.in);
+      const lines = textLines(inputStr, 80);
+      return Math.max(60, Math.min(280, 36 + lines * 16));
+    }
+    case "tr": {
+      const lines = textLines(item.out ?? "", 80);
+      return Math.max(60, Math.min(320, 36 + lines * 16));
+    }
+    case "t": {
+      // If the server gave us blocks, use them for a much closer estimate
+      // than counting raw text length (markdown adds vertical headings, code
+      // blocks, lists each with their own padding).
+      if (item.blocks && item.blocks.length) {
+        let h = 30; // header role label + padding
+        for (const b of item.blocks) {
+          switch (b.t) {
+            case "p":     h += textLines(b.s, 90) * 22 + 6; break;
+            case "h":     h += 28 + Math.max(0, 4 - b.lvl) * 4 + 4; break;
+            case "code":  h += textLines(b.s, 80) * 18 + 16; break;
+            case "ul":
+            case "ol":    h += b.items.length * 22 + 6; break;
+            case "quote": h += textLines(b.s, 80) * 22 + 12; break;
+            case "hr":    h += 12; break;
+          }
+        }
+        return Math.max(48, Math.min(900, h));
+      }
+      const lines = textLines(item.txt, 96);
+      return Math.max(48, Math.min(900, 24 + lines * 22));
+    }
+  }
+}
+
+function textLines(s: string, charsPerLine: number): number {
+  if (!s) return 1;
+  const explicit = (s.match(/\n/g)?.length ?? 0) + 1;
+  const wrap = Math.ceil(s.length / charsPerLine);
+  return Math.max(explicit, wrap);
+}
+
+function safeJson(v: unknown): string {
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
   }
 }
 

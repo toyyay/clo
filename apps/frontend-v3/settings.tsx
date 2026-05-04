@@ -42,8 +42,22 @@ export function writeFontScale(v: number) {
 /**
  * Applies theme + font-scale to the <html> element. Re-applied on every
  * change. Auto theme honors prefers-color-scheme.
+ *
+ * Dispatches `chatview-v3:before-visual-change` BEFORE applying so the
+ * chat virtual scroll can capture an anchor, and
+ * `chatview-v3:after-visual-change` AFTER so it can re-pin.
  */
+export const BEFORE_VISUAL_CHANGE = "chatview-v3:before-visual-change";
+export const AFTER_VISUAL_CHANGE = "chatview-v3:after-visual-change";
+
 export function applyVisualSettings(theme: Theme, fontScale: number) {
+  // Best-effort: only fires if document is ready (skipped on first synchronous
+  // call from app.tsx before mount, which is fine — nothing to anchor yet).
+  try {
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent(BEFORE_VISUAL_CHANGE));
+    }
+  } catch {}
   const root = document.documentElement;
   if (theme === "auto") {
     root.removeAttribute("data-theme");
@@ -51,6 +65,11 @@ export function applyVisualSettings(theme: Theme, fontScale: number) {
     root.setAttribute("data-theme", theme);
   }
   root.style.setProperty("--font-scale", String(fontScale));
+  try {
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent(AFTER_VISUAL_CHANGE));
+    }
+  } catch {}
 }
 
 export type SettingsPopoverProps = {
