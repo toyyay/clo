@@ -30,6 +30,9 @@ export type V3SocketData = {
   ticking: Set<string>;
   /** when set, we still need to drain this view */
   dirty: Set<string>;
+  /** views whose initial snapshot is still in flight; drainView skips them */
+  /** until the snapshot lands so client doesn't get batches before snapshot. */
+  snapshotting: Set<string>;
   /** abort signal for in-flight queries when socket closes */
   closed: boolean;
 };
@@ -49,6 +52,7 @@ export function newV3SocketData(): V3SocketData {
     pending: new Map(),
     ticking: new Set(),
     dirty: new Set(),
+    snapshotting: new Set(),
     closed: false,
   };
 }
@@ -102,9 +106,18 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
   }
 
   async function pushSnapshot(ws: V3WebSocket, view: ViewSpec) {
+    // Idempotency: if a snapshot is already in flight for this view, skip.
+    if (ws.data.snapshotting.has(view.id)) {
+      log("debug", "snapshot.skipped.in_flight", { viewId: view.id });
+      return;
+    }
+    ws.data.snapshotting.add(view.id);
     try {
       const snap = await ctx.repo.buildSnapshot(view);
+      // Pre-mark cursor BEFORE sending so any drain (queued during the build)
+      // computes deltas relative to the snapshot cursor, not 0.
       ws.data.pending.set(view.id, snap.cursor);
+      ws.data.acked.set(view.id, Math.max(ws.data.acked.get(view.id) ?? 0, snap.cursor));
       send(ws, {
         op: "view.snapshot",
         viewId: view.id,
@@ -127,6 +140,8 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
     } catch (err) {
       log("error", "snapshot.failed", err);
       send(ws, { op: "view.error", viewId: view.id, reason: errMsg(err) });
+    } finally {
+      ws.data.snapshotting.delete(view.id);
     }
   }
 
@@ -134,6 +149,10 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
     if (ws.data.closed) return;
     const view = ws.data.views.get(viewId);
     if (!view) return;
+    // While the initial snapshot is still being built, skip drain — otherwise
+    // the client receives batches with a cursor of 0 *before* the snapshot
+    // lands, which scrambles ordering.
+    if (ws.data.snapshotting.has(viewId)) return;
     const since = ws.data.pending.get(viewId) ?? ws.data.acked.get(viewId) ?? 0;
 
     try {

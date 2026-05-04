@@ -320,7 +320,33 @@ export function createStore(): Store {
     },
 
     async openChat(chatId, tailLimit = TAIL_DEFAULT) {
-      const tailRows = await idb.getChatTail(chatId, tailLimit);
+      // 1. IDB сначала — мгновенный first-frame для офлайна и быстрого старта.
+      let tailRows = await idb.getChatTail(chatId, tailLimit);
+
+      // 2. Если IDB пуст для этого чата (snapshot теперь не возит tails),
+      //    тянем с сервера через history.range и кэшируем в IDB.
+      if (tailRows.length === 0 && ws && state.status.kind === "open") {
+        try {
+          const reply = await requestHistory(ws, historyRequests, {
+            chatId,
+            limit: tailLimit,
+          });
+          if (reply.items.length) {
+            const itemRows: idb.RenderItemRow[] = reply.items.map((entry) => ({
+              chatId,
+              seq: entry.seq,
+              itemKey: idb.itemKey(entry.item),
+              item: entry.item,
+              bytes: estimateBytes(entry.item),
+            }));
+            await idb.bulkPutRenderItems(itemRows);
+            tailRows = itemRows.map((r) => ({ chatId: r.chatId, seq: r.seq, itemKey: r.itemKey, item: r.item, bytes: r.bytes }));
+          }
+        } catch (err) {
+          console.warn("[sync-v3] openChat: history.range failed", err);
+        }
+      }
+
       const window: ActiveChatWindow = {
         chatId,
         items: tailRows.map((r) => r.item),

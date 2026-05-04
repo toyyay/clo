@@ -13,9 +13,16 @@ import type {
 } from "../../../packages/sync-v3/contracts";
 import { resolvePredicate, v3SessionIdFromSourceFileId, parseV3SessionId } from "./view-resolver";
 
-const DEFAULT_TAIL_ITEMS = 200;
-const MAX_TAIL_ITEMS = 5000;
+// Snapshot защищён жёстким лимитом — это первый фрейм, отдаётся через WS.
+// Никаких "сэндвичей" на 12 МБ: серверу легко, клиенту тяжело.
+//   • DEFAULT_TAIL_ITEMS=0 — снэпшот несёт только мету, тейлы тянутся через
+//     history.range когда юзер реально откроет чат.
+//   • MAX_SNAPSHOT_CHATS — клиент видит верхушку (по lastSeenAt), остальное
+//     грузится paged через chat_index при скролле.
+const DEFAULT_TAIL_ITEMS = 0;
+const MAX_TAIL_ITEMS = 200;
 const MAX_HISTORY_LIMIT = 500;
+const MAX_SNAPSHOT_CHATS = 500;
 
 export type SnapshotResult = {
   /** max sync_revision included in this snapshot */
@@ -119,6 +126,7 @@ async function buildSnapshot(sql: any, view: ViewSpec): Promise<SnapshotResult> 
     from src
     group by source_file_id, agent_id, provider, project_key, title, last_seen_at, size_bytes
     order by last_seen_at desc
+    limit ${MAX_SNAPSHOT_CHATS}
     `,
     [...resolved.params, ...excludesParams(view)],
   );
