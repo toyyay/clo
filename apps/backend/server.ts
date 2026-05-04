@@ -781,16 +781,29 @@ function applySecurityHeaders(res: Response, req: Request): Response {
 function withSecurityHeaders<T extends Record<string, unknown>>(routes: T): T {
   const wrapped: Record<string, unknown> = {};
   for (const [path, handler] of Object.entries(routes)) {
-    if (typeof handler !== "function") {
-      wrapped[path] = handler;
+    if (typeof handler === "function") {
+      wrapped[path] = async (...args: unknown[]) => {
+        const req = args[0] as Request;
+        const result = await (handler as (...args: unknown[]) => unknown)(...args);
+        if (result instanceof Response) return applySecurityHeaders(result, req);
+        return result;
+      };
       continue;
     }
-    wrapped[path] = async (...args: unknown[]) => {
-      const req = args[0] as Request;
-      const result = await (handler as (...args: unknown[]) => unknown)(...args);
-      if (result instanceof Response) return applySecurityHeaders(result, req);
-      return result;
-    };
+    if (handler instanceof Response) {
+      // Bun's routes accept static Response objects (e.g. for `routes["/"]:
+      // indexV3`). The Response is shared across requests so we must clone
+      // before mutating headers — otherwise we'd permanently fuse our
+      // headers onto the static instance.
+      wrapped[path] = (req: Request) => {
+        const cloned = new Response(handler.body, handler);
+        return applySecurityHeaders(cloned, req);
+      };
+      continue;
+    }
+    // HTMLBundle / unknown values pass through; security headers may need
+    // to be added in their generators if those exist.
+    wrapped[path] = handler;
   }
   return wrapped as T;
 }

@@ -3,6 +3,18 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!--
+      Content Security Policy — runtime header equivalent. Static HTMLBundle
+      served by Bun bypasses our withSecurityHeaders wrapper, so the policy
+      ships in the document instead. `frame-ancestors 'none'` is the key
+      defence: even if a malicious site frames us, scripts inside the frame
+      can't reach our session cookie. `connect-src 'self' wss: ws:` permits
+      the WebSocket query channel without leaking egress destinations.
+    -->
+    <meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" />
+    <meta http-equiv="X-Content-Type-Options" content="nosniff" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
     <title>chatview · v3</title>
   </head>
   <body>
