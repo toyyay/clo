@@ -1,0 +1,253 @@
+// Local IndexedDB cache for in-progress and queued audio recordings.
+//
+// Ported from apps/frontend (v2) almost as-is. The only change is that v3
+// owns its own tiny database (`chatview-v3-audio`, two stores) instead of
+// living inside the chat events DB. That isolates failure modes — wiping
+// the chat cache from Settings → "Reset & reload" does NOT lose unsent
+// recordings, and audio survives schema bumps to the chat DB.
+
+import { PCM_AUDIO_CHUNK_MIME_TYPE } from "./browser-audio-recorder";
+
+const DB_NAME = "chatview-v3-audio";
+const DB_VERSION = 1;
+
+export type CachedAudioStatus = "recording" | "pending" | "uploading" | "failed";
+export type CachedAudioCodec = "pcm-s16le";
+
+export type CachedAudioRecording = {
+  id: string;
+  filename: string;
+  mimeType: string;
+  audioCodec?: CachedAudioCodec | null;
+  sampleRate?: number | null;
+  status: CachedAudioStatus;
+  createdAt: string;
+  updatedAt: string;
+  durationMs: number;
+  chunkCount: number;
+  uploadAttempts: number;
+  error?: string | null;
+};
+
+type CachedAudioChunk = {
+  id: string;
+  recordingId: string;
+  index: number;
+  blob: Blob;
+  mimeType: string;
+  createdAt: string;
+};
+
+let dbPromise: Promise<IDBDatabase> | null = null;
+function openAudioDb(): Promise<IDBDatabase> {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => resolve(req.result);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains("audioRecordings")) {
+        db.createObjectStore("audioRecordings", { keyPath: "id" });
+      }
+      if (!db.objectStoreNames.contains("audioChunks")) {
+        const chunks = db.createObjectStore("audioChunks", { keyPath: "id" });
+        chunks.createIndex("recordingId", "recordingId", { unique: false });
+      }
+    };
+  });
+  return dbPromise;
+}
+
+export async function createCachedAudioRecording(
+  mimeType: string,
+  options: { audioCodec?: CachedAudioCodec | null; sampleRate?: number | null } = {},
+): Promise<CachedAudioRecording> {
+  const now = new Date().toISOString();
+  const id = `rec_${Date.now()}_${newRecordingIdPart()}`;
+  const recording: CachedAudioRecording = {
+    id,
+    filename: `recording-${now.replace(/[:.]/g, "-")}.${audioExtensionForMime(mimeType)}`,
+    mimeType,
+    audioCodec: options.audioCodec ?? null,
+    sampleRate: options.sampleRate ?? null,
+    status: "recording",
+    createdAt: now,
+    updatedAt: now,
+    durationMs: 0,
+    chunkCount: 0,
+    uploadAttempts: 0,
+    error: null,
+  };
+  const db = await openAudioDb();
+  const tx = db.transaction("audioRecordings", "readwrite");
+  tx.objectStore("audioRecordings").put(recording);
+  await transactionDone(tx);
+  return recording;
+}
+
+export async function appendCachedAudioChunk(recordingId: string, index: number, blob: Blob, durationMs: number) {
+  const now = new Date().toISOString();
+  const db = await openAudioDb();
+  const chunkTx = db.transaction("audioChunks", "readwrite");
+  chunkTx.objectStore("audioChunks").put({
+    id: `${recordingId}:${String(index).padStart(8, "0")}`,
+    recordingId,
+    index,
+    blob,
+    mimeType: blob.type,
+    createdAt: now,
+  } satisfies CachedAudioChunk);
+  await transactionDone(chunkTx);
+
+  const recording = await loadCachedAudioRecording(recordingId);
+  if (!recording) return;
+  await saveCachedAudioRecording({
+    ...recording,
+    durationMs: Math.max(recording.durationMs, durationMs),
+    chunkCount: Math.max(recording.chunkCount, index + 1),
+    updatedAt: now,
+    error: null,
+  });
+}
+
+export async function finalizeCachedAudioRecording(recordingId: string, durationMs: number) {
+  const recording = await loadCachedAudioRecording(recordingId);
+  if (!recording) return;
+  await saveCachedAudioRecording({
+    ...recording,
+    status: "pending",
+    durationMs: Math.max(recording.durationMs, durationMs),
+    updatedAt: new Date().toISOString(),
+    error: null,
+  });
+}
+
+export async function markCachedAudioRecordingStatus(recordingId: string, status: CachedAudioStatus, error?: string | null) {
+  const recording = await loadCachedAudioRecording(recordingId);
+  if (!recording) return;
+  await saveCachedAudioRecording({
+    ...recording,
+    status,
+    updatedAt: new Date().toISOString(),
+    uploadAttempts: status === "uploading" ? recording.uploadAttempts + 1 : recording.uploadAttempts,
+    error: error ?? null,
+  });
+}
+
+export async function loadCachedAudioRecordings(): Promise<CachedAudioRecording[]> {
+  const db = await openAudioDb();
+  const rows = await request<CachedAudioRecording[]>(
+    db.transaction("audioRecordings").objectStore("audioRecordings").getAll(),
+  );
+  return rows.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+export async function loadCachedAudioRecording(recordingId: string): Promise<CachedAudioRecording | undefined> {
+  const db = await openAudioDb();
+  return request<CachedAudioRecording | undefined>(
+    db.transaction("audioRecordings").objectStore("audioRecordings").get(recordingId),
+  );
+}
+
+export async function loadCachedAudioBlob(recordingId: string): Promise<Blob> {
+  const db = await openAudioDb();
+  const index = db.transaction("audioChunks").objectStore("audioChunks").index("recordingId");
+  const chunks = await request<CachedAudioChunk[]>(index.getAll(IDBKeyRange.only(recordingId)));
+  const ordered = chunks.sort((a, b) => a.index - b.index);
+  if (!ordered.length) throw new Error("cached recording has no audio chunks");
+  const recording = await loadCachedAudioRecording(recordingId);
+  if (recording?.audioCodec === "pcm-s16le" || ordered.some((chunk) => chunk.mimeType === PCM_AUDIO_CHUNK_MIME_TYPE)) {
+    const sampleRate = normalizedSampleRate(recording?.sampleRate);
+    const buffers = await Promise.all(ordered.map((chunk) => chunk.blob.arrayBuffer()));
+    return new Blob([encodeWavFromPcm16Chunks(buffers, sampleRate)], { type: "audio/wav" });
+  }
+  return new Blob(ordered.map((chunk) => chunk.blob), {
+    type: recording?.mimeType || ordered[0]?.mimeType || "audio/webm",
+  });
+}
+
+export async function deleteCachedAudioRecording(recordingId: string) {
+  const db = await openAudioDb();
+  const tx = db.transaction(["audioRecordings", "audioChunks"], "readwrite");
+  tx.objectStore("audioRecordings").delete(recordingId);
+  const chunkIndex = tx.objectStore("audioChunks").index("recordingId");
+  const cursorReq = chunkIndex.openKeyCursor(IDBKeyRange.only(recordingId));
+  cursorReq.onsuccess = () => {
+    const cursor = cursorReq.result;
+    if (!cursor) return;
+    tx.objectStore("audioChunks").delete(cursor.primaryKey);
+    cursor.continue();
+  };
+  await transactionDone(tx);
+}
+
+async function saveCachedAudioRecording(recording: CachedAudioRecording) {
+  const db = await openAudioDb();
+  const tx = db.transaction("audioRecordings", "readwrite");
+  tx.objectStore("audioRecordings").put(recording);
+  await transactionDone(tx);
+}
+
+function audioExtensionForMime(mimeType: string) {
+  if (mimeType.includes("mp4")) return "m4a";
+  if (mimeType.includes("mpeg")) return "mp3";
+  if (mimeType.includes("ogg")) return "ogg";
+  if (mimeType.includes("wav")) return "wav";
+  return "webm";
+}
+
+function normalizedSampleRate(value?: number | null) {
+  return Number.isFinite(value) && value && value > 0 ? Math.round(value) : 44100;
+}
+
+function encodeWavFromPcm16Chunks(chunks: ArrayBuffer[], sampleRate: number) {
+  const dataBytes = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const bytes = new Uint8Array(44 + dataBytes);
+  const view = new DataView(bytes.buffer);
+  writeAscii(bytes, 0, "RIFF");
+  view.setUint32(4, 36 + dataBytes, true);
+  writeAscii(bytes, 8, "WAVE");
+  writeAscii(bytes, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(bytes, 36, "data");
+  view.setUint32(40, dataBytes, true);
+
+  let offset = 44;
+  for (const chunk of chunks) {
+    bytes.set(new Uint8Array(chunk), offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function writeAscii(bytes: Uint8Array, offset: number, value: string) {
+  for (let index = 0; index < value.length; index += 1) {
+    bytes[offset + index] = value.charCodeAt(index);
+  }
+}
+
+function newRecordingIdPart() {
+  return globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
+}
+
+function request<T>(req: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => resolve(req.result);
+  });
+}
+
+function transactionDone(tx: IDBTransaction) {
+  return new Promise<void>((resolve, reject) => {
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+    tx.oncomplete = () => resolve();
+  });
+}

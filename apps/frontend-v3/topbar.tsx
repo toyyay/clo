@@ -1,79 +1,77 @@
-// Top bar — visually echoes the legacy client (☰ burger, chat title +
-// metadata, sync pill, Aa, ⋯ menu).
+// Top bar — ☰ burger, chat title + metadata, sync pill, Aa prefs popover, ⋯ menu.
 
 import { useEffect, useState } from "react";
-import { useStore, useStoreState } from "./store-hook";
+import { useStoreState } from "./store-hook";
 import { formatBytes, formatRelative } from "./format";
-import { SettingsPopover, useVisualSettings } from "./settings";
+import { InterfacePrefsPopover, useVisualSettings } from "./settings";
+import { SettingsModal } from "./settings-modal";
+import { AudioModal } from "./audio-panel";
 import { SyncStatusPopover } from "./sync-status-popover";
 
 export function Topbar({ onToggleSidebar, sidebarOpen }: { onToggleSidebar: () => void; sidebarOpen: boolean }) {
   const state = useStoreState();
   const activeChat = state.activeChat ? state.visibleChats.get(state.activeChat) : null;
   const visual = useVisualSettings();
+  const [prefsOpen, setPrefsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [audioOpen, setAudioOpen] = useState(false);
 
   return (
-    <header className="topbar">
-      <button
-        className="icon-btn topbar-burger"
-        onClick={onToggleSidebar}
-        aria-label={sidebarOpen ? "Hide chats" : "Show chats"}
-        title={sidebarOpen ? "Hide chats" : "Show chats"}
-      >
-        ☰
-      </button>
+    <>
+      <header className="topbar">
+        <button
+          className="icon-btn topbar-burger"
+          onClick={onToggleSidebar}
+          aria-label={sidebarOpen ? "Hide chats" : "Show chats"}
+          title={sidebarOpen ? "Hide chats" : "Show chats"}
+        >
+          ☰
+        </button>
 
-      <div className="topbar-center">
-        {activeChat ? (
-          <>
-            <div className="topbar-title">{activeChat.title || activeChat.chatId}</div>
-            <div className="topbar-meta">
-              {formatRelative(activeChat.lastSeenAt)}
-              <span className="dot">·</span>
-              {activeChat.itemCount.toLocaleString()} items
-              <span className="dot">·</span>
-              {formatBytes(activeChat.approxBytes)}
-              <span className="dot">·</span>
-              {activeChat.provider}
-            </div>
-          </>
-        ) : (
-          <div className="topbar-title topbar-title-empty">Chats</div>
-        )}
-      </div>
+        <div className="topbar-center">
+          {activeChat ? (
+            <>
+              <div className="topbar-title">{activeChat.title || activeChat.chatId}</div>
+              <div className="topbar-meta">
+                {formatRelative(activeChat.lastSeenAt)}
+                <span className="dot">·</span>
+                {activeChat.itemCount.toLocaleString()} items
+                <span className="dot">·</span>
+                {formatBytes(activeChat.approxBytes)}
+                <span className="dot">·</span>
+                {activeChat.provider}
+              </div>
+            </>
+          ) : (
+            <div className="topbar-title topbar-title-empty">Chats</div>
+          )}
+        </div>
 
-      <SyncProgress />
-      <SyncPill />
+        <SyncProgress />
+        <SyncPill />
 
-      <button
-        className="icon-btn settings-button"
-        onClick={() => setSettingsOpen((v) => !v)}
-        aria-label="Display settings"
-        title="Display settings"
-      >
-        Aa
-      </button>
-      {settingsOpen && (
-        <SettingsPopover
+        <InterfacePrefsPopover
+          open={prefsOpen}
           theme={visual.theme}
-          fontScale={visual.fontScale}
+          prefs={visual.prefs}
+          onToggle={() => setPrefsOpen((v) => !v)}
+          onClose={() => setPrefsOpen(false)}
           onThemeChange={visual.setTheme}
-          onFontScaleChange={visual.setFontScale}
-          onClose={() => setSettingsOpen(false)}
+          onChange={visual.updatePrefs}
+          onReset={visual.resetPrefs}
         />
-      )}
 
-      <AppMenu />
-      <BacklogBar />
-    </header>
+        <AppMenu onOpenSettings={() => setSettingsOpen(true)} onOpenAudio={() => setAudioOpen(true)} />
+        <BacklogBar />
+      </header>
+      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+      {audioOpen && <AudioModal onClose={() => setAudioOpen(false)} />}
+    </>
   );
 }
 
 /** Thin indeterminate progress bar painted at the bottom edge of the topbar
- *  while there's pending sync backlog or we're in the middle of (re)connecting.
- *  Tells the user "the app isn't frozen, data is still flowing" without
- *  needing them to open the diagnostics popover. */
+ *  while there's pending sync backlog or we're in the middle of (re)connecting. */
 function BacklogBar() {
   const state = useStoreState();
   let pending = 0;
@@ -123,8 +121,7 @@ function SyncPill() {
   );
 }
 
-function AppMenu() {
-  const store = useStore();
+function AppMenu({ onOpenSettings, onOpenAudio }: { onOpenSettings: () => void; onOpenAudio: () => void }) {
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
@@ -138,34 +135,7 @@ function AppMenu() {
     return () => document.removeEventListener("click", onDoc);
   }, [open]);
 
-  const reload = () => location.reload();
-  const resetAndReload = async () => {
-    if (!confirm("Reset local cache and reload? This drops IndexedDB, view subscriptions and the local client id.")) return;
-    try {
-      store.stop();
-      await new Promise<void>((res) => {
-        const req = indexedDB.deleteDatabase("chatview-v3");
-        req.onsuccess = () => res();
-        req.onerror = () => res();
-        req.onblocked = () => res();
-      });
-      localStorage.removeItem("chatview-v3:client-id");
-      localStorage.removeItem("chatview-v3:sidebar-expanded");
-      if ("serviceWorker" in navigator) {
-        const regs = await navigator.serviceWorker.getRegistrations();
-        await Promise.all(regs.map((r) => r.unregister().catch(() => {})));
-      }
-      if ("caches" in window) {
-        const names = await caches.keys();
-        await Promise.all(names.map((n) => caches.delete(n).catch(() => {})));
-      }
-    } catch {}
-    location.reload();
-  };
-  const forceResync = () => {
-    store.stop();
-    setTimeout(() => location.reload(), 100);
-  };
+  const close = () => setOpen(false);
 
   return (
     <>
@@ -179,10 +149,25 @@ function AppMenu() {
       </button>
       {open && (
         <div className="app-menu-pop">
-          <button onClick={reload}>Reload</button>
-          <button onClick={forceResync}>Force re-sync</button>
-          <button onClick={resetAndReload}>Reset & reload</button>
+          <button
+            onClick={() => {
+              close();
+              onOpenAudio();
+            }}
+          >
+            Audio
+          </button>
+          <button
+            onClick={() => {
+              close();
+              onOpenSettings();
+            }}
+          >
+            Settings
+          </button>
+          <a href="/api/agent/download?arch=arm64">Mac Agent</a>
           <a href="/v2">Open legacy /v2</a>
+          <a href="/api/auth/logout">Sign out</a>
         </div>
       )}
     </>

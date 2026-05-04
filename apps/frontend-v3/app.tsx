@@ -4,12 +4,12 @@ import { Sidebar } from "./sidebar";
 import { ChatView } from "./chat-view";
 import { Topbar } from "./topbar";
 import { useStore, useStoreState } from "./store-hook";
-import { applyVisualSettings, readFontScale, readTheme } from "./settings";
+import { applyVisualSettings, readInterfacePrefs, readTheme } from "./settings";
 import type { ViewSpec } from "../../packages/sync-v3/contracts";
 
 // Apply persisted visual settings synchronously, before React first paints,
 // so the page never flashes the wrong theme.
-applyVisualSettings(readTheme(), readFontScale());
+applyVisualSettings(readTheme(), readInterfacePrefs());
 
 const DEFAULT_VIEW: ViewSpec = {
   id: "all-recent",
