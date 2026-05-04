@@ -3,6 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, normalize } from "node:path";
 import { envValue } from "../../packages/shared/env";
 import { sanitizePostgresText } from "./postgres-sanitize";
+import { writeRenderItemsForEvent, projectKeyFromMetadata } from "./sync-v3/ingest-hook";
 
 export const syncEnginePolicy = {
   protocol: "agent-v1",
@@ -312,8 +313,12 @@ export async function handleAgentAppend(req: Request, sql: any) {
       if (chunk.cursorEnd) ackCursor = chunk.cursorEnd;
       else ackCursor = String(chunkRows[0].id);
 
+      // sync-v3: collect inserted/updated event ids so we can fan out to render_items
+      // after the loop (single round-trip per event keeps the change minimal).
+      const sourceProjectKey = projectKeyFromMetadata(source.metadata);
+
       for (const event of chunk.events) {
-        await tx`
+        const insertedRows = await tx`
           insert into agent_normalized_events (
             raw_chunk_id,
             source_file_id,
@@ -361,8 +366,29 @@ export async function handleAgentAppend(req: Request, sql: any) {
             normalized = excluded.normalized,
             sync_revision = nextval('sync_event_revision_seq'),
             updated_at = now()
+          returning id, sync_revision
         `;
         acceptedEvents++;
+
+        // sync-v3: write pre-rendered items in the same tx. If this throws,
+        // the whole append is rolled back which is the desired behavior — we
+        // don't want normalized events to land without their render rows.
+        const inserted = insertedRows[0];
+        if (inserted) {
+          await writeRenderItemsForEvent(tx, {
+            eventId: Number(inserted.id),
+            syncRevision: Number(inserted.sync_revision),
+            sourceFileId: Number(sourceRows[0].id),
+            sourceGeneration: chunk.sourceGeneration,
+            agentId: agent.agentId,
+            provider: source.provider,
+            projectKey: sourceProjectKey,
+            normalized: event.normalized,
+            raw: (event as any).raw,
+            role: event.role ?? null,
+            eventType: event.eventType ?? null,
+          });
+        }
       }
     }
 
