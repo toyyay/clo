@@ -107,10 +107,36 @@ function makeFakeRepo(): Repo & {
     async searchChats() {
       return { chats: [], hasMore: false };
     },
-    async runRawQuery() {
-      return { rows: [], durationMs: 0, truncated: false };
+    async runRawQuery(opts) {
+      return runFakeQuery(opts);
+    },
+    async runRawQueryWithMaxRev(opts) {
+      const result = runFakeQuery(opts);
+      const maxRev = items.reduce((m, it) => Math.max(m, it.seq), 0);
+      return { ...result, maxRev };
+    },
+    async fetchMaxRev() {
+      return items.reduce((m, it) => Math.max(m, it.seq), 0);
+    },
+    async refreshV4MaterializedViews() {
+      return [
+        { name: "v3_chat_index_full", ok: true },
+        { name: "v3_chat_search", ok: true },
+        { name: "v3_chat_last_render", ok: true },
+      ];
     },
   };
+}
+
+// Tiny stub for runRawQuery: supports only the literal sqls we use in tests.
+// Anything else returns the empty result so behavioural tests stay isolated
+// from real SQL parsing.
+function runFakeQuery(opts: { sql: string; params?: unknown[] }) {
+  const sql = opts.sql.trim().toLowerCase();
+  if (sql === "select 1 as x") {
+    return { rows: [{ x: 1 }], durationMs: 0, truncated: false };
+  }
+  return { rows: [], durationMs: 0, truncated: false };
 }
 
 function matchesViewExcludes(view: ViewSpec, chatId: string): boolean {
@@ -345,6 +371,99 @@ describe("ws-server", () => {
     );
     const snap = sent.find((f) => f.op === "view.snapshot");
     expect(snap).toBeDefined();
+  });
+
+  test("hello.ok includes maxRev (number, >= 0)", async () => {
+    const repo = makeFakeRepo();
+    repo.addEvent("v3:1", TEXT_ITEM, 7);
+    const handlers = makeHandlers({ repo });
+    const { ws, sent } = makeFakeSocket();
+    handlers.onOpen(ws);
+    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 1, clientId: "cmr", views: [] }));
+    const helloOk = sent.find((f) => f.op === "hello.ok");
+    expect(helloOk).toBeDefined();
+    if (helloOk && helloOk.op === "hello.ok") {
+      expect(typeof helloOk.maxRev).toBe("number");
+      expect(helloOk.maxRev).toBeGreaterThanOrEqual(0);
+      // Fake repo derives maxRev from item seq; 7 was added above.
+      expect(helloOk.maxRev).toBe(7);
+    }
+  });
+
+  test("v4 query op returns query.ok with rows + maxRev", async () => {
+    const repo = makeFakeRepo();
+    repo.addEvent("v3:1", TEXT_ITEM, 3);
+    const handlers = makeHandlers({ repo });
+    const { ws, sent } = makeFakeSocket();
+    handlers.onOpen(ws);
+    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 1, clientId: "cq", views: [] }));
+    sent.length = 0;
+
+    await handlers.onMessage(
+      ws,
+      JSON.stringify({ op: "query", reqId: "q1", sql: "select 1 as x" }),
+    );
+
+    const reply = sent.find((f) => f.op === "query.ok");
+    expect(reply).toBeDefined();
+    if (reply && reply.op === "query.ok") {
+      expect(reply.reqId).toBe("q1");
+      expect(reply.rows).toEqual([{ x: 1 }]);
+      expect(typeof reply.maxRev).toBe("number");
+      expect(reply.maxRev).toBe(3);
+    }
+    // v3 query.run.ok must NOT be emitted for the v4 op.
+    expect(sent.find((f) => f.op === "query.run.ok")).toBeUndefined();
+  });
+
+  test("v3 query.run still works in parallel and now also carries maxRev", async () => {
+    const repo = makeFakeRepo();
+    repo.addEvent("v3:1", TEXT_ITEM, 5);
+    const handlers = makeHandlers({ repo });
+    const { ws, sent } = makeFakeSocket();
+    handlers.onOpen(ws);
+    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 1, clientId: "cqr", views: [] }));
+    sent.length = 0;
+
+    await handlers.onMessage(
+      ws,
+      JSON.stringify({ op: "query.run", reqId: "qr1", sql: "select 1 as x" }),
+    );
+    const reply = sent.find((f) => f.op === "query.run.ok");
+    expect(reply).toBeDefined();
+    if (reply && reply.op === "query.run.ok") {
+      expect(reply.reqId).toBe("qr1");
+      expect(reply.maxRev).toBe(5);
+    }
+  });
+
+  test("broadcastTick fans out to every open socket", () => {
+    const repo = makeFakeRepo();
+    const handlers = makeHandlers({ repo });
+    const a = makeFakeSocket();
+    const b = makeFakeSocket();
+    handlers.onOpen(a.ws);
+    handlers.onOpen(b.ws);
+
+    handlers.broadcastTick(42, [1, 2, 3]);
+    const aTick = a.sent.find((f) => f.op === "tick");
+    const bTick = b.sent.find((f) => f.op === "tick");
+    expect(aTick).toBeDefined();
+    expect(bTick).toBeDefined();
+    if (aTick && aTick.op === "tick") {
+      expect(aTick.maxRev).toBe(42);
+      expect(aTick.files).toEqual([1, 2, 3]);
+    }
+
+    // Without files (large batch) — frame should omit `files`.
+    a.sent.length = 0;
+    handlers.broadcastTick(99);
+    const aTick2 = a.sent.find((f) => f.op === "tick");
+    expect(aTick2).toBeDefined();
+    if (aTick2 && aTick2.op === "tick") {
+      expect(aTick2.maxRev).toBe(99);
+      expect(aTick2.files).toBeUndefined();
+    }
   });
 
   test("close marks socket and stops draining", async () => {

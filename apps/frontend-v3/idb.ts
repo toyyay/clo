@@ -20,7 +20,9 @@
 import type { ChatIndex, GroupNode, RenderItem, ViewSpec } from "../../packages/sync-v3/contracts";
 
 const DB_NAME = "chatview-v3";
-const DB_VERSION = 1;
+// v2: adds the `exclude_rules` store used by the v4 protocol store. Old stores
+// untouched — onupgradeneeded only creates the new one.
+const DB_VERSION = 2;
 
 export type ViewRow = {
   viewId: string;
@@ -94,6 +96,11 @@ export function openDb(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains("mutation_outbox")) {
         db.createObjectStore("mutation_outbox", { keyPath: "id" });
+      }
+      if (!db.objectStoreNames.contains("exclude_rules")) {
+        // Auto-incrementing primary key — rule shapes vary by `type` and the
+        // user just wants to add/remove rows; no natural unique key.
+        db.createObjectStore("exclude_rules", { keyPath: "id", autoIncrement: true });
       }
     };
     req.onerror = () => reject(req.error);
@@ -388,6 +395,42 @@ export async function deleteMutations(ids: string[]) {
   const tx = db.transaction("mutation_outbox", "readwrite");
   for (const id of ids) tx.objectStore("mutation_outbox").delete(id);
   await awaitTx(tx);
+}
+
+// ---------- exclude rules (v4) --------------------------------------------
+
+export type ExcludeRuleType = "host" | "project" | "provider" | "chatId" | "kind" | "maxItemBytes";
+
+export type ExcludeRuleRow = {
+  /** Auto-assigned by IDB (autoIncrement). Optional on insert. */
+  id?: number;
+  type: ExcludeRuleType;
+  /** Strings for {host,project,provider,chatId,kind}; numbers for maxItemBytes. */
+  value: string | number;
+  addedAt: string;
+};
+
+export async function addExcludeRule(rule: Omit<ExcludeRuleRow, "id">): Promise<number> {
+  const db = await openDb();
+  const tx = db.transaction("exclude_rules", "readwrite");
+  const req = tx.objectStore("exclude_rules").add(rule);
+  const id = (await awaitReq(req)) as number;
+  await awaitTx(tx);
+  return id;
+}
+
+export async function removeExcludeRule(id: number): Promise<void> {
+  const db = await openDb();
+  const tx = db.transaction("exclude_rules", "readwrite");
+  tx.objectStore("exclude_rules").delete(id);
+  await awaitTx(tx);
+}
+
+export async function listExcludeRules(): Promise<ExcludeRuleRow[]> {
+  const db = await openDb();
+  return awaitReq(
+    db.transaction("exclude_rules").objectStore("exclude_rules").getAll() as IDBRequest<ExcludeRuleRow[]>,
+  );
 }
 
 // ---------- helpers --------------------------------------------------------

@@ -865,6 +865,128 @@ create index if not exists idx_v3_sync_events_view
   where view_id is not null;
 `.trim(),
   },
+  {
+    id: "0017",
+    name: "sync_v4_pg_notify_and_mvs",
+    sql: `
+-- v4 protocol pieces:
+--   1. Trigger that emits pg_notify on every render insert/update — so the
+--      backend's LISTEN-loop can broadcast a "tick" frame to all live
+--      websocket clients without polling. Channel name short on purpose;
+--      payload is small JSON so a wide debounce window fits in the 8000-byte
+--      NOTIFY budget.
+--   2. v3_chat_index_full materialized view — denormalized chat list with
+--      pre-computed item_count and last_render_at. Lets the frontend boot
+--      query be a single SELECT without correlated subqueries.
+--   3. v3_chat_search materialized view — tsvector over title + projectKey
+--      with a GIN index. Supports server-side ILIKE/FTS for sidebar search
+--      against the full corpus, no magic 50.
+--   4. v3_chat_last_render — preview of the last rendered item per chat,
+--      tool bodies stripped. Powers sidebar hover preview and "what's new"
+--      glance without dragging full tails over the wire.
+
+create or replace function chatview_notify_render_change() returns trigger as $$
+declare
+  payload jsonb;
+begin
+  payload := jsonb_build_object(
+    'sourceFileId', new.source_file_id,
+    'syncRevision', new.sync_revision
+  );
+  perform pg_notify('chatview_render_changed', payload::text);
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_chatview_notify_render on agent_render_items;
+create trigger trg_chatview_notify_render
+  after insert or update of payload, display, sync_revision
+  on agent_render_items
+  for each row
+  execute function chatview_notify_render_change();
+
+drop materialized view if exists v3_chat_index_full cascade;
+
+create materialized view v3_chat_index_full as
+select
+  f.id                                                                       as source_file_id,
+  'v3:' || f.id::text                                                        as chat_id,
+  'h:' || f.agent_id || '|p:' || f.provider || '|pr:' || coalesce(nullif(f.metadata->>'projectKey',''),'(unknown)') as group_key,
+  f.agent_id                                                                 as host_id,
+  f.provider                                                                 as provider,
+  coalesce(nullif(f.metadata->>'projectKey',''),'(unknown)')                 as project_key,
+  coalesce(
+    nullif(f.metadata->>'title',''),
+    nullif(f.metadata->>'projectName',''),
+    nullif(f.metadata->>'projectKey',''),
+    '(no title)'
+  )                                                                          as title,
+  f.last_seen_at,
+  f.size_bytes                                                               as approx_bytes,
+  coalesce((select count(*) from agent_render_items r
+            where r.source_file_id = f.id and r.display = true), 0)::bigint  as item_count,
+  (select max(sync_revision) from agent_render_items r
+   where r.source_file_id = f.id and r.display = true)                       as last_sync_revision
+from agent_source_files f
+where f.deleted_at is null and f.source_kind = 'conversation';
+
+create unique index idx_v3_chat_index_full_pk on v3_chat_index_full (source_file_id);
+create index idx_v3_chat_index_full_seen   on v3_chat_index_full (last_seen_at desc nulls last);
+create index idx_v3_chat_index_full_group  on v3_chat_index_full (group_key, last_seen_at desc nulls last);
+create index idx_v3_chat_index_full_host   on v3_chat_index_full (host_id, last_seen_at desc nulls last);
+
+drop materialized view if exists v3_chat_search cascade;
+
+create materialized view v3_chat_search as
+select
+  f.id as source_file_id,
+  'v3:' || f.id::text as chat_id,
+  to_tsvector('simple',
+    coalesce(f.metadata->>'title','') || ' ' ||
+    coalesce(f.metadata->>'projectName','') || ' ' ||
+    coalesce(f.metadata->>'projectKey','') || ' ' ||
+    f.agent_id || ' ' ||
+    f.provider
+  ) as document,
+  coalesce(
+    nullif(f.metadata->>'title',''),
+    nullif(f.metadata->>'projectName',''),
+    nullif(f.metadata->>'projectKey',''),
+    '(no title)'
+  ) as title,
+  coalesce(nullif(f.metadata->>'projectKey',''),'(unknown)') as project_key,
+  f.agent_id as host_id,
+  f.provider,
+  f.last_seen_at
+from agent_source_files f
+where f.deleted_at is null and f.source_kind = 'conversation';
+
+create unique index idx_v3_chat_search_pk on v3_chat_search (source_file_id);
+create index idx_v3_chat_search_doc on v3_chat_search using gin(document);
+create index idx_v3_chat_search_seen on v3_chat_search (last_seen_at desc nulls last);
+
+drop materialized view if exists v3_chat_last_render cascade;
+
+create materialized view v3_chat_last_render as
+select distinct on (r.source_file_id)
+  r.source_file_id,
+  r.sync_revision,
+  -- tool bodies stripped — sidebar preview never needs the full input/output.
+  case (r.payload->>'k')
+    when 'tu' then (r.payload - 'in')
+    when 'tr' then (r.payload - 'out')
+    else r.payload
+  end as item,
+  r.payload->>'k' as kind,
+  r.created_at
+from agent_render_items r
+where r.display = true
+order by r.source_file_id, r.sync_revision desc;
+
+create unique index idx_v3_chat_last_render_pk on v3_chat_last_render (source_file_id);
+`.trim(),
+    transaction: false,
+  },
 ];
 
 export function migrationsEnabled(env = process.env) {

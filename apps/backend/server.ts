@@ -8,6 +8,7 @@ import * as Y from "yjs";
 import type { ServerWebSocket } from "bun";
 import { makeHandlers as makeV3Handlers, makePostgresContext as makeV3PgContext, newV3SocketData, type V3SocketData, type V3WebSocket } from "./sync-v3/ws-server";
 import { makeRepo as makeV3Repo } from "./sync-v3/repo";
+import { makeNotifyListener, type NotifyListener } from "./sync-v3/notify-listener";
 import type {
   AppSettingsInfo,
   AppLogBatchRequest,
@@ -125,6 +126,7 @@ const docIdsBySocket = new WeakMap<YjsWebSocket, Set<string>>();
 let v3HandlersSingleton: ReturnType<typeof makeV3Handlers> | null = null;
 let v3RepoSingleton: ReturnType<typeof makeV3Repo> | null = null;
 let v3RefreshTimer: ReturnType<typeof setInterval> | null = null;
+let v4NotifyListenerSingleton: NotifyListener | null = null;
 const V3_AGGREGATE_REFRESH_MS = 60_000;
 function v3Handlers() {
   if (v3HandlersSingleton) return v3HandlersSingleton;
@@ -141,6 +143,15 @@ function v3Handlers() {
       });
     }, V3_AGGREGATE_REFRESH_MS);
   }
+
+  // v4 notify-listener: tick fan-out + MV refresh on the same debounce window.
+  // Spun up alongside the WS handlers so the broadcast target exists.
+  if (!v4NotifyListenerSingleton) {
+    v4NotifyListenerSingleton = makeNotifyListener({
+      repo: v3RepoSingleton,
+      handlers: v3HandlersSingleton,
+    });
+  }
   return v3HandlersSingleton;
 }
 /** Called by ingest path after agent append commits, so any connected clients */
@@ -148,12 +159,22 @@ function v3Handlers() {
 export function notifyV3NewEvents(maxRevision: number) {
   if (!v3HandlersSingleton) return;
   v3HandlersSingleton.notifyNewEvents(maxRevision);
+  // v4 path: feed the listener too. maxRevision is sometimes 0 (caller didn't
+  // know a precise value) — the listener falls back to its 1s poll in that
+  // case so we never under-tick.
+  if (v4NotifyListenerSingleton && maxRevision > 0) {
+    v4NotifyListenerSingleton.reportRenderChange(0, maxRevision);
+  }
 }
 /** Called when a specific source_file_id received new events. Used to fire   */
 /** chat.added on followNew=true views.                                       */
-export function notifyV3AffectedChat(sourceFileId: number) {
+export function notifyV3AffectedChat(sourceFileId: number, syncRevision = 0) {
   if (!v3HandlersSingleton) return;
   v3HandlersSingleton.notifyAffectedChat(sourceFileId);
+  // v4 path: include the source_file_id so clients can re-pull narrowly.
+  if (v4NotifyListenerSingleton) {
+    v4NotifyListenerSingleton.reportRenderChange(sourceFileId, syncRevision);
+  }
 }
 
 if (!agentToken) {
@@ -198,6 +219,10 @@ process.on("uncaughtException", (error) => {
 
 await prepareDatabase();
 await prepareDataDir();
+// Eagerly init v3/v4 ws + notify-listener so the polling loop runs even
+// before the first browser connect — backfill scripts that touch
+// agent_render_items will still produce ticks the moment a client lands.
+v3Handlers();
 void refreshOpenRouterStatus("startup").catch((error) => {
   console.error("OpenRouter startup check failed", error instanceof Error ? error.message : String(error));
 });

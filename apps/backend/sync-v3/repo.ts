@@ -65,6 +65,19 @@ export type Repo = {
    *  op) so we can iterate UI features without minting new RPC operations
    *  every time. Returns row objects keyed by column name. */
   runRawQuery(opts: RunRawQueryOpts): Promise<{ rows: Record<string, unknown>[]; durationMs: number; truncated: boolean }>;
+  /** Same as runRawQuery but also reads `max(sync_revision)` inside the same
+   *  read-only transaction. v4 `query` op uses this so the returned rows and
+   *  the `maxRev` watermark are race-free with each other. */
+  runRawQueryWithMaxRev(opts: RunRawQueryOpts): Promise<{ rows: Record<string, unknown>[]; durationMs: number; truncated: boolean; maxRev: number }>;
+  /** Read the largest currently-visible `sync_revision`. Used by hello.ok to
+   *  bootstrap the v4 client's tick tracker, and by the notify-listener as a
+   *  poll fallback when LISTEN delivery is unavailable. */
+  fetchMaxRev(): Promise<number>;
+  /** Refresh the v4 chat-index/search/last-render materialized views.
+   *  Each view has a unique index so `concurrently` works. Returns once all
+   *  three settle (success or failure). Failures are surfaced as the rejected
+   *  per-view promise so the caller can warn-log without aborting tick. */
+  refreshV4MaterializedViews(): Promise<{ name: string; ok: boolean; error?: string }[]>;
   bytesRemainingForView(view: ViewSpec, cursor: number): Promise<number>;
   refreshGroupAggregates(): Promise<void>;
 };
@@ -124,7 +137,62 @@ export function makeRepo(sql: any): Repo {
     listChatsByGroup: (opts) => listChatsByGroup(sql, opts),
     searchChats: (opts) => searchChats(sql, opts),
     runRawQuery: (opts) => runRawQuery(sql, opts),
+    runRawQueryWithMaxRev: (opts) => runRawQueryWithMaxRev(sql, opts),
+    fetchMaxRev: () => fetchMaxRev(sql),
+    refreshV4MaterializedViews: () => refreshV4MaterializedViews(sql),
   };
+}
+
+async function fetchMaxRev(sql: any): Promise<number> {
+  // coalesce keeps the empty-DB case (no render rows) returning 0 instead of
+  // null. cast to ::bigint then we normalise to JS number; sync_revision is
+  // monotonic per-row so the value fits in JS's 53-bit int range for the
+  // foreseeable life of this app.
+  const rows = await sql`select coalesce(max(sync_revision), 0)::bigint as m from agent_render_items`;
+  const raw = rows[0]?.m ?? 0;
+  return typeof raw === "bigint" ? Number(raw) : Number(raw);
+}
+
+async function runRawQueryWithMaxRev(
+  sql: any,
+  opts: RunRawQueryOpts,
+): Promise<{ rows: Record<string, unknown>[]; durationMs: number; truncated: boolean; maxRev: number }> {
+  const t0 = Date.now();
+  const params = Array.isArray(opts.params) ? opts.params : [];
+  const result = await sql.transaction(async (tx: any) => {
+    await tx.unsafe(`set local transaction read only`);
+    await tx.unsafe(`set local statement_timeout = ${RAW_QUERY_STATEMENT_TIMEOUT_MS}`);
+    const rows = await tx.unsafe(opts.sql, params);
+    // Read maxRev inside the same tx so it's a consistent snapshot with the
+    // user's query — the client uses it as a "I have data up to revision X"
+    // watermark.
+    const mrRows = await tx.unsafe(`select coalesce(max(sync_revision), 0)::bigint as m from agent_render_items`);
+    const raw = mrRows?.[0]?.m ?? 0;
+    const maxRev = typeof raw === "bigint" ? Number(raw) : Number(raw);
+    return { rows: rows as any[], maxRev };
+  });
+  const truncated = result.rows.length > MAX_RAW_QUERY_ROWS;
+  const safeRows = result.rows.slice(0, MAX_RAW_QUERY_ROWS).map((row: any) => normalizeRow(row));
+  return { rows: safeRows, durationMs: Date.now() - t0, truncated, maxRev: result.maxRev };
+}
+
+const V4_MATERIALIZED_VIEWS = ["v3_chat_index_full", "v3_chat_search", "v3_chat_last_render"] as const;
+
+async function refreshV4MaterializedViews(
+  sql: any,
+): Promise<{ name: string; ok: boolean; error?: string }[]> {
+  // CONCURRENTLY needs the unique index migration 0017 created. Run them in
+  // parallel — Postgres serialises the actual refresh internally per-view but
+  // network round-trips overlap, which keeps the tick latency budget tight.
+  const settled = await Promise.allSettled(
+    V4_MATERIALIZED_VIEWS.map((name) => sql.unsafe(`refresh materialized view concurrently ${name}`)),
+  );
+  return settled.map((r, i) => {
+    const name = V4_MATERIALIZED_VIEWS[i]!;
+    if (r.status === "fulfilled") return { name, ok: true };
+    const error = r.reason instanceof Error ? r.reason.message : String(r.reason);
+    return { name, ok: false, error };
+  });
 }
 
 async function runRawQuery(sql: any, opts: RunRawQueryOpts): Promise<{ rows: Record<string, unknown>[]; durationMs: number; truncated: boolean }> {

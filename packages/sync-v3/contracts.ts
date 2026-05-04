@@ -160,6 +160,17 @@ export type ChatIndex = {
 };
 
 // ---------- WS Frames ------------------------------------------------------
+//
+// Two parallel protocols live in this union for now:
+//   • v3 ops (`view.*`, `chat.added/removed`, `chats.byGroup/search`, `history.range`)
+//     — pre-existing snapshot/batch model; being phased out.
+//   • v4 ops (`query`, `tick`, `hello.ok` extended with maxRev) — pull-on-tick
+//     model. Server is a dumb transport: it broadcasts {op:"tick", maxRev,
+//     files} when ingest writes new render rows; client decides what to
+//     re-pull via `query`. No predicate/snapshot/batch state on server.
+//
+// During Phase 2-3 of the v4 rollout, both work. Phase 4 deletes the v3
+// frames entirely along with their server-side machinery.
 
 export type ClientFrame =
   | { op: "hello"; v: number; clientId: string; deviceMemoryGb?: number; views: ClientViewState[] }
@@ -179,6 +190,8 @@ export type ClientFrame =
    *  (~5 devices, single user); the backend does NOT whitelist or sign
    *  queries — params are bound, transaction is read-only, timeout is 5s. */
   | { op: "query.run"; reqId: string; sql: string; params?: unknown[] }
+  /** v4: alias of query.run with a shorter name and the same semantics. */
+  | { op: "query"; reqId: string; sql: string; params?: unknown[] }
   | { op: "ping" };
 
 export type ClientViewState = {
@@ -190,7 +203,16 @@ export type ClientViewState = {
 };
 
 export type ServerFrame =
-  | { op: "hello.ok"; v: number; serverTime: string }
+  | { op: "hello.ok"; v: number; serverTime: string; maxRev?: number }
+  /** v4 live-tick: "something changed in the DB". `files` is a short list of
+   *  affected source_file_ids when the debounce window stays small enough;
+   *  if it grows past ~64 ids server omits it and client re-pulls broadly. */
+  | { op: "tick"; maxRev: number; files?: number[] }
+  /** v4 query reply (alias of query.run.ok with a shorter name). `maxRev`
+   *  is the max sync_revision visible to the read transaction — clients use
+   *  it to decide whether they're already caught up to the latest tick. */
+  | { op: "query.ok"; reqId: string; rows: Record<string, unknown>[]; rowCount: number; durationMs: number; truncated: boolean; maxRev: number }
+  | { op: "query.err"; reqId: string; error: string }
   | { op: "view.snapshot"; viewId: string; cursor: number; groups: GroupNode[]; chats: ChatIndex[]; tails: Record<string, SeqRenderItem[]>; totals: { items: number; bytesRemaining: number } }
   | { op: "view.batch"; viewId: string; cursor: number; items: BatchItem[]; bytesRemaining: number; moreReady: boolean }
   | { op: "view.idle"; viewId: string; cursor: number }
@@ -202,7 +224,7 @@ export type ServerFrame =
   | { op: "history.range.ok"; reqId: string; chatId: string; items: SeqRenderItem[]; hasOlder: boolean; hasNewer: boolean }
   | { op: "chats.byGroup.ok"; reqId: string; groupKey: string; chats: ChatIndex[]; hasMore: boolean }
   | { op: "chats.search.ok"; reqId: string; query: string; chats: ChatIndex[]; hasMore: boolean }
-  | { op: "query.run.ok"; reqId: string; rows: Record<string, unknown>[]; rowCount: number; durationMs: number; truncated: boolean }
+  | { op: "query.run.ok"; reqId: string; rows: Record<string, unknown>[]; rowCount: number; durationMs: number; truncated: boolean; maxRev?: number }
   | { op: "query.run.err"; reqId: string; error: string }
   | { op: "flow.adjust"; batchBytes: number; reason: string }
   | { op: "pong" };

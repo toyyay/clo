@@ -80,6 +80,9 @@ export type WsHandlers = {
   /** Called when a specific chat received new events. If any followNew view    */
   /** matches and the chat isn't yet a member, emits chat.added.                */
   notifyAffectedChat(sourceFileId: number): void;
+  /** v4: broadcast a `tick` frame to every open socket. `files` is omitted by  */
+  /** the caller when the affected-files set is too large to fit in one frame. */
+  broadcastTick(maxRev: number, files?: number[]): void;
 };
 
 export type WsContext = {
@@ -337,6 +340,16 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
         }
       }
     },
+    broadcastTick(maxRev: number, files?: number[]) {
+      // v4 transport: dumb fan-out. Clients drive their own re-pull strategy.
+      const frame: ServerFrame = files !== undefined
+        ? { op: "tick", maxRev, files }
+        : { op: "tick", maxRev };
+      for (const ws of sockets) {
+        if (ws.data.closed) continue;
+        send(ws, frame);
+      }
+    },
     notifyAffectedChat(sourceFileId: number) {
       // Это вызывается ingest-хуком когда есть конкретный source_file_id с новыми
       // events. Для каждого открытого сокета: если есть view с followNew=true,
@@ -392,7 +405,17 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
     switch (frame.op) {
       case "hello": {
         ws.data.clientId = frame.clientId;
-        send(ws, { op: "hello.ok", v: WS_PROTOCOL_VERSION, serverTime: new Date().toISOString() });
+        // v4: include the current max sync_revision so a reconnecting client
+        // can decide whether it's caught up to the latest tick before
+        // re-issuing a `query`. Best-effort — if the read fails (e.g. db
+        // hiccup) we still send hello.ok so the legacy v3 path stays alive.
+        let maxRev = 0;
+        try {
+          maxRev = await ctx.repo.fetchMaxRev();
+        } catch (err) {
+          log("warn", "hello.fetchMaxRev.failed", err);
+        }
+        send(ws, { op: "hello.ok", v: WS_PROTOCOL_VERSION, serverTime: new Date().toISOString(), maxRev });
 
         // Telemetry: open session row, log structured event.
         try {
@@ -658,24 +681,44 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
         return;
       }
 
-      case "query.run": {
+      case "query.run":
+      case "query": {
+        // v3 op: "query.run" — kept for the existing client.
+        // v4 op: "query"     — same semantics, different reply op name.
+        // Both go through runRawQueryWithMaxRev so the v4 client can use the
+        // returned `maxRev` as its tick watermark race-free with the rows.
         const t0 = Date.now();
+        const isV4 = frame.op === "query";
         try {
-          const result = await ctx.repo.runRawQuery({
+          const result = await ctx.repo.runRawQueryWithMaxRev({
             sql: frame.sql,
             params: frame.params,
           });
-          const bytes = send(ws, {
-            op: "query.run.ok",
-            reqId: frame.reqId,
-            rows: result.rows,
-            rowCount: result.rows.length,
-            durationMs: result.durationMs,
-            truncated: result.truncated,
-          });
+          const bytes = isV4
+            ? send(ws, {
+                op: "query.ok",
+                reqId: frame.reqId,
+                rows: result.rows,
+                rowCount: result.rows.length,
+                durationMs: result.durationMs,
+                truncated: result.truncated,
+                maxRev: result.maxRev,
+              })
+            : send(ws, {
+                op: "query.run.ok",
+                reqId: frame.reqId,
+                rows: result.rows,
+                rowCount: result.rows.length,
+                durationMs: result.durationMs,
+                truncated: result.truncated,
+                // Additive: v3 clients ignore unknown fields, v4-style users
+                // who haven't migrated to "query" still benefit from a
+                // watermark.
+                maxRev: result.maxRev,
+              });
           telemetry.log({
             clientId: ws.data.clientId ?? null,
-            event: "query.run",
+            event: isV4 ? "query" : "query.run",
             level: "info",
             durationMs: Date.now() - t0,
             bytes,
@@ -685,18 +728,19 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
               rowCount: result.rows.length,
               truncated: result.truncated,
               dbDurationMs: result.durationMs,
+              maxRev: result.maxRev,
             },
           });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          send(ws, {
-            op: "query.run.err",
-            reqId: frame.reqId,
-            error: message,
-          });
+          if (isV4) {
+            send(ws, { op: "query.err", reqId: frame.reqId, error: message });
+          } else {
+            send(ws, { op: "query.run.err", reqId: frame.reqId, error: message });
+          }
           telemetry.log({
             clientId: ws.data.clientId ?? null,
-            event: "query.run",
+            event: isV4 ? "query" : "query.run",
             level: "warn",
             durationMs: Date.now() - t0,
             bytes: 0,

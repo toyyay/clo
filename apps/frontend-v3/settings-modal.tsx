@@ -5,9 +5,12 @@
 // now only opens this modal plus Audio. Heavy / dangerous actions belong
 // in a dedicated surface where the user can read what they do.
 
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { useStore, useStoreState } from "./store-hook";
 import { formatBytes, formatRelative } from "./format";
+import type { ExcludeRuleRow, ExcludeRuleType } from "./idb";
+
+const PROTOCOL_KEY = "chatview-v3:protocol";
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const store = useStore();
@@ -15,6 +18,64 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [sha, setSha] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [protocol, setProtocol] = useState<"v3" | "v4">(() => {
+    try {
+      return localStorage.getItem(PROTOCOL_KEY) === "v4" ? "v4" : "v3";
+    } catch {
+      return "v3";
+    }
+  });
+  const [rules, setRules] = useState<ExcludeRuleRow[]>([]);
+  const [newRuleType, setNewRuleType] = useState<ExcludeRuleType>("host");
+  const [newRuleValue, setNewRuleValue] = useState<string>("");
+
+  // v4-only: load and manipulate exclude rules. The v3 store doesn't expose
+  // these methods; guard the calls so we don't crash on the older store.
+  const supportsRules = protocol === "v4" && typeof (store as unknown as { listExcludeRules?: unknown }).listExcludeRules === "function";
+  useEffect(() => {
+    if (!supportsRules) return;
+    let cancelled = false;
+    void (store as unknown as { listExcludeRules: () => Promise<ExcludeRuleRow[]> })
+      .listExcludeRules()
+      .then((rows) => {
+        if (!cancelled) setRules(rows);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [supportsRules, store]);
+
+  const switchProtocol = (next: "v3" | "v4") => {
+    try {
+      localStorage.setItem(PROTOCOL_KEY, next);
+    } catch {}
+    setProtocol(next);
+    // Reload to swap stores cleanly.
+    setTimeout(() => location.reload(), 50);
+  };
+
+  const addRule = async () => {
+    const v = newRuleValue.trim();
+    if (!v) return;
+    const value: string | number = newRuleType === "maxItemBytes" ? Number(v) || 0 : v;
+    await (store as unknown as { addExcludeRule: (r: Omit<ExcludeRuleRow, "id">) => Promise<void> }).addExcludeRule({
+      type: newRuleType,
+      value,
+      addedAt: new Date().toISOString(),
+    });
+    setRules(
+      await (store as unknown as { listExcludeRules: () => Promise<ExcludeRuleRow[]> }).listExcludeRules(),
+    );
+    setNewRuleValue("");
+  };
+
+  const removeRule = async (id: number) => {
+    await (store as unknown as { removeExcludeRule: (id: number) => Promise<void> }).removeExcludeRule(id);
+    setRules(
+      await (store as unknown as { listExcludeRules: () => Promise<ExcludeRuleRow[]> }).listExcludeRules(),
+    );
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -131,6 +192,99 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               </button>
             </div>
           </div>
+
+          <div className="modal-section">
+            <div className="modal-section-title">Sync protocol</div>
+            <div className="modal-section-desc">
+              v3 is the snapshot/batch model. v4 (experimental) is pull-on-tick: WebSocket only carries
+              "something changed", client decides what to re-pull. Switch reloads the page.
+            </div>
+            <div className="modal-actions">
+              <button
+                onClick={() => switchProtocol("v3")}
+                style={{ borderColor: protocol === "v3" ? "var(--text-link)" : undefined }}
+              >
+                v3 {protocol === "v3" && "✓"}
+              </button>
+              <button
+                onClick={() => switchProtocol("v4")}
+                style={{ borderColor: protocol === "v4" ? "var(--text-link)" : undefined }}
+              >
+                v4 (experimental) {protocol === "v4" && "✓"}
+              </button>
+            </div>
+          </div>
+
+          {supportsRules && (
+            <div className="modal-section">
+              <div className="modal-section-title">Filters (don't sync)</div>
+              <div className="modal-section-desc">
+                Hide chats by host, project, provider, or kind. New matching chats stay hidden until
+                the rule is removed. Rules apply on every re-pull.
+              </div>
+              {rules.length > 0 && (
+                <div className="modal-kv">
+                  {rules
+                    .filter((r): r is ExcludeRuleRow & { id: number } => typeof r.id === "number")
+                    .map((r) => (
+                      <Fragment key={r.id}>
+                        <span>{r.type}</span>
+                        <b style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                          <span style={{ flex: 1 }}>{String(r.value)}</span>
+                          <button className="icon-btn" onClick={() => removeRule(r.id)} title="Remove rule">
+                            ×
+                          </button>
+                        </b>
+                      </Fragment>
+                    ))}
+                </div>
+              )}
+              <div className="modal-actions" style={{ marginTop: 6 }}>
+                <select
+                  value={newRuleType}
+                  onChange={(e) => setNewRuleType(e.target.value as ExcludeRuleType)}
+                  style={{
+                    border: "1px solid var(--border-strong)",
+                    background: "var(--bg-input)",
+                    color: "var(--text)",
+                    borderRadius: 6,
+                    padding: "5px 8px",
+                  }}
+                >
+                  <option value="host">host</option>
+                  <option value="project">project</option>
+                  <option value="provider">provider</option>
+                  <option value="chatId">chatId</option>
+                  <option value="kind">kind (tu/tr/th)</option>
+                  <option value="maxItemBytes">maxItemBytes</option>
+                </select>
+                <input
+                  value={newRuleValue}
+                  onChange={(e) => setNewRuleValue(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void addRule();
+                  }}
+                  placeholder={
+                    newRuleType === "maxItemBytes"
+                      ? "8192"
+                      : newRuleType === "kind"
+                        ? "tu"
+                        : "value"
+                  }
+                  style={{
+                    flex: 1,
+                    minWidth: 120,
+                    border: "1px solid var(--border-strong)",
+                    background: "var(--bg-input)",
+                    color: "var(--text)",
+                    borderRadius: 6,
+                    padding: "5px 8px",
+                  }}
+                />
+                <button onClick={() => void addRule()}>Add</button>
+              </div>
+            </div>
+          )}
 
           <div className="modal-section">
             <div className="modal-section-title">Other</div>
