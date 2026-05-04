@@ -172,6 +172,13 @@ export type ClientFrame =
   | { op: "history.range"; reqId: string; chatId: string; before?: number; after?: number; limit: number }
   | { op: "chats.byGroup"; reqId: string; groupKey: string; afterLastSeenAt?: string; limit: number }
   | { op: "chats.search"; reqId: string; query: string; limit: number }
+  /** Escape hatch: run an arbitrary SQL query against the chatview Postgres
+   *  in a read-only, statement_timeout-bounded transaction. Used by the
+   *  frontend to iterate UI features without round-tripping new RPC ops
+   *  through the protocol every time. Note: this is a small private app
+   *  (~5 devices, single user); the backend does NOT whitelist or sign
+   *  queries — params are bound, transaction is read-only, timeout is 5s. */
+  | { op: "query.run"; reqId: string; sql: string; params?: unknown[] }
   | { op: "ping" };
 
 export type ClientViewState = {
@@ -195,6 +202,8 @@ export type ServerFrame =
   | { op: "history.range.ok"; reqId: string; chatId: string; items: SeqRenderItem[]; hasOlder: boolean; hasNewer: boolean }
   | { op: "chats.byGroup.ok"; reqId: string; groupKey: string; chats: ChatIndex[]; hasMore: boolean }
   | { op: "chats.search.ok"; reqId: string; query: string; chats: ChatIndex[]; hasMore: boolean }
+  | { op: "query.run.ok"; reqId: string; rows: Record<string, unknown>[]; rowCount: number; durationMs: number; truncated: boolean }
+  | { op: "query.run.err"; reqId: string; error: string }
   | { op: "flow.adjust"; batchBytes: number; reason: string }
   | { op: "pong" };
 

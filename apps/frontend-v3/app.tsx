@@ -44,6 +44,13 @@ export function App() {
     const clientId = ensureClientId();
     void store.start({ url: makeWsUrl(), clientId });
     void registerServiceWorker();
+    // Expose the query escape hatch on window so we can iterate from the
+    // DevTools console without rebuilding: `await chatview.q("select count(*)
+    // from agent_source_files")` returns rows + durationMs + truncated flag.
+    (window as unknown as { chatview?: unknown }).chatview = {
+      q: (sql: string, params?: unknown[]) => store.runQuery(sql, params),
+      store,
+    };
     return () => store.stop();
   }, [store]);
 

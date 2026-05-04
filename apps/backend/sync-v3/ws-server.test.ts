@@ -107,6 +107,9 @@ function makeFakeRepo(): Repo & {
     async searchChats() {
       return { chats: [], hasMore: false };
     },
+    async runRawQuery() {
+      return { rows: [], durationMs: 0, truncated: false };
+    },
   };
 }
 

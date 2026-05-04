@@ -77,6 +77,13 @@ export type Store = {
   loadGroupChildren(parentKey: string): Promise<GroupNode[]>;
   loadChatPage(groupKey: string, opts: { afterLastSeenAt?: string; limit: number }): Promise<ChatIndex[]>;
   searchChats(query: string, limit?: number): Promise<{ chats: ChatIndex[]; hasMore: boolean }>;
+  /** Escape hatch — run an arbitrary SQL string against the chatview Postgres
+   *  in a read-only, statement_timeout-bounded server-side transaction.
+   *  Use to iterate UI features without minting new RPC ops. */
+  runQuery<T = Record<string, unknown>>(
+    sql: string,
+    params?: unknown[],
+  ): Promise<{ rows: T[]; durationMs: number; truncated: boolean }>;
 };
 
 const TAIL_DEFAULT = 200;
@@ -116,6 +123,14 @@ export function createStore(): Store {
   const chatPageRequests = new Map<string, (frame: { chats: ChatIndex[]; hasMore: boolean }) => void>();
   /** map reqId → resolver for pending chats.search */
   const chatSearchRequests = new Map<string, (frame: { chats: ChatIndex[]; hasMore: boolean }) => void>();
+  /** map reqId → { resolve, reject } for pending query.run */
+  const rawQueryRequests = new Map<
+    string,
+    {
+      resolve: (frame: { rows: Record<string, unknown>[]; durationMs: number; truncated: boolean }) => void;
+      reject: (err: Error) => void;
+    }
+  >();
 
   function commit(next: Partial<StoreState>) {
     state = { ...state, ...next };
@@ -266,6 +281,26 @@ export function createStore(): Store {
         if (cb) {
           cb({ chats: frame.chats, hasMore: frame.hasMore });
           chatSearchRequests.delete(frame.reqId);
+        }
+        return;
+      }
+      case "query.run.ok": {
+        const handler = rawQueryRequests.get(frame.reqId);
+        if (handler) {
+          handler.resolve({
+            rows: frame.rows,
+            durationMs: frame.durationMs,
+            truncated: frame.truncated,
+          });
+          rawQueryRequests.delete(frame.reqId);
+        }
+        return;
+      }
+      case "query.run.err": {
+        const handler = rawQueryRequests.get(frame.reqId);
+        if (handler) {
+          handler.reject(new Error(frame.error));
+          rawQueryRequests.delete(frame.reqId);
         }
         return;
       }
@@ -601,6 +636,30 @@ export function createStore(): Store {
       }
       out.sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
       return { chats: out, hasMore: out.length >= limit };
+    },
+
+    runQuery<T = Record<string, unknown>>(sql: string, params?: unknown[]) {
+      if (!ws || state.status.kind !== "open") {
+        return Promise.reject(new Error("ws is not open"));
+      }
+      return new Promise<{ rows: T[]; durationMs: number; truncated: boolean }>((resolve, reject) => {
+        const reqId = `q-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+        const timer = setTimeout(() => {
+          rawQueryRequests.delete(reqId);
+          reject(new Error("query.run timeout"));
+        }, 30_000);
+        rawQueryRequests.set(reqId, {
+          resolve: (frame) => {
+            clearTimeout(timer);
+            resolve({ rows: frame.rows as T[], durationMs: frame.durationMs, truncated: frame.truncated });
+          },
+          reject: (err) => {
+            clearTimeout(timer);
+            reject(err);
+          },
+        });
+        ws!.send({ op: "query.run", reqId, sql, params: params ?? [] });
+      });
     },
   };
 }

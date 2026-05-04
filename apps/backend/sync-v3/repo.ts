@@ -60,9 +60,25 @@ export type Repo = {
    *  (NOT just chats already streamed in the snapshot). Used by the sidebar
    *  search box so a query for an old chat actually finds it. */
   searchChats(opts: SearchChatsOpts): Promise<{ chats: ChatIndex[]; hasMore: boolean }>;
+  /** Run an arbitrary SQL string in a read-only transaction with a tight
+   *  statement_timeout. Used by the frontend escape hatch (query.run WS
+   *  op) so we can iterate UI features without minting new RPC operations
+   *  every time. Returns row objects keyed by column name. */
+  runRawQuery(opts: RunRawQueryOpts): Promise<{ rows: Record<string, unknown>[]; durationMs: number; truncated: boolean }>;
   bytesRemainingForView(view: ViewSpec, cursor: number): Promise<number>;
   refreshGroupAggregates(): Promise<void>;
 };
+
+export type RunRawQueryOpts = {
+  sql: string;
+  params?: unknown[];
+};
+
+/** Hard cap so a `select * from agent_render_items` doesn't fill memory.
+ *  When triggered, response is marked `truncated: true` so caller knows. */
+const MAX_RAW_QUERY_ROWS = 5000;
+/** Per-statement Postgres timeout. Frontend can't deadlock its own backend. */
+const RAW_QUERY_STATEMENT_TIMEOUT_MS = 5000;
 
 export type SearchChatsOpts = {
   query: string;
@@ -107,7 +123,51 @@ export function makeRepo(sql: any): Repo {
     fetchChatIndex: (sourceFileId) => fetchChatIndex(sql, sourceFileId),
     listChatsByGroup: (opts) => listChatsByGroup(sql, opts),
     searchChats: (opts) => searchChats(sql, opts),
+    runRawQuery: (opts) => runRawQuery(sql, opts),
   };
+}
+
+async function runRawQuery(sql: any, opts: RunRawQueryOpts): Promise<{ rows: Record<string, unknown>[]; durationMs: number; truncated: boolean }> {
+  const t0 = Date.now();
+  const params = Array.isArray(opts.params) ? opts.params : [];
+  // Wrap in a transaction so:
+  //   1. SET LOCAL TRANSACTION READ ONLY rejects any UPDATE/INSERT/DDL the
+  //      user pastes (or that lives inside a CTE or subquery).
+  //   2. SET LOCAL statement_timeout is scoped to this tx only.
+  // Both SET LOCAL targets cannot be parameterized — but the only "user input"
+  // that flows into them is the timeout, which is a numeric literal we own.
+  const rows: any[] = await sql.transaction(async (tx: any) => {
+    await tx.unsafe(`set local transaction read only`);
+    await tx.unsafe(`set local statement_timeout = ${RAW_QUERY_STATEMENT_TIMEOUT_MS}`);
+    return tx.unsafe(opts.sql, params);
+  });
+  const truncated = rows.length > MAX_RAW_QUERY_ROWS;
+  // Bun's tagged-SQL returns row objects with values typed by Postgres
+  // (Date, BigInt for int8, etc.). Convert non-JSON-safe scalars so the
+  // payload survives JSON.stringify on the WS write path.
+  const safeRows = rows.slice(0, MAX_RAW_QUERY_ROWS).map((row: any) => normalizeRow(row));
+  return { rows: safeRows, durationMs: Date.now() - t0, truncated };
+}
+
+function normalizeRow(row: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(row)) out[k] = normalizeValue(v);
+  return out;
+}
+
+function normalizeValue(v: unknown): unknown {
+  if (v === null || v === undefined) return v;
+  if (typeof v === "bigint") return v.toString();
+  if (v instanceof Date) return v.toISOString();
+  if (Array.isArray(v)) return v.map(normalizeValue);
+  if (typeof v === "object") {
+    // jsonb columns come back as plain objects already; recurse to handle
+    // nested Date / bigint inside metadata blobs.
+    const obj: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) obj[k] = normalizeValue(val);
+    return obj;
+  }
+  return v;
 }
 
 const MAX_SEARCH_HITS = 200;

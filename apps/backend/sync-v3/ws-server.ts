@@ -658,6 +658,57 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
         return;
       }
 
+      case "query.run": {
+        const t0 = Date.now();
+        try {
+          const result = await ctx.repo.runRawQuery({
+            sql: frame.sql,
+            params: frame.params,
+          });
+          const bytes = send(ws, {
+            op: "query.run.ok",
+            reqId: frame.reqId,
+            rows: result.rows,
+            rowCount: result.rows.length,
+            durationMs: result.durationMs,
+            truncated: result.truncated,
+          });
+          telemetry.log({
+            clientId: ws.data.clientId ?? null,
+            event: "query.run",
+            level: "info",
+            durationMs: Date.now() - t0,
+            bytes,
+            payload: {
+              sqlSnippet: frame.sql.slice(0, 200),
+              paramCount: Array.isArray(frame.params) ? frame.params.length : 0,
+              rowCount: result.rows.length,
+              truncated: result.truncated,
+              dbDurationMs: result.durationMs,
+            },
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          send(ws, {
+            op: "query.run.err",
+            reqId: frame.reqId,
+            error: message,
+          });
+          telemetry.log({
+            clientId: ws.data.clientId ?? null,
+            event: "query.run",
+            level: "warn",
+            durationMs: Date.now() - t0,
+            bytes: 0,
+            payload: {
+              sqlSnippet: frame.sql.slice(0, 200),
+              error: message,
+            },
+          });
+        }
+        return;
+      }
+
       case "ping": {
         send(ws, { op: "pong" });
         return;
