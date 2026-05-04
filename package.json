@@ -17,7 +17,9 @@
     "test": "bun test",
     "build:agent": "mkdir -p dist && bun build apps/agent/main.ts --compile --outfile dist/chatview-agent",
     "build:clo": "mkdir -p dist/clo && bun build apps/agent/clo.ts --target bun --format esm --outfile dist/clo/clo.js",
-    "build:frontend": "bun build index.html --outdir dist/frontend"
+    "build:frontend": "bun build index.html --outdir dist/frontend",
+    "build:frontend-v3": "bun build apps/frontend-v3/index.html --outdir dist/frontend-v3 --minify",
+    "v3:backfill": "bun run scripts/backfill-render-items.ts"
   },
   "dependencies": {
     "react": "^19.0.0",

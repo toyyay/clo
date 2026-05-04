@@ -1,10 +1,13 @@
 import index from "../../index.html";
+import indexV3 from "../frontend-v3/index.html";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, normalize } from "node:path";
 import * as Y from "yjs";
 import type { ServerWebSocket } from "bun";
+import { makeHandlers as makeV3Handlers, makePostgresContext as makeV3PgContext, newV3SocketData, type V3SocketData, type V3WebSocket } from "./sync-v3/ws-server";
+import { makeRepo as makeV3Repo } from "./sync-v3/repo";
 import type {
   AppSettingsInfo,
   AppLogBatchRequest,
@@ -113,9 +116,26 @@ const runningTranscriptionIds = new Set<string>();
 let activeTranscriptionJobs = 0;
 let openRouterStatus: OpenRouterStatusInfo = initialOpenRouterStatus();
 let openRouterStatusCheck: Promise<OpenRouterStatusInfo> | null = null;
-type YjsWebSocket = ServerWebSocket<{ docIds: Set<string> }>;
+type WsData = ({ kind: "yjs"; docIds: Set<string> } & Partial<V3SocketData>) | V3SocketData;
+type YjsWebSocket = ServerWebSocket<{ kind: "yjs"; docIds: Set<string> }>;
 const yjsSocketsByDoc = new Map<string, Set<YjsWebSocket>>();
 const docIdsBySocket = new WeakMap<YjsWebSocket, Set<string>>();
+
+// sync-v3: lazy-init handlers (need repo + sql)
+let v3HandlersSingleton: ReturnType<typeof makeV3Handlers> | null = null;
+function v3Handlers() {
+  if (v3HandlersSingleton) return v3HandlersSingleton;
+  const repo = makeV3Repo(sql);
+  const ctx = makeV3PgContext(sql, repo);
+  v3HandlersSingleton = makeV3Handlers(ctx);
+  return v3HandlersSingleton;
+}
+/** Called by ingest path after agent append commits, so any connected clients */
+/** drain new events in real time. Cheap: just sets a dirty flag per-view.    */
+export function notifyV3NewEvents(maxRevision: number) {
+  if (!v3HandlersSingleton) return;
+  v3HandlersSingleton.notifyNewEvents(maxRevision);
+}
 
 if (!agentToken) {
   throw new Error("AGENT_TOKEN is required in production");
@@ -169,10 +189,12 @@ void resumeQueuedTranscriptionJobs().catch((error) => {
   console.error("failed to resume queued transcriptions", error);
 });
 
-Bun.serve<{ docIds: Set<string> }>({
+Bun.serve<WsData>({
   port,
   routes: withApiRequestLogging({
     "/": index,
+    "/v3": indexV3,
+    "/v3/": indexV3,
     "/service-worker.js": async (req: Request) => serviceWorkerResponse(req),
     "/manifest.webmanifest": (req: Request) => webManifestResponse(req),
     "/app-icon.svg": () => appIconResponse(),
@@ -408,10 +430,16 @@ Bun.serve<{ docIds: Set<string> }>({
         return text(error instanceof Error ? error.message : "bad request", 400);
       }
     },
-    "/api/yjs/ws": (req: Request, server: { upgrade(req: Request, options: { data: { docIds: Set<string> } }): boolean }) => {
+    "/api/yjs/ws": (req: Request, server: { upgrade(req: Request, options: { data: WsData }): boolean }) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;
-      if (server.upgrade(req, { data: { docIds: new Set<string>() } })) return;
+      if (server.upgrade(req, { data: { kind: "yjs", docIds: new Set<string>() } })) return;
+      return text("websocket upgrade failed", 400);
+    },
+    "/api/v3/ws": (req: Request, server: { upgrade(req: Request, options: { data: WsData }): boolean }) => {
+      const auth = requireWebAuth(req);
+      if (auth) return auth;
+      if (server.upgrade(req, { data: newV3SocketData() })) return;
       return text("websocket upgrade failed", 400);
     },
     "/api/stream": (req: Request) => {
@@ -494,6 +522,8 @@ Bun.serve<{ docIds: Set<string> }>({
     "/api/agent/v1/append": async (req: Request) =>
       handleAgentV1(req, async () => {
         const result = await handleAgentAppend(req, sql);
+        // sync-v3: kick connected clients to drain — cheap, fire-and-forget.
+        if (result.acceptedEvents) notifyV3NewEvents(0);
         if (result.acceptedEvents || result.acceptedChunks || result.sourceFileId) {
           void logBackendRequestEvent({
             level: "info",
@@ -598,9 +628,17 @@ Bun.serve<{ docIds: Set<string> }>({
   }),
   websocket: {
     open(ws) {
-      docIdsBySocket.set(ws, ws.data.docIds);
+      if (ws.data.kind === "v3") {
+        v3Handlers().onOpen(ws as unknown as V3WebSocket);
+        return;
+      }
+      docIdsBySocket.set(ws as YjsWebSocket, ws.data.docIds!);
     },
     async message(ws, rawMessage) {
+      if (ws.data.kind === "v3") {
+        await v3Handlers().onMessage(ws as unknown as V3WebSocket, rawMessage as any);
+        return;
+      }
       let message: YjsSocketMessage;
       try {
         message = JSON.parse(typeof rawMessage === "string" ? rawMessage : new TextDecoder().decode(rawMessage));
@@ -609,7 +647,7 @@ Bun.serve<{ docIds: Set<string> }>({
       }
 
       if (message.type === "subscribe") {
-        subscribeYjsSocket(ws, message.docIds);
+        subscribeYjsSocket(ws as YjsWebSocket, message.docIds);
         return;
       }
 
@@ -618,11 +656,15 @@ Bun.serve<{ docIds: Set<string> }>({
         if (!docId) return;
         const update = fromBase64(message.update);
         await mergeYjsUpdate(docId, update, message.sessionDbId);
-        broadcastYjsUpdate(docId, message.update, ws);
+        broadcastYjsUpdate(docId, message.update, ws as YjsWebSocket);
       }
     },
     close(ws) {
-      unsubscribeYjsSocket(ws);
+      if (ws.data.kind === "v3") {
+        v3Handlers().onClose(ws as unknown as V3WebSocket);
+        return;
+      }
+      unsubscribeYjsSocket(ws as YjsWebSocket);
     },
   },
   development: !isProduction,
