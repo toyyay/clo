@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import { useStore, useStoreState } from "./store-hook";
 import { formatBytes, formatRelative } from "./format";
 import { SettingsPopover, useVisualSettings } from "./settings";
+import { SyncStatusPopover } from "./sync-status-popover";
 
 export function Topbar({ onToggleSidebar, sidebarOpen }: { onToggleSidebar: () => void; sidebarOpen: boolean }) {
   const state = useStoreState();
@@ -82,13 +83,25 @@ function SyncProgress() {
 
 function SyncPill() {
   const state = useStoreState();
+  const [open, setOpen] = useState(false);
   const kind = state.status.kind;
-  const label = kind === "open" ? "ok" : kind === "connecting" ? "…" : kind === "reconnecting" ? "rec" : kind === "closed" ? "off" : "—";
+  let totalPending = 0;
+  for (const v of state.pendingBytes.values()) totalPending += v;
+  const stuck = kind === "open" && totalPending > 0 && state.link.lastFrameAt !== null && (Date.now() - state.link.lastFrameAt) > 20_000;
+  const label = stuck ? "?!" : kind === "open" ? "ok" : kind === "connecting" ? "…" : kind === "reconnecting" ? "rec" : kind === "closed" ? "off" : "—";
+  const pillKind = stuck ? "stuck" : kind;
   return (
-    <div className={`sync-pill sync-pill-${kind}`} title={`status: ${kind} · views: ${state.views.size}`}>
-      <span className="sync-dot" />
-      <span className="sync-label">{label}</span>
-    </div>
+    <>
+      <button
+        className={`sync-pill sync-pill-${pillKind}`}
+        title="Click for sync diagnostics"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="sync-dot" />
+        <span className="sync-label">{label}</span>
+      </button>
+      {open && <SyncStatusPopover onClose={() => setOpen(false)} />}
+    </>
   );
 }
 

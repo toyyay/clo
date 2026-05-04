@@ -33,11 +33,29 @@ export type ConnStatus =
   | { kind: "reconnecting"; attempt: number; nextAttemptAt: number }
   | { kind: "closed"; reason: string };
 
+export type WsLink = {
+  /** Last measured ping → pong RTT in ms, or null until first sample. */
+  pingRttMs: number | null;
+  /** When that sample was taken (epoch ms). */
+  pingMeasuredAt: number | null;
+  /** Last time we received ANY frame from the server (epoch ms). */
+  lastFrameAt: number | null;
+  /** Last time we sent ANY frame (epoch ms). */
+  lastSentAt: number | null;
+  /** Total received bytes since open. */
+  bytesIn: number;
+  /** Total sent bytes since open. */
+  bytesOut: number;
+};
+
 export type WsClient = {
   start(): void;
   stop(): void;
   send(frame: ClientFrame): void;
   status(): ConnStatus;
+  link(): WsLink;
+  /** Subscribe to link metric changes (called on each frame + ping). */
+  subscribeLink(listener: () => void): () => void;
 };
 
 export function createWsClient(options: WsClientOptions): WsClient {
@@ -48,6 +66,19 @@ export function createWsClient(options: WsClientOptions): WsClient {
   let pingTimer: ReturnType<typeof setInterval> | null = null;
   let queued: ClientFrame[] = [];
   let currentStatus: ConnStatus = { kind: "idle" };
+  let pingSentAt: number | null = null;
+  const link: WsLink = {
+    pingRttMs: null,
+    pingMeasuredAt: null,
+    lastFrameAt: null,
+    lastSentAt: null,
+    bytesIn: 0,
+    bytesOut: 0,
+  };
+  const linkListeners = new Set<() => void>();
+  const notifyLink = () => {
+    for (const l of linkListeners) l();
+  };
 
   const log = options.log ?? (() => {});
   const setStatus = (s: ConnStatus) => {
@@ -103,19 +134,34 @@ export function createWsClient(options: WsClientOptions): WsClient {
         // Drain anything queued while we were disconnected.
         for (const frame of queued.splice(0)) socket.send(JSON.stringify(frame));
 
-        // Heartbeat
+        // Heartbeat — ping every 15s, capture RTT on the matching pong.
         if (pingTimer) clearInterval(pingTimer);
         pingTimer = setInterval(() => {
-          if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ op: "ping" } satisfies ClientFrame));
-        }, 25_000);
+          if (socket.readyState !== WebSocket.OPEN) return;
+          pingSentAt = Date.now();
+          const json = JSON.stringify({ op: "ping" } satisfies ClientFrame);
+          socket.send(json);
+          link.lastSentAt = pingSentAt;
+          link.bytesOut += json.length;
+        }, 15_000);
       } catch (err) {
         log("warn", "ws.handshake.failed", err);
       }
     });
 
     socket.addEventListener("message", (ev) => {
+      const raw = typeof ev.data === "string" ? ev.data : new TextDecoder().decode(ev.data as ArrayBuffer);
+      const now = Date.now();
+      link.lastFrameAt = now;
+      link.bytesIn += raw.length;
       try {
-        const frame = JSON.parse(typeof ev.data === "string" ? ev.data : new TextDecoder().decode(ev.data as ArrayBuffer)) as ServerFrame;
+        const frame = JSON.parse(raw) as ServerFrame;
+        if (frame.op === "pong" && pingSentAt !== null) {
+          link.pingRttMs = now - pingSentAt;
+          link.pingMeasuredAt = now;
+          pingSentAt = null;
+        }
+        notifyLink();
         options.onFrame(frame);
       } catch (err) {
         log("warn", "ws.message.parse.failed", err);
@@ -152,14 +198,26 @@ export function createWsClient(options: WsClientOptions): WsClient {
       setStatus({ kind: "closed", reason: "stopped" });
     },
     send(frame) {
+      const json = JSON.stringify(frame);
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(frame));
+        ws.send(json);
+        link.lastSentAt = Date.now();
+        link.bytesOut += json.length;
       } else {
         queued.push(frame);
       }
     },
     status() {
       return currentStatus;
+    },
+    link() {
+      return { ...link };
+    },
+    subscribeLink(listener) {
+      linkListeners.add(listener);
+      return () => {
+        linkListeners.delete(listener);
+      };
     },
   };
 }

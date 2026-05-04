@@ -23,7 +23,7 @@ import type {
   ViewSpec,
 } from "../../packages/sync-v3/contracts";
 import * as idb from "./idb";
-import { createWsClient, specHash, type ConnStatus, type WsClient } from "./ws-client";
+import { createWsClient, specHash, type ConnStatus, type WsClient, type WsLink } from "./ws-client";
 
 export type ActiveChatWindow = {
   chatId: string;
@@ -45,6 +45,12 @@ export type StoreState = {
   visibleChats: Map<string, ChatIndex>;
   activeChat: string | null;
   activeWindow: ActiveChatWindow | null;
+  /** Live WS link metrics — see ws-client WsLink. */
+  link: WsLink;
+  /** Last per-view ack progress, used to estimate throughput. */
+  lastBatchAt: Map<string, number>;
+  /** Rolling estimate of bytes/sec downloaded across all views. */
+  throughputBps: number;
 };
 
 export type Store = {
@@ -68,6 +74,9 @@ export type Store = {
 const TAIL_DEFAULT = 200;
 const HISTORY_PAGE = 100;
 
+// Rolling window for throughput estimation.
+const THROUGHPUT_WINDOW_MS = 30_000;
+
 export function createStore(): Store {
   const listeners = new Set<() => void>();
   let state: StoreState = {
@@ -79,9 +88,15 @@ export function createStore(): Store {
     visibleChats: new Map(),
     activeChat: null,
     activeWindow: null,
+    link: { pingRttMs: null, pingMeasuredAt: null, lastFrameAt: null, lastSentAt: null, bytesIn: 0, bytesOut: 0 },
+    lastBatchAt: new Map(),
+    throughputBps: 0,
   };
+  /** Track recent (timestamp, bytesIn) samples for throughput calculation. */
+  const throughputSamples: { t: number; bytes: number }[] = [];
 
   let ws: WsClient | null = null;
+  let tickHandle: ReturnType<typeof setInterval> | null = null;
   /** map reqId → resolver for pending history.range */
   const historyRequests = new Map<string, (frame: { items: SeqRenderItem[]; hasOlder: boolean; hasNewer: boolean }) => void>();
 
@@ -129,6 +144,7 @@ export function createStore(): Store {
   }
 
   async function applyBatch(frame: Extract<ServerFrame, { op: "view.batch" }>) {
+    state.lastBatchAt.set(frame.viewId, Date.now());
     const itemRows: idb.RenderItemRow[] = frame.items.map((bi) => ({
       chatId: bi.chatId,
       seq: bi.seq,
@@ -259,7 +275,29 @@ export function createStore(): Store {
         url: opts.url,
         clientId: opts.clientId,
         onStatus: (s) => commit({ status: s }),
-        onFrame,
+        onFrame: (frame) => {
+          // Update link.bytesIn-derived throughput on every frame.
+          const wsLink = ws?.link();
+          if (wsLink) {
+            const now = Date.now();
+            throughputSamples.push({ t: now, bytes: wsLink.bytesIn });
+            // Drop samples older than the window.
+            while (throughputSamples.length && throughputSamples[0]!.t < now - THROUGHPUT_WINDOW_MS) {
+              throughputSamples.shift();
+            }
+            let bps = 0;
+            if (throughputSamples.length >= 2) {
+              const first = throughputSamples[0]!;
+              const last = throughputSamples[throughputSamples.length - 1]!;
+              const dtSec = Math.max(0.001, (last.t - first.t) / 1000);
+              bps = Math.max(0, (last.bytes - first.bytes) / dtSec);
+            }
+            state.link = wsLink;
+            state.throughputBps = bps;
+          }
+          onFrame(frame);
+          commit({});
+        },
         async getViewStates(): Promise<ClientViewState[]> {
           const rows = await idb.listViews();
           return rows.map((r) => ({ viewId: r.viewId, specHash: r.specHash, cursor: r.cursor }));
@@ -286,11 +324,24 @@ export function createStore(): Store {
         },
       });
       ws.start();
+      ws.subscribeLink(() => {
+        const cur = ws?.link();
+        if (cur) {
+          state.link = cur;
+          commit({});
+        }
+      });
+      // Tick once per second so "last frame N seconds ago" stays fresh.
+      tickHandle = setInterval(() => commit({}), 1000);
     },
 
     stop() {
       ws?.stop();
       ws = null;
+      if (tickHandle) {
+        clearInterval(tickHandle);
+        tickHandle = null;
+      }
     },
 
     async upsertView(view) {

@@ -197,7 +197,11 @@ body {
   background: var(--pill-bg);
   color: var(--pill-fg);
   white-space: nowrap;
+  border: 0;
+  cursor: pointer;
+  font-family: inherit;
 }
+.sync-pill:hover { filter: brightness(1.05); }
 .sync-pill .sync-dot {
   width: 8px;
   height: 8px;
@@ -213,6 +217,83 @@ body {
 .sync-pill-reconnecting .sync-dot { background: #d6a700; }
 .sync-pill-closed { background: var(--pill-err-bg); color: var(--pill-err-fg); }
 .sync-pill-closed .sync-dot { background: #c0413a; }
+.sync-pill-stuck { background: var(--pill-warn-bg); color: var(--pill-warn-fg); }
+.sync-pill-stuck .sync-dot { background: #c0413a; animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* sync status popover */
+.sync-status-pop {
+  position: fixed;
+  top: 44px;
+  right: 80px;
+  z-index: 9998;
+  background: var(--bg-pop);
+  border: 1px solid var(--border-popover);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+  padding: 0;
+  min-width: 280px;
+  max-width: 360px;
+  color: var(--text);
+  font-size: calc(12px * var(--font-scale));
+}
+.sync-status-header {
+  padding: 8px 12px;
+  font-weight: 700;
+  font-size: calc(12px * var(--font-scale));
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--border);
+}
+.sync-status-header-open { color: var(--pill-ok-fg); background: var(--pill-ok-bg); }
+.sync-status-header-connecting,
+.sync-status-header-reconnecting { color: var(--pill-warn-fg); background: var(--pill-warn-bg); }
+.sync-status-header-closed { color: var(--pill-err-fg); background: var(--pill-err-bg); }
+.sync-status-header-stuck { color: var(--pill-err-fg); background: var(--pill-warn-bg); }
+
+.sync-status-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  padding: 10px 12px;
+}
+.sync-status-key { color: var(--text-faint); font-size: calc(11px * var(--font-scale)); }
+.sync-status-val { color: var(--text); font-variant-numeric: tabular-nums; text-align: right; word-break: break-all; }
+.sync-status-val-hl { color: var(--pill-warn-fg); font-weight: 600; }
+
+.sync-status-section-label {
+  padding: 6px 12px;
+  font-size: calc(10px * var(--font-scale));
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  border-top: 1px solid var(--border);
+}
+.sync-status-views {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 0 12px 6px;
+}
+.sync-status-view-row {
+  padding: 4px 0;
+  font-size: calc(11px * var(--font-scale));
+}
+.sync-status-view-row + .sync-status-view-row { border-top: 1px dashed var(--border); }
+.sync-status-view-name { font-weight: 600; }
+.sync-status-view-meta { color: var(--text-faint); }
+.sync-status-view-meta .dot { margin: 0 4px; color: var(--text-dim); }
+
+.sync-status-foot {
+  padding: 6px 12px 8px;
+  border-top: 1px solid var(--border);
+}
+.sync-status-hint {
+  font-size: calc(10px * var(--font-scale));
+  color: var(--text-faint);
+}
 
 .icon-btn {
   display: inline-flex;
