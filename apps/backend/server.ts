@@ -491,8 +491,17 @@ Bun.serve<WsData>({
       // non-matching origin.
       const origin = req.headers.get("origin");
       if (origin !== null) {
+        // Behind a TLS terminator (Cloudflare / nginx) Bun sees the request
+        // as http://localhost:3737 — so reconstructing the expected origin
+        // from req.url would always reject. Use the forwarded headers when
+        // present and fall back to the request URL only for direct serving
+        // (local dev).
+        const fwdProto = req.headers.get("x-forwarded-proto");
+        const fwdHost = req.headers.get("x-forwarded-host") ?? req.headers.get("host");
         const reqUrl = new URL(req.url);
-        const expected = `${reqUrl.protocol === "https:" ? "https:" : "http:"}//${reqUrl.host}`;
+        const proto = fwdProto ?? (reqUrl.protocol === "https:" ? "https" : "http");
+        const host = fwdHost ?? reqUrl.host;
+        const expected = `${proto}://${host}`;
         if (origin !== expected) {
           return text("origin not allowed", 403);
         }
