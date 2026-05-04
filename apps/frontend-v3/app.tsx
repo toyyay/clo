@@ -37,7 +37,70 @@ export function App() {
       <ChatView />
       <Statusbar />
       <BuildBadge />
+      <AppMenu />
     </div>
+  );
+}
+
+function AppMenu() {
+  const store = useStore();
+  const [open, setOpen] = useState(false);
+  const reload = () => location.reload();
+  const resetAndReload = async () => {
+    if (!confirm("Reset local cache and reload? This drops IndexedDB, view subscriptions and the local client id.")) return;
+    try {
+      // 1. Stop the WS so deletion isn't fighting an open transaction.
+      store.stop();
+      // 2. Drop our IDB schema.
+      await new Promise<void>((res) => {
+        const req = indexedDB.deleteDatabase("chatview-v3");
+        req.onsuccess = () => res();
+        req.onerror = () => res();
+        req.onblocked = () => res();
+      });
+      // 3. Drop localStorage keys (client id + sidebar expansion).
+      localStorage.removeItem("chatview-v3:client-id");
+      localStorage.removeItem("chatview-v3:sidebar-expanded");
+      // 4. Unregister any remaining service workers + clear all caches as a
+      //    belt-and-suspenders measure (legacy SW kill-switch should already
+      //    have done this, but Boox / old browsers may have lagged).
+      if ("serviceWorker" in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((r) => r.unregister().catch(() => {})));
+      }
+      if ("caches" in window) {
+        const names = await caches.keys();
+        await Promise.all(names.map((n) => caches.delete(n).catch(() => {})));
+      }
+    } catch {}
+    location.reload();
+  };
+  const forceResync = async () => {
+    // Stop+start the WS — drainOutbox will re-upsert all known views,
+    // server will respond with snapshot. Cheaper than full reset.
+    store.stop();
+    setTimeout(() => location.reload(), 100);
+  };
+
+  return (
+    <>
+      <button
+        className="app-menu-button"
+        aria-label="App menu"
+        onClick={() => setOpen((v) => !v)}
+        title="App menu"
+      >
+        ⋯
+      </button>
+      {open && (
+        <div className="app-menu-pop" onMouseLeave={() => setOpen(false)}>
+          <button onClick={reload}>Reload</button>
+          <button onClick={forceResync}>Force re-sync</button>
+          <button onClick={resetAndReload}>Reset & reload</button>
+          <a href="/v2">Open legacy /v2</a>
+        </div>
+      )}
+    </>
   );
 }
 
