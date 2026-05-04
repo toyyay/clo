@@ -87,11 +87,15 @@ export function createWsClient(options: WsClientOptions): WsClient {
         for (const frame of outbox) socket.send(JSON.stringify(frame));
 
         const states = await options.getViewStates();
+        const deviceMemoryGb = typeof (navigator as any)?.deviceMemory === "number"
+          ? (navigator as any).deviceMemory
+          : undefined;
         socket.send(
           JSON.stringify({
             op: "hello",
             v: WS_PROTOCOL_VERSION,
             clientId: options.clientId,
+            deviceMemoryGb,
             views: states,
           } satisfies ClientFrame),
         );

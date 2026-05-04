@@ -16,6 +16,7 @@
 import { canonicalizeSpec, type ClientFrame, type ServerFrame, type ViewSpec, WS_PROTOCOL_VERSION } from "../../../packages/sync-v3/contracts";
 import type { Repo } from "./repo";
 import { createHash } from "node:crypto";
+import { type Telemetry, makeNoopTelemetry, makePostgresTelemetry } from "./telemetry";
 
 export type V3SocketData = {
   kind: "v3";
@@ -35,6 +36,10 @@ export type V3SocketData = {
   snapshotting: Set<string>;
   /** abort signal for in-flight queries when socket closes */
   closed: boolean;
+  /** v3_client_sessions row id; null until telemetry hello fires. */
+  sessionId: number | null;
+  /** opening request metadata for telemetry on hello */
+  openMeta: { userAgent: string | null; ip: string | null };
 };
 
 export type V3WebSocket = {
@@ -43,7 +48,7 @@ export type V3WebSocket = {
   close(code?: number, reason?: string): void;
 };
 
-export function newV3SocketData(): V3SocketData {
+export function newV3SocketData(openMeta?: { userAgent: string | null; ip: string | null }): V3SocketData {
   return {
     kind: "v3",
     clientId: null,
@@ -54,6 +59,8 @@ export function newV3SocketData(): V3SocketData {
     dirty: new Set(),
     snapshotting: new Set(),
     closed: false,
+    sessionId: null,
+    openMeta: openMeta ?? { userAgent: null, ip: null },
   };
 }
 
@@ -86,22 +93,35 @@ export type WsContext = {
   recordViewChat?(clientId: string, viewId: string, sourceFileId: number, seq: number): Promise<void>;
   /** Remove chat membership when excluded. */
   removeViewChat?(clientId: string, viewId: string, sourceFileId: number): Promise<void>;
+  /** Telemetry: WS-session lifecycle and structured event log. */
+  telemetry?: Telemetry;
   /** logger — optional, defaults to console.warn for errors */
   log?: (level: "debug" | "info" | "warn" | "error", event: string, ctx?: unknown) => void;
 };
 
 export function makeHandlers(ctx: WsContext): WsHandlers {
   const sockets = new Set<V3WebSocket>();
+  const telemetry: Telemetry = ctx.telemetry ?? makeNoopTelemetry();
 
   const log = ctx.log ?? ((level, event, _ctx) => {
     if (level === "error" || level === "warn") console.warn(`[sync-v3 ws] ${event}`, _ctx ?? "");
   });
 
-  function send(ws: V3WebSocket, frame: ServerFrame) {
+  function send(ws: V3WebSocket, frame: ServerFrame): number | null {
     try {
-      ws.send(JSON.stringify(frame));
+      const json = JSON.stringify(frame);
+      ws.send(json);
+      return json.length;
     } catch (err) {
       log("warn", "send.failed", err);
+      telemetry.log({
+        clientId: ws.data.clientId ?? null,
+        viewId: (frame as any).viewId ?? null,
+        event: "frame.send.failed",
+        level: "error",
+        payload: { op: frame.op, err: errMsg(err) },
+      });
+      return null;
     }
   }
 
@@ -109,16 +129,22 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
     // Idempotency: if a snapshot is already in flight for this view, skip.
     if (ws.data.snapshotting.has(view.id)) {
       log("debug", "snapshot.skipped.in_flight", { viewId: view.id });
+      telemetry.log({
+        clientId: ws.data.clientId ?? null,
+        viewId: view.id,
+        event: "snapshot.skipped",
+        level: "debug",
+        payload: { reason: "in_flight" },
+      });
       return;
     }
     ws.data.snapshotting.add(view.id);
+    const t0 = Date.now();
     try {
       const snap = await ctx.repo.buildSnapshot(view);
-      // Pre-mark cursor BEFORE sending so any drain (queued during the build)
-      // computes deltas relative to the snapshot cursor, not 0.
       ws.data.pending.set(view.id, snap.cursor);
       ws.data.acked.set(view.id, Math.max(ws.data.acked.get(view.id) ?? 0, snap.cursor));
-      send(ws, {
+      const bytes = send(ws, {
         op: "view.snapshot",
         viewId: view.id,
         cursor: snap.cursor,
@@ -127,8 +153,21 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
         tails: snap.tails,
         totals: snap.totals,
       });
+      telemetry.log({
+        clientId: ws.data.clientId ?? null,
+        viewId: view.id,
+        event: "snapshot.sent",
+        level: "info",
+        durationMs: Date.now() - t0,
+        bytes,
+        payload: {
+          cursor: snap.cursor,
+          groups: snap.groups.length,
+          chats: snap.chats.length,
+          tailKeys: Object.keys(snap.tails).length,
+        },
+      });
 
-      // Record membership so followNew can detect newcomers later.
       if (ctx.recordViewChat && ws.data.clientId) {
         for (const chat of snap.chats) {
           const sourceFileId = parseSourceFileId(chat.chatId);
@@ -139,6 +178,14 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
       }
     } catch (err) {
       log("error", "snapshot.failed", err);
+      telemetry.log({
+        clientId: ws.data.clientId ?? null,
+        viewId: view.id,
+        event: "snapshot.failed",
+        level: "error",
+        durationMs: Date.now() - t0,
+        payload: { error: errMsg(err) },
+      });
       send(ws, { op: "view.error", viewId: view.id, reason: errMsg(err) });
     } finally {
       ws.data.snapshotting.delete(view.id);
@@ -149,11 +196,9 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
     if (ws.data.closed) return;
     const view = ws.data.views.get(viewId);
     if (!view) return;
-    // While the initial snapshot is still being built, skip drain — otherwise
-    // the client receives batches with a cursor of 0 *before* the snapshot
-    // lands, which scrambles ordering.
     if (ws.data.snapshotting.has(viewId)) return;
     const since = ws.data.pending.get(viewId) ?? ws.data.acked.get(viewId) ?? 0;
+    const t0 = Date.now();
 
     try {
       const delta = await ctx.repo.fetchDelta(view, since);
@@ -165,7 +210,7 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
         return;
       }
       ws.data.pending.set(viewId, delta.cursor);
-      send(ws, {
+      const bytes = send(ws, {
         op: "view.batch",
         viewId,
         cursor: delta.cursor,
@@ -173,8 +218,25 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
         bytesRemaining: delta.bytesRemaining,
         moreReady: delta.moreReady,
       });
+      telemetry.log({
+        clientId: ws.data.clientId ?? null,
+        viewId,
+        event: "batch.sent",
+        level: "info",
+        durationMs: Date.now() - t0,
+        bytes,
+        payload: { items: delta.items.length, cursor: delta.cursor, bytesRemaining: delta.bytesRemaining },
+      });
     } catch (err) {
       log("error", "drain.failed", err);
+      telemetry.log({
+        clientId: ws.data.clientId ?? null,
+        viewId,
+        event: "drain.failed",
+        level: "error",
+        durationMs: Date.now() - t0,
+        payload: { error: errMsg(err) },
+      });
       send(ws, { op: "view.error", viewId, reason: errMsg(err) });
     }
   }
@@ -208,14 +270,27 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
       try {
         const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
         frame = JSON.parse(text);
-      } catch {
+      } catch (err) {
         send(ws, { op: "view.error", viewId: "*", reason: "invalid_json" });
+        telemetry.log({
+          clientId: ws.data.clientId ?? null,
+          event: "frame.parse.failed",
+          level: "warn",
+          payload: { error: errMsg(err) },
+        });
         return;
       }
       try {
         await handleFrame(ws, frame);
       } catch (err) {
         log("error", "handle.failed", err);
+        telemetry.log({
+          clientId: ws.data.clientId ?? null,
+          viewId: (frame as any).viewId ?? null,
+          event: "frame.handle.failed",
+          level: "error",
+          payload: { op: (frame as any).op, error: errMsg(err) },
+        });
         send(ws, { op: "view.error", viewId: (frame as any).viewId ?? "*", reason: errMsg(err) });
       }
     },
@@ -223,6 +298,19 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
     onClose(ws) {
       ws.data.closed = true;
       sockets.delete(ws);
+      const sid = ws.data.sessionId;
+      const cid = ws.data.clientId;
+      if (sid !== null) {
+        // disconnected_at + close_code unknown — Bun doesn't surface them in the
+        // close handler signature we get; log a synthetic close.
+        telemetry.recordSessionClose(sid, 0, null).catch(() => {});
+      }
+      telemetry.log({
+        clientId: cid ?? null,
+        event: "ws.close",
+        level: "info",
+        payload: { views: Array.from(ws.data.views.keys()) },
+      });
     },
 
     notifyNewEvents(_maxRevision: number) {
@@ -292,6 +380,30 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
         ws.data.clientId = frame.clientId;
         send(ws, { op: "hello.ok", v: WS_PROTOCOL_VERSION, serverTime: new Date().toISOString() });
 
+        // Telemetry: open session row, log structured event.
+        try {
+          const sid = await telemetry.recordSessionOpen({
+            clientId: frame.clientId,
+            userAgent: ws.data.openMeta.userAgent,
+            ip: ws.data.openMeta.ip,
+            deviceMemoryGb: frame.deviceMemoryGb ?? null,
+            protocolVersion: frame.v,
+            viewsAtOpen: frame.views.map((v) => ({ viewId: v.viewId, cursor: v.cursor })),
+          });
+          if (sid !== null) ws.data.sessionId = sid;
+        } catch {}
+        telemetry.log({
+          clientId: frame.clientId,
+          event: "ws.connect",
+          level: "info",
+          payload: {
+            v: frame.v,
+            deviceMemoryGb: frame.deviceMemoryGb ?? null,
+            views: frame.views.map((v) => ({ viewId: v.viewId, cursor: v.cursor })),
+            ua: ws.data.openMeta.userAgent,
+          },
+        });
+
         // Preload views from DB if persistence wired in
         if (ctx.loadViews && ws.data.clientId) {
           try {
@@ -344,6 +456,18 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
             log("warn", "persistView.failed", err);
           }
         }
+        telemetry.log({
+          clientId: ws.data.clientId ?? null,
+          viewId: view.id,
+          event: "view.upsert",
+          level: "info",
+          payload: {
+            predicate: view.predicate,
+            followNew: view.followNew ?? false,
+            includes: view.includes?.length ?? 0,
+            excludes: view.excludes?.length ?? 0,
+          },
+        });
         await pushSnapshot(ws, view);
         return;
       }
@@ -355,15 +479,34 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
         if (ctx.deleteView && ws.data.clientId) {
           await ctx.deleteView(ws.data.clientId, frame.viewId).catch(() => {});
         }
+        telemetry.log({
+          clientId: ws.data.clientId ?? null,
+          viewId: frame.viewId,
+          event: "view.delete",
+          level: "info",
+        });
         return;
       }
 
       case "view.ack": {
+        const previousAck = ws.data.acked.get(frame.viewId) ?? 0;
         ws.data.acked.set(frame.viewId, frame.cursor);
         if (ctx.saveCursor && ws.data.clientId) {
           ctx.saveCursor(ws.data.clientId, frame.viewId, frame.cursor).catch(() => {});
         }
-        // After ack, see if there's more to drain
+        // Update session liveness on ack — cheap proxy for "still talking".
+        if (ws.data.sessionId !== null) {
+          telemetry.recordSessionPing(ws.data.sessionId).catch(() => {});
+        }
+        if (frame.cursor < previousAck) {
+          telemetry.log({
+            clientId: ws.data.clientId ?? null,
+            viewId: frame.viewId,
+            event: "ack.regressed",
+            level: "warn",
+            payload: { ackCursor: frame.cursor, previousAck },
+          });
+        }
         scheduleDrain(ws, frame.viewId);
         return;
       }
@@ -408,19 +551,34 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
       }
 
       case "history.range": {
+        const t0 = Date.now();
         const result = await ctx.repo.fetchHistoryRange({
           chatId: frame.chatId,
           before: frame.before,
           after: frame.after,
           limit: frame.limit,
         });
-        send(ws, {
+        const bytes = send(ws, {
           op: "history.range.ok",
           reqId: frame.reqId,
           chatId: frame.chatId,
           items: result.items,
           hasOlder: result.hasOlder,
           hasNewer: result.hasNewer,
+        });
+        telemetry.log({
+          clientId: ws.data.clientId ?? null,
+          event: "history.range",
+          level: "info",
+          durationMs: Date.now() - t0,
+          bytes,
+          payload: {
+            chatId: frame.chatId,
+            before: frame.before ?? null,
+            after: frame.after ?? null,
+            limit: frame.limit,
+            items: result.items.length,
+          },
         });
         return;
       }
@@ -450,6 +608,7 @@ function parseSourceFileId(chatId: string): number | null {
 export function makePostgresContext(sql: any, repo: Repo): WsContext {
   return {
     repo,
+    telemetry: makePostgresTelemetry(sql),
     async persistView(clientId, view, hash) {
       await sql`
         insert into client_views (client_id, view_id, spec, spec_hash, updated_at)

@@ -458,7 +458,11 @@ Bun.serve<WsData>({
     "/api/v3/ws": (req: Request, server: { upgrade(req: Request, options: { data: WsData }): boolean }) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;
-      if (server.upgrade(req, { data: newV3SocketData() })) return;
+      const openMeta = {
+        userAgent: req.headers.get("user-agent"),
+        ip: req.headers.get("cf-connecting-ip") ?? req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? null,
+      };
+      if (server.upgrade(req, { data: newV3SocketData(openMeta) })) return;
       return text("websocket upgrade failed", 400);
     },
     "/api/stream": (req: Request) => {

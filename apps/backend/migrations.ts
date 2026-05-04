@@ -808,6 +808,63 @@ create index idx_v3_group_aggregates_level on v3_group_aggregates (level);
 `.trim(),
     transaction: false,
   },
+  {
+    id: "0016",
+    name: "sync_v3_telemetry",
+    sql: `
+-- Per-WS-connection session log. One row per connect; updated on disconnect.
+-- Lets you answer "is client X online right now?" and "how long was the
+-- session, what browser, what views?" without scraping container logs.
+create table if not exists v3_client_sessions (
+  id bigserial primary key,
+  client_id text not null,
+  user_agent text,
+  ip text,
+  device_memory_gb int,
+  protocol_version int,
+  views_at_open jsonb not null default '[]'::jsonb,
+  connected_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  disconnected_at timestamptz,
+  close_code int,
+  close_reason text,
+  metadata jsonb not null default '{}'::jsonb
+);
+
+create index if not exists idx_v3_client_sessions_client_recent
+  on v3_client_sessions (client_id, connected_at desc);
+
+create index if not exists idx_v3_client_sessions_active
+  on v3_client_sessions (last_seen_at desc)
+  where disconnected_at is null;
+
+-- Append-only log of sync-v3 events. Cheap inserts, easy to query by
+-- (client_id, created_at desc) for "what's been happening with this client".
+create table if not exists v3_sync_events (
+  id bigserial primary key,
+  client_id text,
+  view_id text,
+  event text not null,
+  level text not null default 'info',
+  duration_ms int,
+  bytes int,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_v3_sync_events_client_recent
+  on v3_sync_events (client_id, created_at desc)
+  where client_id is not null;
+
+create index if not exists idx_v3_sync_events_problems
+  on v3_sync_events (level, created_at desc)
+  where level in ('warn', 'error');
+
+create index if not exists idx_v3_sync_events_view
+  on v3_sync_events (client_id, view_id, created_at desc)
+  where view_id is not null;
+`.trim(),
+  },
 ];
 
 export function migrationsEnabled(env = process.env) {
