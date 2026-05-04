@@ -19,7 +19,15 @@ import { useStore, useStoreState } from "./store-hook";
 const ROW_OVERSCAN = 6;
 const DEFAULT_ROW_HEIGHT = 88;
 const LOAD_EDGE_PX = 720;
-const MEASURE_FLUSH_MS = 30;
+const MEASURE_FLUSH_MS = 80;
+// На любом устройстве мы НЕ перемеряем строку второй раз — измерения
+// дают фид-бэк-петлю (height → layout → topPad → DOM → ResizeObserver →
+// height …) которая на медленных дисплеях (Boox) проявляется как
+// «чат сам мотается». Достаточно один раз поймать высоту, дальше
+// верить ей. Если контент строки реально изменится — сменится
+// itemKey (например при появлении новых частей события), и для нового
+// ключа замер случится заново.
+const HEIGHT_DELTA_THRESHOLD_PX = 6;
 
 export function ChatView() {
   const state = useStoreState();
@@ -79,7 +87,14 @@ function ActiveChat({ chatId }: { chatId: string }) {
     return { offsets, total };
   }, [items, itemKeys, measureVersion]);
 
-  const updateRange = useCallback(() => {
+  // Two flavours of range updates:
+  //   • passive: re-derive {start,end,topPad,botPad} from current scrollTop +
+  //     layout. Used after layout changes (measure flush, items grow). Does
+  //     NOT trigger loadOlder — purely visual.
+  //   • active: same plus checks the top-edge to fire loadOlder. Used only
+  //     from real onScroll events.
+  // This split breaks the loadOlder-storm on layout-change feedback loops.
+  const updateRange = useCallback((checkEdgeLoad = false) => {
     const el = scrollRef.current;
     if (!el) return;
     const top = el.scrollTop;
@@ -90,44 +105,50 @@ function ActiveChat({ chatId }: { chatId: string }) {
     const botPad = layout.total - (layout.offsets[end] ?? layout.total);
     setRange((cur) => (cur.start === start && cur.end === end && cur.topPad === topPad && cur.botPad === botPad ? cur : { start, end, topPad, botPad }));
 
-    // Edge-loading older
-    if (top < LOAD_EDGE_PX && activeWindow?.hasOlder) {
+    if (checkEdgeLoad && top < LOAD_EDGE_PX && activeWindow?.hasOlder) {
       void store.loadOlder();
     }
   }, [items.length, layout, store, activeWindow?.hasOlder]);
 
   useEffect(() => {
-    updateRange();
+    updateRange(false);
   }, [updateRange]);
 
   const onScroll = useCallback(() => {
-    requestAnimationFrame(updateRange);
+    requestAnimationFrame(() => updateRange(true));
   }, [updateRange]);
 
   // One container ResizeObserver instead of per-row.
+  // Critical: a row whose height we already captured is NEVER re-measured.
+  // Otherwise the loop is: ResizeObserver → setMeasureVersion → layout
+  // recompute → topPad changes → DOM mutates → ResizeObserver fires again …
+  // On slow devices (Boox e-ink) this manifests as the chat "scrolling by
+  // itself". Measure once, trust the value, move on.
   const containerRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     const node = containerRef.current;
     if (!node) return;
     const observer = new ResizeObserver(() => {
-      // Re-measure all rendered rows; cheap because there are ~range.end-range.start.
       const children = Array.from(node.querySelectorAll<HTMLDivElement>(".vrow"));
       for (const child of children) {
         const key = child.dataset.key;
         if (!key) continue;
+        // Skip rows we already measured.
+        if (heightsRef.current.has(key)) continue;
         const h = Math.ceil(child.getBoundingClientRect().height);
         if (h <= 0) continue;
         const prev = heightsRef.current.get(key) ?? 0;
-        if (Math.abs(prev - h) >= 2) pendingHeights.current.set(key, h);
+        if (prev === 0 || Math.abs(prev - h) >= HEIGHT_DELTA_THRESHOLD_PX) {
+          pendingHeights.current.set(key, h);
+        }
       }
       if (!measureRaf.current && pendingHeights.current.size) {
-        // globalThis (not local `activeWindow`) carries setTimeout in browser/JSDOM.
         measureRaf.current = globalThis.setTimeout(flushMeasurements, MEASURE_FLUSH_MS) as unknown as number;
       }
     });
     observer.observe(node);
     return () => observer.disconnect();
-  }, [range.start, range.end]);
+  }, []);  // Single observer for the lifetime of the component — not recreated on range change.
 
   const flushMeasurements = useCallback(() => {
     measureRaf.current = null;

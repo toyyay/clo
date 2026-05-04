@@ -1,0 +1,143 @@
+// Top bar — visually echoes the legacy client (☰ burger, chat title +
+// metadata, sync pill, ⋯ menu) so users coming from / before the swap
+// don't lose orientation.
+
+import { useEffect, useState } from "react";
+import { useStore, useStoreState } from "./store-hook";
+import { formatRelative } from "./format";
+
+export function Topbar({ onToggleSidebar, sidebarOpen }: { onToggleSidebar: () => void; sidebarOpen: boolean }) {
+  const state = useStoreState();
+  const activeChat = state.activeChat ? state.visibleChats.get(state.activeChat) : null;
+
+  return (
+    <header className="topbar">
+      <button
+        className="icon-btn topbar-burger"
+        onClick={onToggleSidebar}
+        aria-label={sidebarOpen ? "Hide chats" : "Show chats"}
+        title={sidebarOpen ? "Hide chats" : "Show chats"}
+      >
+        ☰
+      </button>
+
+      <div className="topbar-center">
+        {activeChat ? (
+          <>
+            <div className="topbar-title">{activeChat.title || activeChat.chatId}</div>
+            <div className="topbar-meta">
+              {formatRelative(activeChat.lastSeenAt)}
+              <span className="dot">·</span>
+              {activeChat.itemCount.toLocaleString()} items
+              <span className="dot">·</span>
+              {formatBytes(activeChat.approxBytes)}
+              <span className="dot">·</span>
+              {activeChat.provider}
+            </div>
+          </>
+        ) : (
+          <div className="topbar-title topbar-title-empty">Chats</div>
+        )}
+      </div>
+
+      <SyncPill />
+      <AppMenu />
+    </header>
+  );
+}
+
+function SyncPill() {
+  const state = useStoreState();
+  const kind = state.status.kind;
+  const label = kind === "open" ? "ok" : kind === "connecting" ? "…" : kind === "reconnecting" ? "rec" : kind === "closed" ? "off" : "—";
+  return (
+    <div className={`sync-pill sync-pill-${kind}`} title={statusTooltip(state)}>
+      <span className="sync-dot" />
+      <span className="sync-label">{label}</span>
+    </div>
+  );
+}
+
+function statusTooltip(state: ReturnType<typeof useStoreState>) {
+  const parts: string[] = [];
+  parts.push(`status: ${state.status.kind}`);
+  parts.push(`views: ${state.views.size}`);
+  let bytes = 0;
+  for (const v of state.pendingBytes.values()) bytes += v;
+  if (bytes > 0) parts.push(`pending: ${formatBytes(bytes)}`);
+  return parts.join("\n");
+}
+
+function AppMenu() {
+  const store = useStore();
+  const [open, setOpen] = useState(false);
+
+  // Close on outside click.
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as HTMLElement;
+      if (t.closest(".app-menu-pop") || t.closest(".app-menu-button")) return;
+      setOpen(false);
+    };
+    document.addEventListener("click", onDoc);
+    return () => document.removeEventListener("click", onDoc);
+  }, [open]);
+
+  const reload = () => location.reload();
+  const resetAndReload = async () => {
+    if (!confirm("Reset local cache and reload? This drops IndexedDB, view subscriptions and the local client id.")) return;
+    try {
+      store.stop();
+      await new Promise<void>((res) => {
+        const req = indexedDB.deleteDatabase("chatview-v3");
+        req.onsuccess = () => res();
+        req.onerror = () => res();
+        req.onblocked = () => res();
+      });
+      localStorage.removeItem("chatview-v3:client-id");
+      localStorage.removeItem("chatview-v3:sidebar-expanded");
+      if ("serviceWorker" in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((r) => r.unregister().catch(() => {})));
+      }
+      if ("caches" in window) {
+        const names = await caches.keys();
+        await Promise.all(names.map((n) => caches.delete(n).catch(() => {})));
+      }
+    } catch {}
+    location.reload();
+  };
+  const forceResync = () => {
+    store.stop();
+    setTimeout(() => location.reload(), 100);
+  };
+
+  return (
+    <>
+      <button
+        className="icon-btn app-menu-button"
+        aria-label="App menu"
+        onClick={() => setOpen((v) => !v)}
+        title="App menu"
+      >
+        ⋯
+      </button>
+      {open && (
+        <div className="app-menu-pop">
+          <button onClick={reload}>Reload</button>
+          <button onClick={forceResync}>Force re-sync</button>
+          <button onClick={resetAndReload}>Reset & reload</button>
+          <a href="/v2">Open legacy /v2</a>
+        </div>
+      )}
+    </>
+  );
+}
+
+function formatBytes(b: number): string {
+  if (!b) return "0";
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${Math.round(b / 1024)} KB`;
+  return `${(b / 1024 / 1024).toFixed(1)} MB`;
+}

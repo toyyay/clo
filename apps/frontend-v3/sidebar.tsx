@@ -10,12 +10,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ChatIndex, GroupNode } from "../../packages/sync-v3/contracts";
 import * as idb from "./idb";
 import { useStoreState, useStore } from "./store-hook";
+import { formatBytes, formatRelative } from "./format";
 
 const PAGE_SIZE = 20;
 
 type ExpandedState = Set<string>;
 
-export function Sidebar() {
+export function Sidebar({ visible }: { visible: boolean }) {
   const store = useStore();
   const state = useStoreState();
   const [expanded, setExpanded] = useState<ExpandedState>(() => readExpanded());
@@ -23,11 +24,12 @@ export function Sidebar() {
   const [childrenByParent, setChildrenByParent] = useState<Map<string, GroupNode[]>>(new Map());
   const [chatPagesByGroup, setChatPagesByGroup] = useState<Map<string, ChatIndex[]>>(new Map());
   const [chatHasMoreByGroup, setChatHasMoreByGroup] = useState<Map<string, boolean>>(new Map());
+  const [search, setSearch] = useState("");
 
-  // Boot: load level=1 hosts.
+  // Boot: load level=1 hosts. Re-run when store gets fresh groups.
   useEffect(() => {
     void idb.getGroupsByLevel(1).then((rows) => setHostNodes(sortByLastSeen(rows)));
-  }, [state.groups.size]); // re-run when store gets fresh groups (trivial dep, fine for boot)
+  }, [state.groups.size]);
 
   const expand = useCallback(async (key: string) => {
     const next = new Set(expanded);
@@ -35,7 +37,6 @@ export function Sidebar() {
     setExpanded(next);
     persistExpanded(next);
 
-    // Fetch direct children if not cached.
     if (!childrenByParent.has(key)) {
       const kids = await store.loadGroupChildren(key);
       const updated = new Map(childrenByParent);
@@ -64,34 +65,72 @@ export function Sidebar() {
     setChatHasMoreByGroup(updatedHasMore);
   }, [chatPagesByGroup, chatHasMoreByGroup, store]);
 
+  const searchResults = useSearch(search, state.visibleChats);
+
   return (
-    <aside className="sidebar">
-      <header className="sidebar-head">
-        <span>Chats</span>
-        <ConnectionDot status={state.status.kind} />
-      </header>
-      <div className="tree">
-        {hostNodes.map((host) => (
-          <HostNode
-            key={host.key}
-            node={host}
-            expanded={expanded}
-            childrenByParent={childrenByParent}
-            chatPagesByGroup={chatPagesByGroup}
-            chatHasMoreByGroup={chatHasMoreByGroup}
-            onExpand={expand}
-            onCollapse={collapse}
-            onLoadChats={loadChatsForProject}
-          />
-        ))}
-        {!hostNodes.length && <div className="empty-tree">No data yet — connecting…</div>}
+    <aside className={`sidebar ${visible ? "visible" : "hidden"}`}>
+      <div className="sidebar-search">
+        <input
+          type="search"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search chats"
+          aria-label="Search chats"
+        />
       </div>
+
+      {search.trim() ? (
+        <div className="tree">
+          {searchResults.length === 0 ? (
+            <div className="empty-tree">No matches</div>
+          ) : (
+            searchResults.map((chat) => (
+              <ChatRow key={chat.chatId} chat={chat} indent={0} />
+            ))
+          )}
+        </div>
+      ) : (
+        <div className="tree">
+          {hostNodes.map((host) => (
+            <GroupRow
+              key={host.key}
+              node={host}
+              indent={0}
+              expanded={expanded}
+              childrenByParent={childrenByParent}
+              chatPagesByGroup={chatPagesByGroup}
+              chatHasMoreByGroup={chatHasMoreByGroup}
+              onExpand={expand}
+              onCollapse={collapse}
+              onLoadChats={loadChatsForProject}
+            />
+          ))}
+          {!hostNodes.length && <div className="empty-tree">No data yet — connecting…</div>}
+        </div>
+      )}
     </aside>
   );
 }
 
+function useSearch(query: string, visibleChats: Map<string, ChatIndex>): ChatIndex[] {
+  const trimmed = query.trim().toLowerCase();
+  return useMemo(() => {
+    if (!trimmed) return [];
+    const out: ChatIndex[] = [];
+    for (const c of visibleChats.values()) {
+      if (c.title.toLowerCase().includes(trimmed) || c.chatId.toLowerCase().includes(trimmed)) {
+        out.push(c);
+      }
+      if (out.length >= 50) break;
+    }
+    out.sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
+    return out;
+  }, [trimmed, visibleChats]);
+}
+
 type NodeProps = {
   node: GroupNode;
+  indent: number;
   expanded: ExpandedState;
   childrenByParent: Map<string, GroupNode[]>;
   chatPagesByGroup: Map<string, ChatIndex[]>;
@@ -101,11 +140,7 @@ type NodeProps = {
   onLoadChats: (projectKey: string, append?: boolean) => void;
 };
 
-function HostNode(props: NodeProps) {
-  return <GroupRow {...props} indent={0} />;
-}
-
-function GroupRow(props: NodeProps & { indent: number }) {
+function GroupRow(props: NodeProps) {
   const { node, expanded, childrenByParent, indent } = props;
   const isOpen = expanded.has(node.key);
   return (
@@ -113,11 +148,15 @@ function GroupRow(props: NodeProps & { indent: number }) {
       <button
         className="group-toggle"
         onClick={() => (isOpen ? props.onCollapse(node.key) : props.onExpand(node.key))}
-        style={{ paddingLeft: indent * 12 }}
+        style={{ paddingLeft: 8 + indent * 12 }}
       >
         <span className={`caret ${isOpen ? "open" : ""}`}>▶</span>
         <span className="group-label">{node.label}</span>
-        <span className="group-meta">{node.chatCount} · {formatBytes(node.approxBytes)}</span>
+        <span className="group-meta">
+          <span className="group-count">{node.chatCount}</span>
+          <span className="group-bytes">{formatBytes(node.approxBytes)}</span>
+          {node.lastSeenAt && <span className="group-time">{formatRelative(node.lastSeenAt)}</span>}
+        </span>
       </button>
       {isOpen && (
         <div className="group-children">
@@ -132,13 +171,10 @@ function GroupRow(props: NodeProps & { indent: number }) {
 }
 
 function ProjectChats(props: NodeProps & { project: GroupNode; indent: number }) {
-  const store = useStore();
-  const state = useStoreState();
   const { project, chatPagesByGroup, chatHasMoreByGroup, onLoadChats, indent } = props;
   const cached = chatPagesByGroup.get(project.key);
   const previewIds = project.topChatIds;
 
-  // Load preview from chat_index by ids (5 chats max — cheap)
   const [preview, setPreview] = useState<ChatIndex[]>([]);
   useEffect(() => {
     void idb.getChatIndexMany(previewIds).then((rows) => setPreview(sortChatsByLastSeen(rows)));
@@ -150,19 +186,14 @@ function ProjectChats(props: NodeProps & { project: GroupNode; indent: number })
   return (
     <div className="project-chats">
       {list.map((chat) => (
-        <button
-          key={chat.chatId}
-          className={`chat-row ${state.activeChat === chat.chatId ? "active" : ""}`}
-          onClick={() => store.openChat(chat.chatId)}
-          style={{ paddingLeft: indent * 12 }}
-          title={chat.title}
-        >
-          <span className="chat-title">{chat.title}</span>
-          <span className="chat-meta">{formatBytes(chat.approxBytes)}</span>
-        </button>
+        <ChatRow key={chat.chatId} chat={chat} indent={indent} />
       ))}
       {hasMore && (
-        <button className="show-more" onClick={() => onLoadChats(project.key, !!cached)} style={{ paddingLeft: indent * 12 }}>
+        <button
+          className="show-more"
+          onClick={() => onLoadChats(project.key, !!cached)}
+          style={{ paddingLeft: 8 + indent * 12 }}
+        >
           {cached ? "Show more" : `Show all ${project.chatCount}`}
         </button>
       )}
@@ -170,9 +201,23 @@ function ProjectChats(props: NodeProps & { project: GroupNode; indent: number })
   );
 }
 
-function ConnectionDot({ status }: { status: string }) {
+function ChatRow({ chat, indent }: { chat: ChatIndex; indent: number }) {
+  const store = useStore();
+  const state = useStoreState();
+  const active = state.activeChat === chat.chatId;
   return (
-    <span className={`conn-dot conn-${status}`} title={status}>●</span>
+    <button
+      className={`chat-row ${active ? "active" : ""}`}
+      onClick={() => store.openChat(chat.chatId)}
+      style={{ paddingLeft: 8 + indent * 12 }}
+      title={`${chat.title}\n${chat.itemCount.toLocaleString()} items · ${formatBytes(chat.approxBytes)}\nlast seen ${chat.lastSeenAt}`}
+    >
+      <span className="chat-title">{chat.title || chat.chatId}</span>
+      <span className="chat-meta">
+        <span className="chat-bytes">{formatBytes(chat.approxBytes)}</span>
+        <span className="chat-time">{formatRelative(chat.lastSeenAt)}</span>
+      </span>
+    </button>
   );
 }
 
@@ -182,13 +227,6 @@ function sortByLastSeen<T extends { lastSeenAt: string }>(rows: T[]): T[] {
 
 function sortChatsByLastSeen(rows: ChatIndex[]): ChatIndex[] {
   return [...rows].sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
-}
-
-function formatBytes(b: number): string {
-  if (!b) return "0";
-  if (b < 1024) return `${b} B`;
-  if (b < 1024 * 1024) return `${Math.round(b / 1024)} KB`;
-  return `${(b / 1024 / 1024).toFixed(1)} MB`;
 }
 
 const EXPANDED_KEY = "chatview-v3:sidebar-expanded";

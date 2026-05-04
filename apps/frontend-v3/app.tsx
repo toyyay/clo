@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { Sidebar } from "./sidebar";
 import { ChatView } from "./chat-view";
+import { Topbar } from "./topbar";
 import { useStore, useStoreState } from "./store-hook";
 import type { ViewSpec } from "../../packages/sync-v3/contracts";
 
@@ -14,9 +15,20 @@ const DEFAULT_VIEW: ViewSpec = {
   priority: 50,
 };
 
+const SIDEBAR_OPEN_KEY = "chatview-v3:sidebar-open";
+
 export function App() {
   const store = useStore();
   const state = useStoreState();
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
+    try {
+      const v = localStorage.getItem(SIDEBAR_OPEN_KEY);
+      if (v === null) return window.matchMedia("(min-width: 780px)").matches;
+      return v === "1";
+    } catch {
+      return true;
+    }
+  });
 
   useEffect(() => {
     const clientId = ensureClientId();
@@ -24,83 +36,30 @@ export function App() {
     return () => store.stop();
   }, [store]);
 
-  // First-run bootstrap: if no views configured, install a default one
+  // First-run bootstrap: install default view if none configured yet.
   useEffect(() => {
     if (state.status.kind === "open" && state.views.size === 0) {
       void store.upsertView(DEFAULT_VIEW);
     }
   }, [state.status.kind, state.views.size, store]);
 
+  const toggleSidebar = () => {
+    setSidebarOpen((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem(SIDEBAR_OPEN_KEY, next ? "1" : "0");
+      } catch {}
+      return next;
+    });
+  };
+
   return (
-    <div className="app">
-      <Sidebar />
+    <div className={`app ${sidebarOpen ? "sidebar-on" : "sidebar-off"}`}>
+      <Topbar onToggleSidebar={toggleSidebar} sidebarOpen={sidebarOpen} />
+      <Sidebar visible={sidebarOpen} />
       <ChatView />
-      <Statusbar />
       <BuildBadge />
-      <AppMenu />
     </div>
-  );
-}
-
-function AppMenu() {
-  const store = useStore();
-  const [open, setOpen] = useState(false);
-  const reload = () => location.reload();
-  const resetAndReload = async () => {
-    if (!confirm("Reset local cache and reload? This drops IndexedDB, view subscriptions and the local client id.")) return;
-    try {
-      // 1. Stop the WS so deletion isn't fighting an open transaction.
-      store.stop();
-      // 2. Drop our IDB schema.
-      await new Promise<void>((res) => {
-        const req = indexedDB.deleteDatabase("chatview-v3");
-        req.onsuccess = () => res();
-        req.onerror = () => res();
-        req.onblocked = () => res();
-      });
-      // 3. Drop localStorage keys (client id + sidebar expansion).
-      localStorage.removeItem("chatview-v3:client-id");
-      localStorage.removeItem("chatview-v3:sidebar-expanded");
-      // 4. Unregister any remaining service workers + clear all caches as a
-      //    belt-and-suspenders measure (legacy SW kill-switch should already
-      //    have done this, but Boox / old browsers may have lagged).
-      if ("serviceWorker" in navigator) {
-        const regs = await navigator.serviceWorker.getRegistrations();
-        await Promise.all(regs.map((r) => r.unregister().catch(() => {})));
-      }
-      if ("caches" in window) {
-        const names = await caches.keys();
-        await Promise.all(names.map((n) => caches.delete(n).catch(() => {})));
-      }
-    } catch {}
-    location.reload();
-  };
-  const forceResync = async () => {
-    // Stop+start the WS — drainOutbox will re-upsert all known views,
-    // server will respond with snapshot. Cheaper than full reset.
-    store.stop();
-    setTimeout(() => location.reload(), 100);
-  };
-
-  return (
-    <>
-      <button
-        className="app-menu-button"
-        aria-label="App menu"
-        onClick={() => setOpen((v) => !v)}
-        title="App menu"
-      >
-        ⋯
-      </button>
-      {open && (
-        <div className="app-menu-pop" onMouseLeave={() => setOpen(false)}>
-          <button onClick={reload}>Reload</button>
-          <button onClick={forceResync}>Force re-sync</button>
-          <button onClick={resetAndReload}>Reset & reload</button>
-          <a href="/v2">Open legacy /v2</a>
-        </div>
-      )}
-    </>
   );
 }
 
@@ -122,40 +81,11 @@ function BuildBadge() {
     };
   }, []);
   if (!sha) return null;
-  // aria-hidden + pointer-events:none + user-select:none — невидим для DOM-кликов,
-  // не выделяется, не реагирует на курсор. Просто буквы поверх всего.
   return (
     <div className="build-badge" aria-hidden="true">
       {sha}
     </div>
   );
-}
-
-function Statusbar() {
-  const state = useStoreState();
-  return (
-    <footer className="statusbar">
-      <span className={`status-pill status-${state.status.kind}`}>
-        {statusLabel(state.status)}
-      </span>
-      <span className="status-views">{state.views.size} views</span>
-    </footer>
-  );
-}
-
-function statusLabel(status: { kind: string }): string {
-  switch (status.kind) {
-    case "open":
-      return "online";
-    case "connecting":
-      return "connecting…";
-    case "reconnecting":
-      return "reconnecting…";
-    case "closed":
-      return "offline";
-    default:
-      return status.kind;
-  }
 }
 
 function makeWsUrl(): string {
