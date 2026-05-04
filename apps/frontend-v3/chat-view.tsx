@@ -227,16 +227,36 @@ function ActiveChat({ chatId }: { chatId: string }) {
     });
   }, [chatId, items.length, layout.total]);
 
+  // Coalesce scroll events into ≤1 updateRange per RAF. Without this, on a
+  // slow CPU we may fall behind a flood of "scroll" events and pile up
+  // pending RAF callbacks.
+  const scrollRafRef = useRef<number | null>(null);
   const onScroll = useCallback(() => {
     // Programmatic scroll from anchor restore should not be treated as user
     // scroll, otherwise we cancel the still-running initial auto-scroll.
     if (anchoringActive.current) {
-      requestAnimationFrame(() => updateRange(false));
+      if (scrollRafRef.current === null) {
+        scrollRafRef.current = requestAnimationFrame(() => {
+          scrollRafRef.current = null;
+          updateRange(false);
+        });
+      }
       return;
     }
     if (initialScrollDone.current === false) userScrolled.current = true;
-    requestAnimationFrame(() => updateRange(true));
+    if (scrollRafRef.current === null) {
+      scrollRafRef.current = requestAnimationFrame(() => {
+        scrollRafRef.current = null;
+        updateRange(true);
+      });
+    }
   }, [updateRange]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollRafRef.current !== null) cancelAnimationFrame(scrollRafRef.current);
+    };
+  }, []);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -333,7 +353,40 @@ function ActiveChat({ chatId }: { chatId: string }) {
   }, []);
 
   const visible = items.slice(range.start, range.end);
-  const grouped = useMemo(() => groupConsecutiveTools(visible, range.start), [visible, range.start]);
+  const grouped = useMemo(() => groupConsecutiveTools(visible, range.start, itemKeys), [visible, range.start, itemKeys]);
+
+  // Per-render-item user state: collapsed tool-groups (by their first-item
+  // key) and expanded long messages (also by item key). Keyed so the state
+  // survives re-renders from sync deltas; cleared on chat change because
+  // these refs reset with the component.
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const [expandedLong, setExpandedLong] = useState<Set<string>>(new Set());
+
+  const toggleGroup = useCallback(
+    (key: string) => {
+      captureAnchor();
+      setCollapsedGroups((prev) => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+      });
+    },
+    [captureAnchor],
+  );
+
+  const toggleLongMessage = useCallback(
+    (key: string) => {
+      captureAnchor();
+      setExpandedLong((prev) => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+      });
+    },
+    [captureAnchor],
+  );
 
   const isEmpty = items.length === 0;
   const isOffline = state.status.kind === "closed" || state.status.kind === "reconnecting";
@@ -359,25 +412,42 @@ function ActiveChat({ chatId }: { chatId: string }) {
             if (entry.kind === "single") {
               const idx = entry.index;
               const key = itemKeys[idx]!;
+              const isLong = entry.item.k === "t" && entry.item.txt.length > LONG_TEXT_THRESHOLD;
+              const expanded = expandedLong.has(key);
               return (
                 <div key={`${chatId}:${key}`} className="vrow" data-key={key}>
-                  <RenderItemView item={entry.item} />
+                  <RenderItemView
+                    item={entry.item}
+                    longExpanded={isLong ? expanded : undefined}
+                    onToggleLong={isLong ? () => toggleLongMessage(key) : undefined}
+                  />
                 </div>
               );
             }
-            // tool-group: wrap consecutive tu/tr items
+            // tool-group: wrap consecutive tu/tr items, collapsible by click on label
+            const collapsed = collapsedGroups.has(entry.groupKey);
             return (
-              <div key={`${chatId}:tg:${entry.startIndex}`} className="tool-group-wrap">
-                <div className="tool-group-label">used {entry.toolCount} tools ▸</div>
-                {entry.items.map((sub, i) => {
-                  const idx = entry.startIndex + i;
-                  const key = itemKeys[idx]!;
-                  return (
-                    <div key={`${chatId}:${key}`} className="vrow" data-key={key}>
-                      <RenderItemView item={sub} />
-                    </div>
-                  );
-                })}
+              <div key={`${chatId}:${entry.groupKey}`} className={`tool-group-wrap ${collapsed ? "collapsed" : ""}`}>
+                <button
+                  className="tool-group-label"
+                  onClick={() => toggleGroup(entry.groupKey)}
+                  aria-expanded={!collapsed}
+                  title={collapsed ? "Expand tool calls" : "Collapse tool calls"}
+                >
+                  <span className="tool-group-caret">{collapsed ? "▶" : "▼"}</span>
+                  used {entry.toolCount} tool{entry.toolCount === 1 ? "" : "s"}
+                  {collapsed && (entry.firstName ? ` · ${entry.firstName}` : "")}
+                </button>
+                {!collapsed &&
+                  entry.items.map((sub, i) => {
+                    const idx = entry.startIndex + i;
+                    const key = itemKeys[idx]!;
+                    return (
+                      <div key={`${chatId}:${key}`} className="vrow" data-key={key}>
+                        <RenderItemView item={sub} />
+                      </div>
+                    );
+                  })}
               </div>
             );
           })}
@@ -413,9 +483,9 @@ function Composer({ chatId, chatMeta }: { chatId: string; chatMeta: string }) {
 
 type GroupEntry =
   | { kind: "single"; item: RenderItem; index: number }
-  | { kind: "tool-group"; items: RenderItem[]; startIndex: number; toolCount: number };
+  | { kind: "tool-group"; items: RenderItem[]; startIndex: number; toolCount: number; groupKey: string; firstName: string | null };
 
-function groupConsecutiveTools(items: RenderItem[], offset: number): GroupEntry[] {
+function groupConsecutiveTools(items: RenderItem[], offset: number, itemKeys: string[]): GroupEntry[] {
   const out: GroupEntry[] = [];
   let i = 0;
   while (i < items.length) {
@@ -428,7 +498,10 @@ function groupConsecutiveTools(items: RenderItem[], offset: number): GroupEntry[
         j += 1;
       }
       const toolCount = group.filter((g) => g.k === "tu").length;
-      out.push({ kind: "tool-group", items: group, startIndex: offset + i, toolCount });
+      // Stable groupKey = first item's render key. Survives re-renders / sync.
+      const groupKey = `tg:${itemKeys[offset + i]!}`;
+      const firstName = group.find((g) => g.k === "tu")?.name ?? null;
+      out.push({ kind: "tool-group", items: group, startIndex: offset + i, toolCount, groupKey, firstName });
       i = j;
       continue;
     }
@@ -437,6 +510,8 @@ function groupConsecutiveTools(items: RenderItem[], offset: number): GroupEntry[
   }
   return out;
 }
+
+const LONG_TEXT_THRESHOLD = 4000;
 
 function estimateHeight(item: RenderItem): number {
   switch (item.k) {

@@ -10,15 +10,38 @@
 
 import type { MarkdownBlock, RenderItem } from "../../packages/sync-v3/contracts";
 
-export function RenderItemView({ item }: { item: RenderItem }) {
+const LONG_PREVIEW_CHARS = 1200;
+
+export function RenderItemView({
+  item,
+  longExpanded,
+  onToggleLong,
+}: {
+  item: RenderItem;
+  longExpanded?: boolean;
+  onToggleLong?: () => void;
+}) {
   switch (item.k) {
-    case "t":
+    case "t": {
+      const isLong = onToggleLong !== undefined; // parent decided based on threshold
+      const showFull = !isLong || longExpanded === true;
+      const txt = showFull ? item.txt : item.txt.slice(0, LONG_PREVIEW_CHARS);
+      // Markdown blocks are pre-parsed for the FULL text; if we're truncating,
+      // fall back to plain text on the truncated slice so we don't render
+      // half-trees.
+      const useBlocks = showFull && item.blocks;
       return (
-        <div className={`msg ${item.r === "a" ? "msg-asst" : "msg-user"}`}>
+        <div className={`msg ${item.r === "a" ? "msg-asst" : "msg-user"} ${isLong && !showFull ? "msg-truncated" : ""}`}>
           <div className="msg-role">{item.r === "a" ? "assistant" : "user"}</div>
-          <div className="msg-body">{item.blocks ? <Blocks blocks={item.blocks} /> : <PlainText txt={item.txt} />}</div>
+          <div className="msg-body">{useBlocks ? <Blocks blocks={item.blocks!} /> : <PlainText txt={txt} />}</div>
+          {isLong && (
+            <button className="show-more-btn" onClick={onToggleLong} aria-expanded={showFull}>
+              {showFull ? "Show less" : `Show full message (${formatCharCount(item.txt.length)})`}
+            </button>
+          )}
         </div>
       );
+    }
     case "th":
       return (
         <div className="msg msg-think">
@@ -140,4 +163,10 @@ function safeStringify(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function formatCharCount(n: number): string {
+  if (n < 1000) return `${n} chars`;
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k chars`;
+  return `${(n / 1_000_000).toFixed(1)}M chars`;
 }

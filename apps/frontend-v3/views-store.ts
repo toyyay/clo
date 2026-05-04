@@ -97,6 +97,9 @@ export function createStore(): Store {
 
   let ws: WsClient | null = null;
   let tickHandle: ReturnType<typeof setInterval> | null = null;
+  /** Increments on every openChat / closeActiveChat. Async paths check this
+   *  before mutating state so a stale request can't pollute the new chat. */
+  let activeChatToken = 0;
   /** map reqId → resolver for pending history.range */
   const historyRequests = new Map<string, (frame: { items: SeqRenderItem[]; hasOlder: boolean; hasNewer: boolean }) => void>();
 
@@ -386,8 +389,14 @@ export function createStore(): Store {
     },
 
     async openChat(chatId, tailLimit = TAIL_DEFAULT) {
+      // Each openChat invocation gets a fresh token; if the user opens
+      // another chat (or closes this one) before our async work finishes,
+      // we silently drop the result instead of polluting the next chat.
+      const token = ++activeChatToken;
+
       // 1. IDB сначала — мгновенный first-frame для офлайна и быстрого старта.
       let tailRows = await idb.getChatTail(chatId, tailLimit);
+      if (token !== activeChatToken) return;
 
       // 2. Если IDB пуст для этого чата (snapshot теперь не возит tails),
       //    тянем с сервера через history.range и кэшируем в IDB.
@@ -397,6 +406,7 @@ export function createStore(): Store {
             chatId,
             limit: tailLimit,
           });
+          if (token !== activeChatToken) return; // user moved on
           if (reply.items.length) {
             const itemRows: idb.RenderItemRow[] = reply.items.map((entry) => ({
               chatId,
@@ -406,13 +416,16 @@ export function createStore(): Store {
               bytes: estimateBytes(entry.item),
             }));
             await idb.bulkPutRenderItems(itemRows);
+            if (token !== activeChatToken) return;
             tailRows = itemRows.map((r) => ({ chatId: r.chatId, seq: r.seq, itemKey: r.itemKey, item: r.item, bytes: r.bytes }));
           }
         } catch (err) {
+          if (token !== activeChatToken) return;
           console.warn("[sync-v3] openChat: history.range failed", err);
         }
       }
 
+      if (token !== activeChatToken) return;
       const window: ActiveChatWindow = {
         chatId,
         items: tailRows.map((r) => r.item),
@@ -425,48 +438,59 @@ export function createStore(): Store {
     },
 
     closeActiveChat() {
+      activeChatToken += 1;
       commit({ activeChat: null, activeWindow: null });
     },
 
     async loadOlder(limit = HISTORY_PAGE) {
       const w = state.activeWindow;
       if (!w || !w.hasOlder) return;
-      // Try IDB first
-      const fromIdb = await idb.getChatRange(w.chatId, {
+      const tokenAtStart = activeChatToken;
+      const chatIdAtStart = w.chatId;
+
+      const fromIdb = await idb.getChatRange(chatIdAtStart, {
         fromSeq: 0,
         toSeq: w.firstSeq - 1,
         limit,
         direction: "prev",
       });
+      // If user switched chats while we were reading IDB, abort.
+      if (tokenAtStart !== activeChatToken || state.activeChat !== chatIdAtStart) return;
+
       let items = fromIdb.map((r) => r.item);
       let firstSeq = fromIdb[0]?.seq ?? w.firstSeq;
       let hasOlder = fromIdb.length === limit;
 
-      // If IDB ran out, ask server. Server returns SeqRenderItem with real seqs.
       if (fromIdb.length < limit && ws && state.status.kind === "open") {
         const remaining = limit - fromIdb.length;
         const serverReply = await requestHistory(ws, historyRequests, {
-          chatId: w.chatId,
-          before: firstSeq, // ask before whatever we already have
+          chatId: chatIdAtStart,
+          before: firstSeq,
           limit: remaining,
         });
+        if (tokenAtStart !== activeChatToken || state.activeChat !== chatIdAtStart) return;
         const itemRows: idb.RenderItemRow[] = serverReply.items.map((entry) => ({
-          chatId: w.chatId,
+          chatId: chatIdAtStart,
           seq: entry.seq,
           itemKey: idb.itemKey(entry.item),
           item: entry.item,
           bytes: estimateBytes(entry.item),
         }));
         await idb.bulkPutRenderItems(itemRows);
+        if (tokenAtStart !== activeChatToken || state.activeChat !== chatIdAtStart) return;
         items = [...serverReply.items.map((e) => e.item), ...items];
         firstSeq = serverReply.items[0]?.seq ?? firstSeq;
         hasOlder = serverReply.hasOlder;
       }
 
+      // Final guard before commit.
+      if (tokenAtStart !== activeChatToken || state.activeChat !== chatIdAtStart) return;
+      const stillCurrent = state.activeWindow;
+      if (!stillCurrent || stillCurrent.chatId !== chatIdAtStart) return;
       commit({
         activeWindow: {
-          ...w,
-          items: [...items, ...w.items],
+          ...stillCurrent,
+          items: [...items, ...stillCurrent.items],
           firstSeq,
           hasOlder,
         },
