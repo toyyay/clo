@@ -118,9 +118,15 @@ function ActiveChat({ chatId }: { chatId: string }) {
 
   // Auto-scroll to the bottom on first paint after the chat opens —
   // matches the legacy "open chat → see latest message" expectation.
-  // Re-runs while heights are still hydrating (layout.total grows as real
-  // measurements replace estimates), and stops once we've reached a stable
-  // bottom OR the user has scrolled manually.
+  //
+  // Use el.scrollHeight (real DOM, not layout.total) and assign it inside a
+  // double-RAF so both `range` (which sets paddingTop/Bottom) and the layout
+  // pass that consumes it have happened before we scroll. Otherwise scrollTop
+  // gets silently clamped to (scrollHeight - clientHeight) on a partial DOM
+  // and we end up at the top.
+  //
+  // Effect re-runs as layout.total grows (heights hydrate) and stops once the
+  // user scrolls manually OR distance-from-bottom is < 4px.
   const userScrolled = useRef(false);
   useLayoutEffect(() => {
     if (initialScrollDone.current) return;
@@ -132,18 +138,18 @@ function ActiveChat({ chatId }: { chatId: string }) {
     const el = scrollRef.current;
     if (!el) return;
     if (layout.total <= el.clientHeight) {
-      // Whole chat fits — nothing to scroll to.
       initialScrollDone.current = true;
       return;
     }
-    el.scrollTop = layout.total;
-    // Don't latch initialScrollDone yet — keep snapping to the new bottom while
-    // heights hydrate (which grows layout.total). Once heights settle, the next
-    // run will see no growth and we'll latch via the equal-bottom check below.
     requestAnimationFrame(() => {
-      if (!scrollRef.current) return;
-      const distFromBottom = scrollRef.current.scrollHeight - scrollRef.current.scrollTop - scrollRef.current.clientHeight;
-      if (distFromBottom < 4) initialScrollDone.current = true;
+      requestAnimationFrame(() => {
+        const el2 = scrollRef.current;
+        if (!el2) return;
+        if (userScrolled.current || initialScrollDone.current) return;
+        el2.scrollTop = el2.scrollHeight; // browser clamps to max — that's fine
+        const distFromBottom = el2.scrollHeight - el2.scrollTop - el2.clientHeight;
+        if (distFromBottom < 4) initialScrollDone.current = true;
+      });
     });
   }, [chatId, items.length, layout.total]);
 
