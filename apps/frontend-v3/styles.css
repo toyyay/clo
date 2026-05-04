@@ -591,10 +591,15 @@ body {
   color: var(--text-faint);
 }
 
-/* mobile: sidebar overlays the chat instead of pushing it. */
+/* mobile: sidebar overlays the chat instead of pushing it.
+   Specificity-matched (.app.sidebar-off / .app.sidebar-on) so the
+   desktop `.app.sidebar-off { grid-template-columns: 0 1fr }` rule
+   above doesn't accidentally win in mobile and squash chat-view to 0px. */
 @media (max-width: 780px) {
-  .app {
-    grid-template-columns: 1fr;
+  .app,
+  .app.sidebar-on,
+  .app.sidebar-off {
+    grid-template-columns: 1fr !important;
     grid-template-rows: 44px 1fr;
     grid-template-areas:
       "topbar"
