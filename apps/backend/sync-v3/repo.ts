@@ -85,26 +85,40 @@ async function buildSnapshot(sql: any, view: ViewSpec): Promise<SnapshotResult> 
   const resolved = resolvePredicate(view.predicate, 1);
 
   // 1. Find matching chats (deduplicated via DISTINCT) + their meta.
+  // CTE pre-extracts projectKey/title from metadata so they're plain columns
+  // for GROUP BY (Postgres won't accept jsonb expressions through aliases there).
   const chats = await sql.unsafe(
     `
+    with src as (
+      select
+        r.source_file_id,
+        r.sync_revision,
+        f.agent_id,
+        f.provider,
+        coalesce(nullif(f.metadata->>'projectKey', ''), '(unknown)') as project_key,
+        coalesce(nullif(f.metadata->>'title', ''), nullif(f.metadata->>'projectName', ''), nullif(f.metadata->>'projectKey', ''), '(no title)') as title,
+        f.last_seen_at,
+        f.size_bytes
+      from agent_render_items r
+      join agent_source_files f on f.id = r.source_file_id
+      where r.display = true
+        and f.deleted_at is null
+        and (${resolved.sql})
+        ${excludesClause(view, resolved.params.length + 1)}
+    )
     select
-      r.source_file_id,
-      f.agent_id,
-      f.provider,
-      coalesce(nullif(f.metadata->>'projectKey', ''), '(unknown)') as project_key,
-      coalesce(nullif(f.metadata->>'title', ''), nullif(f.metadata->>'projectName', ''), nullif(f.metadata->>'projectKey', ''), '(no title)') as title,
-      f.last_seen_at,
-      f.size_bytes,
-      max(r.sync_revision) as max_seq,
+      source_file_id,
+      agent_id,
+      provider,
+      project_key,
+      title,
+      last_seen_at,
+      size_bytes,
+      max(sync_revision) as max_seq,
       count(*) as item_count
-    from agent_render_items r
-    join agent_source_files f on f.id = r.source_file_id
-    where r.display = true
-      and f.deleted_at is null
-      and (${resolved.sql})
-      ${excludesClause(view, resolved.params.length + 1)}
-    group by r.source_file_id, f.agent_id, f.provider, project_key, title, f.last_seen_at, f.size_bytes
-    order by f.last_seen_at desc
+    from src
+    group by source_file_id, agent_id, provider, project_key, title, last_seen_at, size_bytes
+    order by last_seen_at desc
     `,
     [...resolved.params, ...excludesParams(view)],
   );
