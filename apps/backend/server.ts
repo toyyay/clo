@@ -211,9 +211,14 @@ void resumeQueuedTranscriptionJobs().catch((error) => {
 Bun.serve<WsData>({
   port,
   routes: withApiRequestLogging({
-    "/": index,
+    // Default UI is now sync-v3. The legacy client lives under /v2 explicitly
+    // and remains hash-routed so its existing chat URLs (#chat=...) keep
+    // working when prefixed with /v2.
+    "/": indexV3,
     "/v3": indexV3,
     "/v3/": indexV3,
+    "/v2": index,
+    "/v2/": index,
     "/service-worker.js": async (req: Request) => serviceWorkerResponse(req),
     "/manifest.webmanifest": (req: Request) => webManifestResponse(req),
     "/app-icon.svg": () => appIconResponse(),
