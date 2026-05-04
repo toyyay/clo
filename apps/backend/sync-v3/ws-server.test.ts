@@ -99,6 +99,11 @@ function makeFakeRepo(): Repo & {
         itemCount: items.filter((it) => it.chatId === chatId).length,
       };
     },
+    async listChatsByGroup() {
+      // Test repo doesn't simulate the project tree; protocol coverage is in
+      // a dedicated test below.
+      return { chats: [], hasMore: false };
+    },
   };
 }
 

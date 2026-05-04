@@ -167,6 +167,7 @@ export type ClientFrame =
   | { op: "chat.exclude"; viewId: string; chatId: string }
   | { op: "chat.include"; viewId: string; chatId: string }
   | { op: "history.range"; reqId: string; chatId: string; before?: number; after?: number; limit: number }
+  | { op: "chats.byGroup"; reqId: string; groupKey: string; afterLastSeenAt?: string; limit: number }
   | { op: "ping" };
 
 export type ClientViewState = {
@@ -188,6 +189,7 @@ export type ServerFrame =
   | { op: "group.delta"; deltas: Array<Partial<GroupNode> & { key: string }> }
   | { op: "evict.suggest"; chatIds: string[]; reason: "stale" | "exceeds_quota" }
   | { op: "history.range.ok"; reqId: string; chatId: string; items: SeqRenderItem[]; hasOlder: boolean; hasNewer: boolean }
+  | { op: "chats.byGroup.ok"; reqId: string; groupKey: string; chats: ChatIndex[]; hasMore: boolean }
   | { op: "flow.adjust"; batchBytes: number; reason: string }
   | { op: "pong" };
 

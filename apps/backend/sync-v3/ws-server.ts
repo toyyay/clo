@@ -597,6 +597,37 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
         return;
       }
 
+      case "chats.byGroup": {
+        const t0 = Date.now();
+        const result = await ctx.repo.listChatsByGroup({
+          groupKey: frame.groupKey,
+          afterLastSeenAt: frame.afterLastSeenAt,
+          limit: frame.limit,
+        });
+        const bytes = send(ws, {
+          op: "chats.byGroup.ok",
+          reqId: frame.reqId,
+          groupKey: frame.groupKey,
+          chats: result.chats,
+          hasMore: result.hasMore,
+        });
+        telemetry.log({
+          clientId: ws.data.clientId ?? null,
+          event: "chats.byGroup",
+          level: "info",
+          durationMs: Date.now() - t0,
+          bytes,
+          payload: {
+            groupKey: frame.groupKey,
+            limit: frame.limit,
+            after: frame.afterLastSeenAt ?? null,
+            chats: result.chats.length,
+            hasMore: result.hasMore,
+          },
+        });
+        return;
+      }
+
       case "ping": {
         send(ws, { op: "pong" });
         return;

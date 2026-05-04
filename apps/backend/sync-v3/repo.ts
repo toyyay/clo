@@ -53,9 +53,21 @@ export type Repo = {
   fetchChatTailById(sourceFileId: number, limit: number): Promise<SeqRenderItem[]>;
   /** Build a single ChatIndex row for a chat (used by chat.added handler). */
   fetchChatIndex(sourceFileId: number): Promise<ChatIndex | null>;
+  /** Lazy listing of chats inside a group_key — used by sidebar "Show all"
+   *  on projects whose chats fall outside the snapshot's MAX_SNAPSHOT_CHATS top. */
+  listChatsByGroup(opts: ListChatsByGroupOpts): Promise<{ chats: ChatIndex[]; hasMore: boolean }>;
   bytesRemainingForView(view: ViewSpec, cursor: number): Promise<number>;
   refreshGroupAggregates(): Promise<void>;
 };
+
+export type ListChatsByGroupOpts = {
+  groupKey: string;
+  /** ISO timestamp; only chats with last_seen_at < this value are returned */
+  afterLastSeenAt?: string;
+  limit: number;
+};
+
+const MAX_GROUP_PAGE = 100;
 
 export type HistoryRangeOpts = {
   chatId: string;
@@ -84,7 +96,64 @@ export function makeRepo(sql: any): Repo {
     resolveMatchingViews: (sourceFileId) => resolveMatchingViews(sql, sourceFileId),
     fetchChatTailById: (sourceFileId, limit) => fetchChatTail(sql, sourceFileId, limit),
     fetchChatIndex: (sourceFileId) => fetchChatIndex(sql, sourceFileId),
+    listChatsByGroup: (opts) => listChatsByGroup(sql, opts),
   };
+}
+
+async function listChatsByGroup(sql: any, opts: ListChatsByGroupOpts): Promise<{ chats: ChatIndex[]; hasMore: boolean }> {
+  const limit = Math.max(1, Math.min(MAX_GROUP_PAGE, Math.floor(opts.limit)));
+  // Pull from v3_group_aggregates row to extract the (agent_id, provider, project_key)
+  // triple that the group_key encodes — that triple is the indexed filter on
+  // agent_source_files. Doing it via the view keeps key-format authoritatively
+  // owned by the migration (no parsing on the JS side).
+  const groupRows = await sql`
+    select host_id, provider, project_key, level
+    from v3_group_aggregates
+    where group_key = ${opts.groupKey}
+    limit 1
+  `;
+  if (!groupRows.length) return { chats: [], hasMore: false };
+  const g = groupRows[0];
+
+  // Only level=3 groups have the full triple. For level=1/2 we'd need to
+  // page across many projects — sidebar never asks us that today, so stay
+  // strict and refuse early if it ever does.
+  if (Number(g.level) !== 3) return { chats: [], hasMore: false };
+
+  const watermark = opts.afterLastSeenAt ?? null;
+  const rows = await sql`
+    select
+      f.id,
+      f.agent_id,
+      f.provider,
+      coalesce(nullif(f.metadata->>'projectKey', ''), '(unknown)') as project_key,
+      coalesce(nullif(f.metadata->>'title', ''), nullif(f.metadata->>'projectName', ''), nullif(f.metadata->>'projectKey', ''), '(no title)') as title,
+      f.last_seen_at,
+      f.size_bytes,
+      coalesce((select count(*) from agent_render_items r where r.source_file_id = f.id and r.display = true), 0) as item_count
+    from agent_source_files f
+    where f.deleted_at is null
+      and f.source_kind = 'conversation'
+      and f.agent_id = ${g.host_id}
+      and f.provider = ${g.provider}
+      and coalesce(nullif(f.metadata->>'projectKey', ''), '(unknown)') = ${g.project_key}
+      and (${watermark}::timestamptz is null or f.last_seen_at < ${watermark}::timestamptz)
+    order by f.last_seen_at desc
+    limit ${limit + 1}
+  `;
+  const hasMore = rows.length > limit;
+  const chats: ChatIndex[] = rows.slice(0, limit).map((row: any) => ({
+    chatId: v3SessionIdFromSourceFileId(row.id),
+    groupKey: groupKeyFor(row.agent_id, row.provider, row.project_key),
+    hostId: row.agent_id,
+    provider: row.provider,
+    projectKey: row.project_key,
+    title: row.title,
+    lastSeenAt: toISO(row.last_seen_at),
+    approxBytes: Number(row.size_bytes ?? 0),
+    itemCount: Number(row.item_count ?? 0),
+  }));
+  return { chats, hasMore };
 }
 
 async function buildSnapshot(sql: any, view: ViewSpec): Promise<SnapshotResult> {

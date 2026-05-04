@@ -111,6 +111,8 @@ export function createStore(): Store {
   let activeChatToken = 0;
   /** map reqId → resolver for pending history.range */
   const historyRequests = new Map<string, (frame: { items: SeqRenderItem[]; hasOlder: boolean; hasNewer: boolean }) => void>();
+  /** map reqId → resolver for pending chats.byGroup */
+  const chatPageRequests = new Map<string, (frame: { chats: ChatIndex[]; hasMore: boolean }) => void>();
 
   function commit(next: Partial<StoreState>) {
     state = { ...state, ...next };
@@ -248,6 +250,14 @@ export function createStore(): Store {
       case "history.range.ok":
         applyHistoryReply(frame);
         return;
+      case "chats.byGroup.ok": {
+        const cb = chatPageRequests.get(frame.reqId);
+        if (cb) {
+          cb({ chats: frame.chats, hasMore: frame.hasMore });
+          chatPageRequests.delete(frame.reqId);
+        }
+        return;
+      }
       case "evict.suggest":
         // honor server eviction suggestion
         for (const id of frame.chatIds) void idb.deleteChatItems(id);
@@ -520,9 +530,51 @@ export function createStore(): Store {
     },
 
     async loadChatPage(groupKey, opts) {
+      // Try the server first — it sees ALL chats in the group, not just the
+      // top-MAX_SNAPSHOT_CHATS slice that fit in the snapshot. The IDB index
+      // is a fallback for when WS is offline (e.g. boot from cache).
+      if (ws && state.status.kind === "open") {
+        try {
+          const reply = await requestChatPage(ws, chatPageRequests, {
+            groupKey,
+            afterLastSeenAt: opts.afterLastSeenAt,
+            limit: opts.limit,
+          });
+          // Cache fetched rows so a 2nd open is instant and offline use stays
+          // smooth. We also seed visibleChats so openChat() finds the title.
+          if (reply.chats.length) {
+            await idb.bulkPutChatIndex(reply.chats);
+            const visibleChats = new Map(state.visibleChats);
+            for (const c of reply.chats) visibleChats.set(c.chatId, c);
+            commit({ visibleChats });
+          }
+          return reply.chats;
+        } catch (err) {
+          console.warn("[sync-v3] chats.byGroup failed, falling back to IDB", err);
+        }
+      }
       return idb.getChatsByGroup(groupKey, opts);
     },
   };
+}
+
+function requestChatPage(
+  ws: WsClient,
+  pending: Map<string, (frame: { chats: ChatIndex[]; hasMore: boolean }) => void>,
+  opts: { groupKey: string; afterLastSeenAt?: string; limit: number },
+): Promise<{ chats: ChatIndex[]; hasMore: boolean }> {
+  return new Promise((resolve, reject) => {
+    const reqId = `g-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    const timer = setTimeout(() => {
+      pending.delete(reqId);
+      reject(new Error("chats.byGroup timeout"));
+    }, 15_000);
+    pending.set(reqId, (frame) => {
+      clearTimeout(timer);
+      resolve(frame);
+    });
+    ws.send({ op: "chats.byGroup", reqId, ...opts });
+  });
 }
 
 function estimateBytes(item: RenderItem): number {
