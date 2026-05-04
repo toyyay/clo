@@ -1,5 +1,5 @@
 // Frontend v3 entry — тонкий App, всё состояние живёт в store.
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Sidebar } from "./sidebar";
 import { ChatView } from "./chat-view";
 import { useStore, useStoreState } from "./store-hook";
@@ -36,6 +36,34 @@ export function App() {
       <Sidebar />
       <ChatView />
       <Statusbar />
+      <BuildBadge />
+    </div>
+  );
+}
+
+function BuildBadge() {
+  const [sha, setSha] = useState<string>("");
+  useEffect(() => {
+    let cancelled = false;
+    void fetch("/api/health", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((j: { commit_sha?: string }) => {
+        if (cancelled) return;
+        if (typeof j.commit_sha === "string" && j.commit_sha.length > 0) {
+          setSha(j.commit_sha.slice(0, 7));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  if (!sha) return null;
+  // aria-hidden + pointer-events:none + user-select:none — невидим для DOM-кликов,
+  // не выделяется, не реагирует на курсор. Просто буквы поверх всего.
+  return (
+    <div className="build-badge" aria-hidden="true">
+      {sha}
     </div>
   );
 }

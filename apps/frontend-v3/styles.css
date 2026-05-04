@@ -166,6 +166,28 @@ body {
 .status-pill.status-connecting { background: #fff0c0; color: #6e4f00; }
 .status-pill.status-closed { background: #fde0dd; color: #6f2521; }
 
+/* build badge — sits at the very top center, tiny, ghost text,
+   completely non-interactive (no clicks, no selection, no hover even
+   if it overlaps something below). */
+.build-badge {
+  position: fixed;
+  top: 2px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9999;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: 0.05em;
+  color: #888;
+  background: transparent;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+  text-shadow: 0 0 2px rgba(255, 255, 255, 0.8);
+  opacity: 0.55;
+}
+
 /* code blocks */
 .code-block {
   background: #1e1e22;
