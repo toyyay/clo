@@ -653,6 +653,152 @@ create index if not exists idx_agent_normalized_events_file_generation_order
   on agent_normalized_events (source_file_id, source_generation, source_line_no asc nulls last, source_offset asc nulls last, id asc);
 `.trim(),
   },
+  {
+    id: "0013",
+    name: "sync_v3_render_items",
+    sql: `
+-- Pre-rendered chat items: один раз посчитано на сервере, клиент рисует as-is.
+-- project_key — text (а не FK на projects), потому что agent_source_files
+-- не нормализует project в FK, а хранит его в metadata.projectKey.
+create table if not exists agent_render_items (
+  source_event_id bigint not null references agent_normalized_events(id) on delete cascade,
+  part_index int not null,
+  source_file_id bigint not null references agent_source_files(id) on delete cascade,
+  source_generation int not null,
+  agent_id text not null references agents(id) on delete cascade,
+  provider text not null,
+  project_key text,
+  kind text not null check (kind in ('t', 'th', 'tu', 'tr')),
+  role text,
+  display boolean not null default true,
+  payload jsonb not null,
+  payload_bytes int not null,
+  tool_id text,
+  sync_revision bigint not null,
+  created_at timestamptz not null default now(),
+  primary key (source_event_id, part_index)
+);
+
+create index if not exists idx_render_items_chat_seq
+  on agent_render_items (source_file_id, sync_revision asc, source_event_id asc, part_index asc)
+  where display = true;
+
+create index if not exists idx_render_items_global_seq
+  on agent_render_items (sync_revision asc)
+  where display = true;
+
+create index if not exists idx_render_items_agent_provider_project
+  on agent_render_items (agent_id, provider, project_key, sync_revision asc)
+  where display = true;
+`.trim(),
+  },
+  {
+    id: "0014",
+    name: "sync_v3_subscriptions",
+    sql: `
+create table if not exists client_views (
+  client_id text not null,
+  view_id text not null,
+  spec jsonb not null,
+  spec_hash text not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (client_id, view_id)
+);
+
+create table if not exists client_view_cursors (
+  client_id text not null,
+  view_id text not null,
+  cursor bigint not null default 0,
+  pending_ack bigint,
+  updated_at timestamptz not null default now(),
+  primary key (client_id, view_id)
+);
+
+create table if not exists client_view_chats (
+  client_id text not null,
+  view_id text not null,
+  source_file_id bigint not null references agent_source_files(id) on delete cascade,
+  joined_at timestamptz not null default now(),
+  last_render_seq bigint,
+  pinned boolean not null default false,
+  primary key (client_id, view_id, source_file_id)
+);
+
+create index if not exists idx_client_view_chats_recent
+  on client_view_chats (client_id, view_id, last_render_seq desc nulls last);
+`.trim(),
+  },
+  {
+    id: "0015",
+    name: "sync_v3_group_aggregates",
+    sql: `
+-- Materialized view: дерево host -> provider -> project.
+-- project_key извлекается из agent_source_files.metadata->>'projectKey'.
+-- На проде масштаба ~1k строк, REFRESH (без CONCURRENTLY) — миллисекунды.
+create materialized view if not exists v3_group_aggregates as
+with src as (
+  select
+    f.id,
+    f.agent_id,
+    a.hostname,
+    f.provider,
+    coalesce(nullif(f.metadata->>'projectKey', ''), '(unknown)') as project_key,
+    coalesce(nullif(f.metadata->>'projectName', ''), nullif(f.metadata->>'projectKey', ''), '(unknown)') as project_label,
+    f.size_bytes,
+    f.last_seen_at
+  from agent_source_files f
+  join agents a on a.id = f.agent_id
+  where f.deleted_at is null and f.source_kind = 'conversation'
+)
+select
+  'h:' || agent_id                                       as group_key,
+  1                                                       as level,
+  null::text                                              as parent_key,
+  hostname                                                 as label,
+  agent_id                                                 as host_id,
+  null::text                                               as provider,
+  null::text                                               as project_key,
+  count(distinct id)::bigint                               as chat_count,
+  coalesce(sum(size_bytes), 0)::bigint                     as approx_bytes,
+  max(last_seen_at)                                        as last_seen_at
+from src
+group by agent_id, hostname
+union all
+select
+  'h:' || agent_id || '|p:' || provider                   as group_key,
+  2                                                       as level,
+  'h:' || agent_id                                         as parent_key,
+  provider                                                 as label,
+  agent_id                                                 as host_id,
+  provider                                                 as provider,
+  null::text                                               as project_key,
+  count(distinct id)::bigint                               as chat_count,
+  coalesce(sum(size_bytes), 0)::bigint                     as approx_bytes,
+  max(last_seen_at)                                        as last_seen_at
+from src
+group by agent_id, provider
+union all
+select
+  'h:' || agent_id || '|p:' || provider || '|pr:' || project_key as group_key,
+  3                                                                as level,
+  'h:' || agent_id || '|p:' || provider                            as parent_key,
+  project_label                                                    as label,
+  agent_id                                                         as host_id,
+  provider                                                         as provider,
+  project_key                                                      as project_key,
+  count(distinct id)::bigint                                       as chat_count,
+  coalesce(sum(size_bytes), 0)::bigint                             as approx_bytes,
+  max(last_seen_at)                                                as last_seen_at
+from src
+group by agent_id, provider, project_key, project_label;
+
+create unique index if not exists idx_v3_group_aggregates_key on v3_group_aggregates (group_key);
+create index if not exists idx_v3_group_aggregates_parent on v3_group_aggregates (parent_key, last_seen_at desc nulls last);
+create index if not exists idx_v3_group_aggregates_level on v3_group_aggregates (level);
+`.trim(),
+    transaction: false,
+  },
 ];
 
 export function migrationsEnabled(env = process.env) {
