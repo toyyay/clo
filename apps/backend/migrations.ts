@@ -736,7 +736,13 @@ create index if not exists idx_client_view_chats_recent
 -- Materialized view: дерево host -> provider -> project.
 -- project_key извлекается из agent_source_files.metadata->>'projectKey'.
 -- На проде масштаба ~1k строк, REFRESH (без CONCURRENTLY) — миллисекунды.
-create materialized view if not exists v3_group_aggregates as
+--
+-- DROP первым делом потому что миграция 0015 могла частично применить
+-- materialized view без unique index (transaction: false). Re-run должен быть
+-- идемпотентен.
+drop materialized view if exists v3_group_aggregates cascade;
+
+create materialized view v3_group_aggregates as
 with src as (
   select
     f.id,
@@ -755,7 +761,7 @@ select
   'h:' || agent_id                                       as group_key,
   1                                                       as level,
   null::text                                              as parent_key,
-  hostname                                                 as label,
+  min(hostname)                                            as label,
   agent_id                                                 as host_id,
   null::text                                               as provider,
   null::text                                               as project_key,
@@ -763,7 +769,7 @@ select
   coalesce(sum(size_bytes), 0)::bigint                     as approx_bytes,
   max(last_seen_at)                                        as last_seen_at
 from src
-group by agent_id, hostname
+group by agent_id
 union all
 select
   'h:' || agent_id || '|p:' || provider                   as group_key,
@@ -779,23 +785,26 @@ select
 from src
 group by agent_id, provider
 union all
+-- Level 3: GROUP BY (agent_id, provider, project_key) only — multiple distinct
+-- project_label values may exist for the same project_key (e.g. one source has
+-- projectName populated, another doesn't); take min() to pick a stable label.
 select
   'h:' || agent_id || '|p:' || provider || '|pr:' || project_key as group_key,
   3                                                                as level,
   'h:' || agent_id || '|p:' || provider                            as parent_key,
-  project_label                                                    as label,
-  agent_id                                                         as host_id,
-  provider                                                         as provider,
-  project_key                                                      as project_key,
-  count(distinct id)::bigint                                       as chat_count,
-  coalesce(sum(size_bytes), 0)::bigint                             as approx_bytes,
-  max(last_seen_at)                                                as last_seen_at
+  min(project_label)                                                as label,
+  agent_id                                                          as host_id,
+  provider                                                          as provider,
+  project_key                                                       as project_key,
+  count(distinct id)::bigint                                        as chat_count,
+  coalesce(sum(size_bytes), 0)::bigint                              as approx_bytes,
+  max(last_seen_at)                                                 as last_seen_at
 from src
-group by agent_id, provider, project_key, project_label;
+group by agent_id, provider, project_key;
 
-create unique index if not exists idx_v3_group_aggregates_key on v3_group_aggregates (group_key);
-create index if not exists idx_v3_group_aggregates_parent on v3_group_aggregates (parent_key, last_seen_at desc nulls last);
-create index if not exists idx_v3_group_aggregates_level on v3_group_aggregates (level);
+create unique index idx_v3_group_aggregates_key on v3_group_aggregates (group_key);
+create index idx_v3_group_aggregates_parent on v3_group_aggregates (parent_key, last_seen_at desc nulls last);
+create index idx_v3_group_aggregates_level on v3_group_aggregates (level);
 `.trim(),
     transaction: false,
   },
