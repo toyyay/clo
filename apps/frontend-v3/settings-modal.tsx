@@ -249,7 +249,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <div className="modal-section">
             <div className="modal-section-title">Other</div>
             <div className="modal-actions">
-              <a href="/v2">Open legacy /v2</a>
               <a href="/api/agent/download?arch=arm64">Mac Agent (arm64)</a>
               <a href="/api/auth/logout">Sign out</a>
             </div>

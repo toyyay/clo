@@ -164,7 +164,6 @@ function AppMenu({ onOpenSettings, onOpenAudio }: { onOpenSettings: () => void; 
             Settings
           </button>
           <a href="/api/agent/download?arch=arm64">Mac Agent</a>
-          <a href="/v2">Open legacy /v2</a>
           <a href="/api/auth/logout">Sign out</a>
         </div>
       )}

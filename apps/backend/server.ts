@@ -1,4 +1,3 @@
-import index from "../../index.html";
 import indexV3 from "../frontend-v3/index.html";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
@@ -230,15 +229,12 @@ void resumeQueuedTranscriptionJobs().catch((error) => {
 Bun.serve<WsData>({
   port,
   routes: withSecurityHeaders(withApiRequestLogging({
-    // Default UI is now sync-v3. The legacy client lives under /v2 explicitly
-    // and remains hash-routed so its existing chat URLs (#chat=...) keep
-    // working when prefixed with /v2.
+    // Single UI: the v4-protocol React client served from apps/frontend-v3.
+    // Legacy /v2 was removed; if anyone hits it they fall through to the
+    // catchall 404.
     "/": indexV3,
     "/v3": indexV3,
     "/v3/": indexV3,
-    "/v2": index,
-    "/v2/": index,
-    "/service-worker.js": async (req: Request) => serviceWorkerResponse(req),
     "/sw-v3.js": async (req: Request) => v3ServiceWorkerResponse(req),
     "/manifest.webmanifest": (req: Request) => webManifestResponse(req),
     "/app-icon.svg": () => appIconResponse(),
@@ -1340,19 +1336,6 @@ function requestOrigin(req: Request) {
   const proto = forwardedProto || url.protocol.replace(/:$/, "");
   const host = forwardedHost || req.headers.get("host") || url.host;
   return `${proto}://${host}`;
-}
-
-async function serviceWorkerResponse(req: Request) {
-  if (req.method !== "GET") return text("method not allowed", 405);
-  const source = await readFile(new URL("../frontend/service-worker.js", import.meta.url), "utf8");
-  const body = source.replaceAll("__CHATVIEW_BUILD_SHA__", gitSha);
-  return new Response(body, {
-    headers: {
-      "cache-control": "no-store, no-cache, must-revalidate",
-      "content-type": "application/javascript; charset=utf-8",
-      "service-worker-allowed": "/",
-    },
-  });
 }
 
 async function v3ServiceWorkerResponse(req: Request) {

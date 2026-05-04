@@ -133,9 +133,6 @@ export type ChatIndex = {
 export type ClientFrame =
   | { op: "hello"; v: number; clientId: string; deviceMemoryGb?: number }
   | { op: "query"; reqId: string; sql: string; params?: unknown[] }
-  /** Deprecated alias of `query` — kept so the DevTools escape hatch keeps
-   *  working without rebuilding. Both ops have identical semantics. */
-  | { op: "query.run"; reqId: string; sql: string; params?: unknown[] }
   | { op: "ping" };
 
 export type ServerFrame =
@@ -144,14 +141,10 @@ export type ServerFrame =
    *  affected source_file_ids when the debounce window stays small enough;
    *  if it grows past ~64 ids server omits it and client re-pulls broadly. */
   | { op: "tick"; maxRev: number; files?: number[] }
-  /** Reply to `query` / `query.run`. `maxRev` is the largest sync_revision
-   *  visible to the read transaction at the time the rows were collected;
-   *  clients use it to decide if they're already caught up to the latest
-   *  tick (race-safe re-pull tracker). */
+  /** Reply to `query`. `maxRev` is the largest sync_revision visible to the
+   *  read transaction at the time the rows were collected; clients use it to
+   *  decide if they're already caught up to the latest tick (race-safe
+   *  re-pull tracker). */
   | { op: "query.ok"; reqId: string; rows: Record<string, unknown>[]; rowCount: number; durationMs: number; truncated: boolean; maxRev: number }
   | { op: "query.err"; reqId: string; error: string }
-  /** Deprecated aliases of query.ok / query.err — emitted for `query.run`
-   *  callers so existing DevTools snippets keep parsing. */
-  | { op: "query.run.ok"; reqId: string; rows: Record<string, unknown>[]; rowCount: number; durationMs: number; truncated: boolean; maxRev: number }
-  | { op: "query.run.err"; reqId: string; error: string }
   | { op: "pong" };

@@ -160,41 +160,25 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
           return;
         }
 
-        case "query":
-        case "query.run": {
-          // `query` and `query.run` carry identical semantics; the only
-          // difference is the reply op name (`query.ok` vs `query.run.ok`)
-          // so existing DevTools snippets that branch on op keep working.
+        case "query": {
           const t0 = Date.now();
-          const useV4Reply = frame.op === "query";
           try {
             const result = await ctx.repo.runRawQueryWithMaxRev({
               sql: frame.sql,
               params: frame.params,
             });
-            const okFrame: ServerFrame = useV4Reply
-              ? {
-                  op: "query.ok",
-                  reqId: frame.reqId,
-                  rows: result.rows,
-                  rowCount: result.rows.length,
-                  durationMs: result.durationMs,
-                  truncated: result.truncated,
-                  maxRev: result.maxRev,
-                }
-              : {
-                  op: "query.run.ok",
-                  reqId: frame.reqId,
-                  rows: result.rows,
-                  rowCount: result.rows.length,
-                  durationMs: result.durationMs,
-                  truncated: result.truncated,
-                  maxRev: result.maxRev,
-                };
-            const bytes = send(ws, okFrame);
+            const bytes = send(ws, {
+              op: "query.ok",
+              reqId: frame.reqId,
+              rows: result.rows,
+              rowCount: result.rows.length,
+              durationMs: result.durationMs,
+              truncated: result.truncated,
+              maxRev: result.maxRev,
+            });
             telemetry.log({
               clientId: ws.data.clientId ?? null,
-              event: frame.op,
+              event: "query",
               level: "info",
               durationMs: Date.now() - t0,
               bytes,
@@ -207,13 +191,10 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
           } catch (err) {
             const publicMsg = publicQueryErr(err);
             const fullMsg = errMsg(err);
-            const errFrame: ServerFrame = useV4Reply
-              ? { op: "query.err", reqId: frame.reqId, error: publicMsg }
-              : { op: "query.run.err", reqId: frame.reqId, error: publicMsg };
-            send(ws, errFrame);
+            send(ws, { op: "query.err", reqId: frame.reqId, error: publicMsg });
             telemetry.log({
               clientId: ws.data.clientId ?? null,
-              event: `${frame.op}.failed`,
+              event: "query.failed",
               level: "warn",
               durationMs: Date.now() - t0,
               // Telemetry retains the full message for debugging; the wire

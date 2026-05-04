@@ -4,6 +4,8 @@ dist/
 .DS_Store
 data/
 .env
+.env.local
+.env.*.local
 *.dump
 *.sql.gz
 .claude/

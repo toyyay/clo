@@ -99,27 +99,6 @@ describe("ws-server v4", () => {
     }
   });
 
-  test("query.run alias returns query.run.ok with maxRev (kept for DevTools)", async () => {
-    const repo = makeFakeRepo();
-    repo.setMaxRev(7);
-    repo.setQueryRows([{ y: "ok" }]);
-    const handlers = makeHandlers({ repo });
-    const { ws, sent } = makeFakeSocket();
-    handlers.onOpen(ws);
-    await handlers.onMessage(
-      ws,
-      JSON.stringify({ op: "query.run", reqId: "r1", sql: "select 'ok' as y" }),
-    );
-
-    const ok = sent.find((f) => f.op === "query.run.ok");
-    expect(ok).toBeDefined();
-    if (ok && ok.op === "query.run.ok") {
-      expect(ok.reqId).toBe("r1");
-      expect(ok.rows[0]?.y).toBe("ok");
-      expect(ok.maxRev).toBe(7);
-    }
-  });
-
   test("query failure surfaces as query.err with reason", async () => {
     const repo = makeFakeRepo();
     repo.setQueryShouldThrow(new Error("syntax error"));

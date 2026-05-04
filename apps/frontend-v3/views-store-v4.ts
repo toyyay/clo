@@ -744,10 +744,6 @@ export function createStore(): Store {
         scheduleRetry(pq);
         return;
       }
-      // query.run.* are v3 aliases the server still emits for DevTools snippets
-      // that haven't moved to `query` yet. Treat them as their v4 twins.
-      case "query.run.ok":
-      case "query.run.err":
       case "pong":
         return;
     }
