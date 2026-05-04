@@ -7,8 +7,8 @@
 import type {
   ChatIndex,
   GroupNode,
-  Predicate,
   RenderItem,
+  SeqRenderItem,
   ViewSpec,
 } from "../../../packages/sync-v3/contracts";
 import { resolvePredicate, v3SessionIdFromSourceFileId, parseV3SessionId } from "./view-resolver";
@@ -24,8 +24,8 @@ export type SnapshotResult = {
   groups: GroupNode[];
   /** chat index for chats inside this view, sorted by lastSeenAt desc */
   chats: ChatIndex[];
-  /** per-chat tail of RenderItems (last `tailItems` per chat) */
-  tails: Record<string, RenderItem[]>;
+  /** per-chat tail of items with their real sync_revision-derived seq */
+  tails: Record<string, SeqRenderItem[]>;
   totals: { items: number; bytesRemaining: number };
 };
 
@@ -39,7 +39,13 @@ export type DeltaResult = {
 export type Repo = {
   buildSnapshot(view: ViewSpec): Promise<SnapshotResult>;
   fetchDelta(view: ViewSpec, sinceCursor: number, limitBytes?: number): Promise<DeltaResult>;
-  fetchHistoryRange(opts: HistoryRangeOpts): Promise<{ items: RenderItem[]; hasOlder: boolean; hasNewer: boolean }>;
+  fetchHistoryRange(opts: HistoryRangeOpts): Promise<{ items: SeqRenderItem[]; hasOlder: boolean; hasNewer: boolean }>;
+  /** Find which views (by client_id+view_id) include a given chat right now. */
+  resolveMatchingViews(sourceFileId: number): Promise<ResolvedViewMatch[]>;
+  /** Fetch the freshest tail items for a chat (used by chat.added handler). */
+  fetchChatTailById(sourceFileId: number, limit: number): Promise<SeqRenderItem[]>;
+  /** Build a single ChatIndex row for a chat (used by chat.added handler). */
+  fetchChatIndex(sourceFileId: number): Promise<ChatIndex | null>;
   bytesRemainingForView(view: ViewSpec, cursor: number): Promise<number>;
   refreshGroupAggregates(): Promise<void>;
 };
@@ -53,6 +59,14 @@ export type HistoryRangeOpts = {
   limit: number;
 };
 
+export type ResolvedViewMatch = {
+  clientId: string;
+  viewId: string;
+  /** true if this chat is already a member of this view (pre-existing); */
+  /** false means the chat newly matches and triggers chat.added emission. */
+  alreadyMember: boolean;
+};
+
 export function makeRepo(sql: any): Repo {
   return {
     buildSnapshot: (view) => buildSnapshot(sql, view),
@@ -60,6 +74,9 @@ export function makeRepo(sql: any): Repo {
     fetchHistoryRange: (opts) => fetchHistoryRange(sql, opts),
     bytesRemainingForView: (view, cursor) => bytesRemainingForView(sql, view, cursor),
     refreshGroupAggregates: () => refreshGroupAggregates(sql),
+    resolveMatchingViews: (sourceFileId) => resolveMatchingViews(sql, sourceFileId),
+    fetchChatTailById: (sourceFileId, limit) => fetchChatTail(sql, sourceFileId, limit),
+    fetchChatIndex: (sourceFileId) => fetchChatIndex(sql, sourceFileId),
   };
 }
 
@@ -111,7 +128,7 @@ async function buildSnapshot(sql: any, view: ViewSpec): Promise<SnapshotResult> 
   const cursor = chats.reduce((max: number, r: any) => Math.max(max, Number(r.max_seq ?? 0)), 0);
 
   // 2. Per-chat tail of RenderItems (если tailItems > 0)
-  const tails: Record<string, RenderItem[]> = {};
+  const tails: Record<string, SeqRenderItem[]> = {};
   if (tailItems > 0) {
     for (const chat of chatIndex) {
       tails[chat.chatId] = await fetchChatTail(sql, parseV3SessionId(chat.chatId)!, tailItems);
@@ -134,9 +151,9 @@ async function buildSnapshot(sql: any, view: ViewSpec): Promise<SnapshotResult> 
   };
 }
 
-async function fetchChatTail(sql: any, sourceFileId: number, limit: number): Promise<RenderItem[]> {
+async function fetchChatTail(sql: any, sourceFileId: number, limit: number): Promise<SeqRenderItem[]> {
   const rows = await sql`
-    select payload
+    select payload, sync_revision
     from agent_render_items
     where source_file_id = ${sourceFileId}
       and display = true
@@ -144,7 +161,86 @@ async function fetchChatTail(sql: any, sourceFileId: number, limit: number): Pro
     limit ${Math.min(limit, MAX_TAIL_ITEMS)}
   `;
   // Возвращаем в хронологическом порядке (старое → новое)
-  return rows.map((r: any) => r.payload as RenderItem).reverse();
+  return rows
+    .map((r: any) => ({ item: r.payload as RenderItem, seq: Number(r.sync_revision) }))
+    .reverse();
+}
+
+async function fetchChatIndex(sql: any, sourceFileId: number): Promise<ChatIndex | null> {
+  const rows = await sql`
+    select
+      f.id,
+      f.agent_id,
+      f.provider,
+      coalesce(nullif(f.metadata->>'projectKey', ''), '(unknown)') as project_key,
+      coalesce(nullif(f.metadata->>'title', ''), nullif(f.metadata->>'projectName', ''), nullif(f.metadata->>'projectKey', ''), '(no title)') as title,
+      f.last_seen_at,
+      f.size_bytes,
+      coalesce((select count(*) from agent_render_items r where r.source_file_id = f.id and r.display = true), 0) as item_count
+    from agent_source_files f
+    where f.id = ${sourceFileId} and f.deleted_at is null
+  `;
+  if (!rows.length) return null;
+  const row = rows[0];
+  return {
+    chatId: v3SessionIdFromSourceFileId(row.id),
+    groupKey: groupKeyFor(row.agent_id, row.provider, row.project_key),
+    hostId: row.agent_id,
+    provider: row.provider,
+    projectKey: row.project_key,
+    title: row.title,
+    lastSeenAt: toISO(row.last_seen_at),
+    approxBytes: Number(row.size_bytes ?? 0),
+    itemCount: Number(row.item_count ?? 0),
+  };
+}
+
+async function resolveMatchingViews(sql: any, sourceFileId: number): Promise<ResolvedViewMatch[]> {
+  // Получаем все client_views и применяем predicate к этому конкретному чату.
+  // Predicate eval делаем в SQL через resolvePredicate + EXISTS.
+  // На малом числе подписок (5 клиентов × ~5 view) это быстро.
+  const views = await sql`
+    select v.client_id, v.view_id, v.spec
+    from client_views v
+  `;
+  const result: ResolvedViewMatch[] = [];
+  for (const row of views) {
+    const spec = row.spec as ViewSpec;
+    if ((spec.excludes ?? []).includes(v3SessionIdFromSourceFileId(sourceFileId))) continue;
+    const includes = (spec.includes ?? []).includes(v3SessionIdFromSourceFileId(sourceFileId));
+    let matches = includes;
+    if (!matches) {
+      const resolved = resolvePredicate(spec.predicate, 1);
+      const params = [...resolved.params, sourceFileId];
+      const sourceParamIdx = resolved.params.length + 1;
+      const matchRows = await sql.unsafe(
+        `select 1 from agent_render_items r
+         join agent_source_files f on f.id = r.source_file_id
+         where r.source_file_id = $${sourceParamIdx}
+           and r.display = true
+           and (${resolved.sql})
+         limit 1`,
+        params,
+      );
+      matches = matchRows.length > 0;
+    }
+    if (!matches) continue;
+
+    // Membership: смотрим client_view_chats
+    const memberRows = await sql`
+      select 1 from client_view_chats
+      where client_id = ${row.client_id}
+        and view_id = ${row.view_id}
+        and source_file_id = ${sourceFileId}
+      limit 1
+    `;
+    result.push({
+      clientId: String(row.client_id),
+      viewId: String(row.view_id),
+      alreadyMember: memberRows.length > 0,
+    });
+  }
+  return result;
 }
 
 async function fetchDelta(sql: any, view: ViewSpec, sinceCursor: number, limitBytes: number): Promise<DeltaResult> {
@@ -236,7 +332,9 @@ async function fetchHistoryRange(sql: any, opts: HistoryRangeOpts) {
       order by sync_revision desc
       limit ${limit}
     `;
-    const items = rows.map((r: any) => r.payload as RenderItem).reverse();
+    const items: SeqRenderItem[] = rows
+      .map((r: any) => ({ item: r.payload as RenderItem, seq: Number(r.sync_revision) }))
+      .reverse();
     const oldestSeq = rows.length ? Number(rows[rows.length - 1].sync_revision) : opts.before;
     const olderRows = await sql`
       select 1 from agent_render_items
@@ -255,7 +353,10 @@ async function fetchHistoryRange(sql: any, opts: HistoryRangeOpts) {
       order by sync_revision asc
       limit ${limit}
     `;
-    const items = rows.map((r: any) => r.payload as RenderItem);
+    const items: SeqRenderItem[] = rows.map((r: any) => ({
+      item: r.payload as RenderItem,
+      seq: Number(r.sync_revision),
+    }));
     const newestSeq = rows.length ? Number(rows[rows.length - 1].sync_revision) : opts.after;
     const newerRows = await sql`
       select 1 from agent_render_items

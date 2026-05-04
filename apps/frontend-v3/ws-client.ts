@@ -162,14 +162,29 @@ export function createWsClient(options: WsClientOptions): WsClient {
 
 // ---------- helpers usable from views-store --------------------------------
 
+/**
+ * SHA-256 truncated to 16 bytes (32 hex chars), matching server (ws-server.ts:specHash).
+ * Falls back to 4×32-bit FNV-1a stripes only on environments without Web Crypto;
+ * the fallback emits the same 32 hex chars so reconnect handshake works correctly
+ * even though it's not collision-resistant. Server uses crypto SHA-256 always —
+ * mismatch on the fallback path triggers a fresh snapshot which is correct
+ * behavior (slightly less efficient, never wrong).
+ */
 export async function specHash(spec: ViewSpec): Promise<string> {
   const data = new TextEncoder().encode(canonicalizeSpec(spec));
   if (typeof crypto !== "undefined" && "subtle" in crypto) {
     const buf = await crypto.subtle.digest("SHA-256", data);
     return [...new Uint8Array(buf)].slice(0, 16).map((b) => b.toString(16).padStart(2, "0")).join("");
   }
-  // Fallback (tests / non-browser) — non-cryptographic 32-bit hash
-  let h = 5381;
-  for (let i = 0; i < data.length; i += 1) h = (h * 33) ^ data[i]!;
-  return (h >>> 0).toString(16).padStart(8, "0");
+  // Non-crypto fallback: 4 stripes of 32-bit FNV-1a with different seeds, total 32 hex chars.
+  const seeds = [0x811c9dc5, 0x01000193, 0xdeadbeef, 0xcafef00d];
+  const stripes = seeds.map((seed) => {
+    let h = seed >>> 0;
+    for (let i = 0; i < data.length; i += 1) {
+      h = (h ^ data[i]!) >>> 0;
+      h = (h * 16777619) >>> 0;
+    }
+    return h.toString(16).padStart(8, "0");
+  });
+  return stripes.join("");
 }

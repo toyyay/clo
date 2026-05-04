@@ -64,8 +64,11 @@ export type WsHandlers = {
   onMessage(ws: V3WebSocket, raw: string | Buffer | Uint8Array): Promise<void>;
   onClose(ws: V3WebSocket): void;
   /** Called by ingest hook (or a polling tick) when new events arrive that may */
-  /** match views on connected sockets.                                          */
+  /** match views on connected sockets. Triggers a drain for every view.        */
   notifyNewEvents(maxRevision: number): void;
+  /** Called when a specific chat received new events. If any followNew view    */
+  /** matches and the chat isn't yet a member, emits chat.added.                */
+  notifyAffectedChat(sourceFileId: number): void;
 };
 
 export type WsContext = {
@@ -75,6 +78,10 @@ export type WsContext = {
   loadViews?(clientId: string): Promise<{ view: ViewSpec; cursor: number; hash: string }[]>;
   saveCursor?(clientId: string, viewId: string, cursor: number): Promise<void>;
   deleteView?(clientId: string, viewId: string): Promise<void>;
+  /** Mark chat as member of a view (for followNew to know what's new). */
+  recordViewChat?(clientId: string, viewId: string, sourceFileId: number, seq: number): Promise<void>;
+  /** Remove chat membership when excluded. */
+  removeViewChat?(clientId: string, viewId: string, sourceFileId: number): Promise<void>;
   /** logger — optional, defaults to console.warn for errors */
   log?: (level: "debug" | "info" | "warn" | "error", event: string, ctx?: unknown) => void;
 };
@@ -107,6 +114,16 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
         tails: snap.tails,
         totals: snap.totals,
       });
+
+      // Record membership so followNew can detect newcomers later.
+      if (ctx.recordViewChat && ws.data.clientId) {
+        for (const chat of snap.chats) {
+          const sourceFileId = parseSourceFileId(chat.chatId);
+          if (sourceFileId === null) continue;
+          const lastSeq = (snap.tails[chat.chatId] ?? []).at(-1)?.seq ?? 0;
+          ctx.recordViewChat(ws.data.clientId, view.id, sourceFileId, lastSeq).catch(() => {});
+        }
+      }
     } catch (err) {
       log("error", "snapshot.failed", err);
       send(ws, { op: "view.error", viewId: view.id, reason: errMsg(err) });
@@ -190,12 +207,61 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
     },
 
     notifyNewEvents(_maxRevision: number) {
+      // Опционально: вызывающий может передавать affectedSourceFileIds через
+      // notifyAffectedChat — это даёт следящим подпискам шанс прислать chat.added.
       for (const ws of sockets) {
         if (ws.data.closed) continue;
         for (const viewId of ws.data.views.keys()) {
           scheduleDrain(ws, viewId);
         }
       }
+    },
+    notifyAffectedChat(sourceFileId: number) {
+      // Это вызывается ingest-хуком когда есть конкретный source_file_id с новыми
+      // events. Для каждого открытого сокета: если есть view с followNew=true,
+      // которому этот чат подходит и пока не входит в подписку — шлём chat.added.
+      void (async () => {
+        try {
+          const matches = await ctx.repo.resolveMatchingViews(sourceFileId);
+          for (const ws of sockets) {
+            if (ws.data.closed || !ws.data.clientId) continue;
+            for (const view of ws.data.views.values()) {
+              if (!view.followNew) {
+                scheduleDrain(ws, view.id);
+                continue;
+              }
+              const match = matches.find(
+                (m) => m.clientId === ws.data.clientId && m.viewId === view.id,
+              );
+              if (!match) {
+                scheduleDrain(ws, view.id);
+                continue;
+              }
+              if (match.alreadyMember) {
+                scheduleDrain(ws, view.id);
+                continue;
+              }
+              // New chat enters the view → send chat.added
+              try {
+                const [chat, tail] = await Promise.all([
+                  ctx.repo.fetchChatIndex(sourceFileId),
+                  ctx.repo.fetchChatTailById(sourceFileId, view.history?.tailItems ?? 200),
+                ]);
+                if (!chat) continue;
+                const lastSeq = tail.length ? tail[tail.length - 1]!.seq : 0;
+                if (ctx.recordViewChat) {
+                  await ctx.recordViewChat(ws.data.clientId, view.id, sourceFileId, lastSeq).catch(() => {});
+                }
+                send(ws, { op: "chat.added", viewId: view.id, chat, tail });
+              } catch (err) {
+                log("warn", "chat.added.failed", err);
+              }
+            }
+          }
+        } catch (err) {
+          log("warn", "notifyAffectedChat.failed", err);
+        }
+      })();
     },
   };
 
@@ -297,6 +363,11 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
         if (ctx.persistView && ws.data.clientId) {
           ctx.persistView(ws.data.clientId, next, specHash(next)).catch(() => {});
         }
+        // Drop membership so followNew won't think the chat is still inside.
+        const sourceFileId = parseSourceFileId(frame.chatId);
+        if (ctx.removeViewChat && ws.data.clientId && sourceFileId !== null) {
+          ctx.removeViewChat(ws.data.clientId, view.id, sourceFileId).catch(() => {});
+        }
         send(ws, { op: "chat.removed", viewId: view.id, chatId: frame.chatId, reason: "excluded", evictHint: true });
         return;
       }
@@ -347,6 +418,14 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+function parseSourceFileId(chatId: string): number | null {
+  if (chatId.startsWith("v3:")) {
+    const n = Number(chatId.slice(3));
+    return Number.isFinite(n) ? n : null;
+  }
+  return /^\d+$/.test(chatId) ? Number(chatId) : null;
+}
+
 // ---------- persistence helpers (Postgres) --------------------------------
 
 export function makePostgresContext(sql: any, repo: Repo): WsContext {
@@ -388,6 +467,21 @@ export function makePostgresContext(sql: any, repo: Repo): WsContext {
     async deleteView(clientId, viewId) {
       await sql`delete from client_views where client_id = ${clientId} and view_id = ${viewId}`;
       await sql`delete from client_view_cursors where client_id = ${clientId} and view_id = ${viewId}`;
+      await sql`delete from client_view_chats where client_id = ${clientId} and view_id = ${viewId}`;
+    },
+    async recordViewChat(clientId, viewId, sourceFileId, seq) {
+      await sql`
+        insert into client_view_chats (client_id, view_id, source_file_id, last_render_seq)
+        values (${clientId}, ${viewId}, ${sourceFileId}, ${seq})
+        on conflict (client_id, view_id, source_file_id) do update set
+          last_render_seq = greatest(client_view_chats.last_render_seq, excluded.last_render_seq)
+      `;
+    },
+    async removeViewChat(clientId, viewId, sourceFileId) {
+      await sql`
+        delete from client_view_chats
+        where client_id = ${clientId} and view_id = ${viewId} and source_file_id = ${sourceFileId}
+      `;
     },
   };
 }

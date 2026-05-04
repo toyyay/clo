@@ -18,6 +18,7 @@ import type {
   ClientViewState,
   GroupNode,
   RenderItem,
+  SeqRenderItem,
   ServerFrame,
   ViewSpec,
 } from "../../packages/sync-v3/contracts";
@@ -81,8 +82,8 @@ export function createStore(): Store {
   };
 
   let ws: WsClient | null = null;
-  /** map reqId → (resolve, reject) for pending history.range */
-  const historyRequests = new Map<string, (frame: { items: RenderItem[]; hasOlder: boolean; hasNewer: boolean }) => void>();
+  /** map reqId → resolver for pending history.range */
+  const historyRequests = new Map<string, (frame: { items: SeqRenderItem[]; hasOlder: boolean; hasNewer: boolean }) => void>();
 
   function commit(next: Partial<StoreState>) {
     state = { ...state, ...next };
@@ -96,23 +97,22 @@ export function createStore(): Store {
   }
 
   async function applySnapshot(frame: Extract<ServerFrame, { op: "view.snapshot" }>) {
-    // Persist groups, chats, tails into IDB
+    // Persist groups, chats, tails into IDB. Server gives us real sync_revision
+    // values as seq, so older items returned via history.range later land at
+    // the same key and overlap correctly.
     await idb.bulkPutGroups(frame.groups);
     await idb.bulkPutChatIndex(frame.chats);
     const itemRows: idb.RenderItemRow[] = [];
-    for (const [chatId, items] of Object.entries(frame.tails)) {
-      // Use synthetic seq sequences if server didn't provide per-item; we keep
-      // monotonic (cursor - n + i) as a stable fallback for IDB ordering.
-      const baseSeq = Math.max(1, frame.cursor - items.length + 1);
-      items.forEach((item, i) => {
+    for (const [chatId, tail] of Object.entries(frame.tails)) {
+      for (const entry of tail) {
         itemRows.push({
           chatId,
-          seq: baseSeq + i,
-          itemKey: idb.itemKey(item),
-          item,
-          bytes: estimateBytes(item),
+          seq: entry.seq,
+          itemKey: idb.itemKey(entry.item),
+          item: entry.item,
+          bytes: estimateBytes(entry.item),
         });
-      });
+      }
     }
     await idb.bulkPutRenderItems(itemRows);
 
@@ -176,12 +176,12 @@ export function createStore(): Store {
 
   async function applyChatAdded(frame: Extract<ServerFrame, { op: "chat.added" }>) {
     await idb.bulkPutChatIndex([frame.chat]);
-    const itemRows: idb.RenderItemRow[] = frame.tail.map((item, i) => ({
+    const itemRows: idb.RenderItemRow[] = frame.tail.map((entry) => ({
       chatId: frame.chat.chatId,
-      seq: i + 1,
-      itemKey: idb.itemKey(item),
-      item,
-      bytes: estimateBytes(item),
+      seq: entry.seq,
+      itemKey: idb.itemKey(entry.item),
+      item: entry.item,
+      bytes: estimateBytes(entry.item),
     }));
     await idb.bulkPutRenderItems(itemRows);
     const visibleChats = new Map(state.visibleChats);
@@ -350,27 +350,25 @@ export function createStore(): Store {
       let firstSeq = fromIdb[0]?.seq ?? w.firstSeq;
       let hasOlder = fromIdb.length === limit;
 
-      // If IDB ran out, ask server.
+      // If IDB ran out, ask server. Server returns SeqRenderItem with real seqs.
       if (fromIdb.length < limit && ws && state.status.kind === "open") {
         const remaining = limit - fromIdb.length;
-        const serverItems = await requestHistory(ws, historyRequests, {
+        const serverReply = await requestHistory(ws, historyRequests, {
           chatId: w.chatId,
-          before: w.firstSeq,
+          before: firstSeq, // ask before whatever we already have
           limit: remaining,
         });
-        // Persist server items into IDB so future loadOlder is instant.
-        const baseSeq = Math.max(1, firstSeq - serverItems.items.length);
-        const itemRows: idb.RenderItemRow[] = serverItems.items.map((item, i) => ({
+        const itemRows: idb.RenderItemRow[] = serverReply.items.map((entry) => ({
           chatId: w.chatId,
-          seq: baseSeq + i,
-          itemKey: idb.itemKey(item),
-          item,
-          bytes: estimateBytes(item),
+          seq: entry.seq,
+          itemKey: idb.itemKey(entry.item),
+          item: entry.item,
+          bytes: estimateBytes(entry.item),
         }));
         await idb.bulkPutRenderItems(itemRows);
-        items = [...serverItems.items, ...items];
-        firstSeq = baseSeq;
-        hasOlder = serverItems.hasOlder;
+        items = [...serverReply.items.map((e) => e.item), ...items];
+        firstSeq = serverReply.items[0]?.seq ?? firstSeq;
+        hasOlder = serverReply.hasOlder;
       }
 
       commit({
@@ -403,9 +401,9 @@ function estimateBytes(item: RenderItem): number {
 
 function requestHistory(
   ws: WsClient,
-  pending: Map<string, (frame: { items: RenderItem[]; hasOlder: boolean; hasNewer: boolean }) => void>,
+  pending: Map<string, (frame: { items: SeqRenderItem[]; hasOlder: boolean; hasNewer: boolean }) => void>,
   opts: { chatId: string; before?: number; after?: number; limit: number },
-): Promise<{ items: RenderItem[]; hasOlder: boolean; hasNewer: boolean }> {
+): Promise<{ items: SeqRenderItem[]; hasOlder: boolean; hasNewer: boolean }> {
   return new Promise((resolve, reject) => {
     const reqId = `h-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     const timer = setTimeout(() => {

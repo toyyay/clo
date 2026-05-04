@@ -1,17 +1,28 @@
 import { describe, expect, test } from "bun:test";
 import { makeHandlers, newV3SocketData, specHash, type V3WebSocket } from "./ws-server";
-import type { ChatIndex, GroupNode, RenderItem, ServerFrame, ViewSpec } from "../../../packages/sync-v3/contracts";
-import type { DeltaResult, Repo, SnapshotResult } from "./repo";
+import type { ChatIndex, GroupNode, RenderItem, SeqRenderItem, ServerFrame, ViewSpec } from "../../../packages/sync-v3/contracts";
+import type { DeltaResult, Repo, ResolvedViewMatch, SnapshotResult } from "./repo";
 
 // In-memory fake repo for integration tests.
-function makeFakeRepo(): Repo & { addEvent(chatId: string, item: RenderItem, seq: number): void } {
+function makeFakeRepo(): Repo & {
+  addEvent(chatId: string, item: RenderItem, seq: number): void;
+  setChatMembership(viewId: string, chatId: string, isMember: boolean): void;
+} {
   const items: { chatId: string; item: RenderItem; seq: number; bytes: number }[] = [];
   const chatTitles = new Map<string, string>();
+  // (clientId omitted in fake) — track by viewId only
+  const memberships = new Map<string, Set<string>>(); // viewId -> chatIds
 
   return {
     addEvent(chatId, item, seq) {
       items.push({ chatId, item, seq, bytes: 200 });
       if (!chatTitles.has(chatId)) chatTitles.set(chatId, `chat ${chatId}`);
+    },
+    setChatMembership(viewId, chatId, isMember) {
+      const s = memberships.get(viewId) ?? new Set();
+      if (isMember) s.add(chatId);
+      else s.delete(chatId);
+      memberships.set(viewId, s);
     },
     async buildSnapshot(view: ViewSpec): Promise<SnapshotResult> {
       const matched = items.filter((it) => matchesViewExcludes(view, it.chatId));
@@ -28,10 +39,13 @@ function makeFakeRepo(): Repo & { addEvent(chatId: string, item: RenderItem, seq
         approxBytes: 1000,
         itemCount: matched.filter((it) => it.chatId === cid).length,
       }));
-      const tails: Record<string, RenderItem[]> = {};
+      const tails: Record<string, SeqRenderItem[]> = {};
       const tailLimit = view.history?.tailItems ?? 200;
       for (const cid of chatIds) {
-        tails[cid] = matched.filter((it) => it.chatId === cid).slice(-tailLimit).map((it) => it.item);
+        tails[cid] = matched
+          .filter((it) => it.chatId === cid)
+          .slice(-tailLimit)
+          .map((it) => ({ item: it.item, seq: it.seq }));
       }
       const groups: GroupNode[] = [
         { key: "h:test", level: 1, parentKey: null, label: "test", chatCount: chatIds.length, approxBytes: 1000, lastSeenAt: "2026-05-04T00:00:00Z", topChatIds: [] },
@@ -46,13 +60,45 @@ function makeFakeRepo(): Repo & { addEvent(chatId: string, item: RenderItem, seq
       return { cursor, items: out, bytesRemaining: 0, moreReady: false };
     },
     async fetchHistoryRange(opts) {
-      const chatItems = items.filter((it) => it.chatId === opts.chatId).map((it) => it.item);
+      const chatItems = items
+        .filter((it) => it.chatId === opts.chatId)
+        .map((it): SeqRenderItem => ({ item: it.item, seq: it.seq }));
       return { items: chatItems.slice(-opts.limit), hasOlder: chatItems.length > opts.limit, hasNewer: false };
     },
     async bytesRemainingForView() {
       return 0;
     },
     async refreshGroupAggregates() {},
+    async resolveMatchingViews(sourceFileId): Promise<ResolvedViewMatch[]> {
+      const chatId = `v3:${sourceFileId}`;
+      const out: ResolvedViewMatch[] = [];
+      for (const [viewId, set] of memberships) {
+        out.push({ clientId: "c-test", viewId, alreadyMember: set.has(chatId) });
+      }
+      return out;
+    },
+    async fetchChatTailById(sourceFileId, limit): Promise<SeqRenderItem[]> {
+      const chatId = `v3:${sourceFileId}`;
+      return items
+        .filter((it) => it.chatId === chatId)
+        .slice(-limit)
+        .map((it) => ({ item: it.item, seq: it.seq }));
+    },
+    async fetchChatIndex(sourceFileId): Promise<ChatIndex | null> {
+      const chatId = `v3:${sourceFileId}`;
+      if (!items.some((it) => it.chatId === chatId)) return null;
+      return {
+        chatId,
+        groupKey: "h:test|p:claude|pr:default",
+        hostId: "test",
+        provider: "claude",
+        projectKey: "default",
+        title: chatTitles.get(chatId) ?? chatId,
+        lastSeenAt: "2026-05-04T00:00:00Z",
+        approxBytes: 1000,
+        itemCount: items.filter((it) => it.chatId === chatId).length,
+      };
+    },
   };
 }
 
@@ -111,7 +157,57 @@ describe("ws-server", () => {
       expect(snapshot.viewId).toBe("active");
       expect(snapshot.chats.length).toBe(1);
       expect(snapshot.tails["v3:1"]).toBeDefined();
+      // SeqRenderItem shape: each tail entry has .item and .seq
+      const tailEntry = snapshot.tails["v3:1"]?.[0];
+      expect(tailEntry?.seq).toBe(1);
+      expect(tailEntry?.item.k).toBe("t");
     }
+  });
+
+  test("followNew: chat.added emitted when new chat matches and not yet a member", async () => {
+    const repo = makeFakeRepo();
+    const handlers = makeHandlers({ repo });
+    const { ws, sent } = makeFakeSocket();
+    handlers.onOpen(ws);
+    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 1, clientId: "c-test", views: [] }));
+    const followView: ViewSpec = { ...TEST_VIEW, id: "follow", followNew: true };
+    await handlers.onMessage(ws, JSON.stringify({ op: "view.upsert", view: followView }));
+    sent.length = 0;
+
+    // Simulate: new chat appears (sourceFileId=42), not yet in view
+    repo.addEvent("v3:42", TEXT_ITEM, 5);
+    repo.setChatMembership("follow", "v3:42", false);
+    handlers.notifyAffectedChat(42);
+
+    // Wait for async dispatch
+    await new Promise((r) => setTimeout(r, 5));
+
+    const added = sent.find((f) => f.op === "chat.added");
+    expect(added).toBeDefined();
+    if (added && added.op === "chat.added") {
+      expect(added.viewId).toBe("follow");
+      expect(added.chat.chatId).toBe("v3:42");
+      expect(added.tail.length).toBe(1);
+      expect(added.tail[0]!.seq).toBe(5);
+    }
+  });
+
+  test("followNew: existing member chat does NOT trigger chat.added (just drains)", async () => {
+    const repo = makeFakeRepo();
+    const handlers = makeHandlers({ repo });
+    const { ws, sent } = makeFakeSocket();
+    handlers.onOpen(ws);
+    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 1, clientId: "c-test", views: [] }));
+    const followView: ViewSpec = { ...TEST_VIEW, id: "follow", followNew: true };
+    await handlers.onMessage(ws, JSON.stringify({ op: "view.upsert", view: followView }));
+    sent.length = 0;
+
+    repo.addEvent("v3:42", TEXT_ITEM, 5);
+    repo.setChatMembership("follow", "v3:42", true); // already a member
+    handlers.notifyAffectedChat(42);
+    await new Promise((r) => setTimeout(r, 5));
+
+    expect(sent.find((f) => f.op === "chat.added")).toBeUndefined();
   });
 
   test("upsert + new event fires batch via notifyNewEvents", async () => {

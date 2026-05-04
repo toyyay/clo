@@ -73,6 +73,13 @@ export type ToolGroupItem = {
   results: Array<{ id: number; p: number }>;
 };
 
+/** Item with its sync_revision-derived seq, for stable IDB ordering. */
+export type SeqRenderItem = {
+  item: RenderItem;
+  /** monotonic seq used as IDB sort key — derived from sync_revision; stable across snapshot/batch/history */
+  seq: number;
+};
+
 /** Минимальный pre-parsed markdown — чтобы клиент не тащил react-markdown. */
 export type MarkdownBlock =
   | { t: "p"; s: string }
@@ -172,15 +179,15 @@ export type ClientViewState = {
 
 export type ServerFrame =
   | { op: "hello.ok"; v: number; serverTime: string }
-  | { op: "view.snapshot"; viewId: string; cursor: number; groups: GroupNode[]; chats: ChatIndex[]; tails: Record<string, RenderItem[]>; totals: { items: number; bytesRemaining: number } }
+  | { op: "view.snapshot"; viewId: string; cursor: number; groups: GroupNode[]; chats: ChatIndex[]; tails: Record<string, SeqRenderItem[]>; totals: { items: number; bytesRemaining: number } }
   | { op: "view.batch"; viewId: string; cursor: number; items: BatchItem[]; bytesRemaining: number; moreReady: boolean }
   | { op: "view.idle"; viewId: string; cursor: number }
   | { op: "view.error"; viewId: string; reason: string }
-  | { op: "chat.added"; viewId: string; chat: ChatIndex; tail: RenderItem[] }
+  | { op: "chat.added"; viewId: string; chat: ChatIndex; tail: SeqRenderItem[] }
   | { op: "chat.removed"; viewId: string; chatId: string; reason: "excluded" | "predicate_no_match" | "deleted"; evictHint?: boolean }
   | { op: "group.delta"; deltas: Array<Partial<GroupNode> & { key: string }> }
   | { op: "evict.suggest"; chatIds: string[]; reason: "stale" | "exceeds_quota" }
-  | { op: "history.range.ok"; reqId: string; chatId: string; items: RenderItem[]; hasOlder: boolean; hasNewer: boolean }
+  | { op: "history.range.ok"; reqId: string; chatId: string; items: SeqRenderItem[]; hasOlder: boolean; hasNewer: boolean }
   | { op: "flow.adjust"; batchBytes: number; reason: string }
   | { op: "pong" };
 

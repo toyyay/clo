@@ -123,11 +123,24 @@ const docIdsBySocket = new WeakMap<YjsWebSocket, Set<string>>();
 
 // sync-v3: lazy-init handlers (need repo + sql)
 let v3HandlersSingleton: ReturnType<typeof makeV3Handlers> | null = null;
+let v3RepoSingleton: ReturnType<typeof makeV3Repo> | null = null;
+let v3RefreshTimer: ReturnType<typeof setInterval> | null = null;
+const V3_AGGREGATE_REFRESH_MS = 60_000;
 function v3Handlers() {
   if (v3HandlersSingleton) return v3HandlersSingleton;
-  const repo = makeV3Repo(sql);
-  const ctx = makeV3PgContext(sql, repo);
+  v3RepoSingleton = makeV3Repo(sql);
+  const ctx = makeV3PgContext(sql, v3RepoSingleton);
   v3HandlersSingleton = makeV3Handlers(ctx);
+
+  // Periodic group_aggregates refresh — cheap on prod scale (<1k aggregate rows).
+  // First refresh on the next tick so the WS server is fully wired before we run SQL.
+  if (!v3RefreshTimer) {
+    v3RefreshTimer = setInterval(() => {
+      v3RepoSingleton?.refreshGroupAggregates().catch((err) => {
+        console.warn("[sync-v3] group_aggregates refresh failed", err);
+      });
+    }, V3_AGGREGATE_REFRESH_MS);
+  }
   return v3HandlersSingleton;
 }
 /** Called by ingest path after agent append commits, so any connected clients */
@@ -135,6 +148,12 @@ function v3Handlers() {
 export function notifyV3NewEvents(maxRevision: number) {
   if (!v3HandlersSingleton) return;
   v3HandlersSingleton.notifyNewEvents(maxRevision);
+}
+/** Called when a specific source_file_id received new events. Used to fire   */
+/** chat.added on followNew=true views.                                       */
+export function notifyV3AffectedChat(sourceFileId: number) {
+  if (!v3HandlersSingleton) return;
+  v3HandlersSingleton.notifyAffectedChat(sourceFileId);
 }
 
 if (!agentToken) {
@@ -523,7 +542,13 @@ Bun.serve<WsData>({
       handleAgentV1(req, async () => {
         const result = await handleAgentAppend(req, sql);
         // sync-v3: kick connected clients to drain — cheap, fire-and-forget.
-        if (result.acceptedEvents) notifyV3NewEvents(0);
+        if (result.acceptedEvents) {
+          notifyV3NewEvents(0);
+          if (result.sourceFileId) {
+            const sourceFileId = Number(result.sourceFileId);
+            if (Number.isFinite(sourceFileId)) notifyV3AffectedChat(sourceFileId);
+          }
+        }
         if (result.acceptedEvents || result.acceptedChunks || result.sourceFileId) {
           void logBackendRequestEvent({
             level: "info",

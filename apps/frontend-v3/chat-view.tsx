@@ -22,10 +22,8 @@ const LOAD_EDGE_PX = 720;
 const MEASURE_FLUSH_MS = 30;
 
 export function ChatView() {
-  const store = useStore();
   const state = useStoreState();
-  const window = state.activeWindow;
-  if (!state.activeChat || !window) {
+  if (!state.activeChat || !state.activeWindow) {
     return <div className="chat-empty">Select a chat from the sidebar.</div>;
   }
   return <ActiveChat key={state.activeChat} chatId={state.activeChat} />;
@@ -34,8 +32,10 @@ export function ChatView() {
 function ActiveChat({ chatId }: { chatId: string }) {
   const store = useStore();
   const state = useStoreState();
-  const window = state.activeWindow;
-  const items = window?.items ?? [];
+  // Important: NOT named `window` — that would shadow the global, and we
+  // need globalThis.setTimeout below.
+  const activeWindow = state.activeWindow;
+  const items = activeWindow?.items ?? [];
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const heightsRef = useRef<Map<string, number>>(new Map());
@@ -91,10 +91,10 @@ function ActiveChat({ chatId }: { chatId: string }) {
     setRange((cur) => (cur.start === start && cur.end === end && cur.topPad === topPad && cur.botPad === botPad ? cur : { start, end, topPad, botPad }));
 
     // Edge-loading older
-    if (top < LOAD_EDGE_PX && window?.hasOlder) {
+    if (top < LOAD_EDGE_PX && activeWindow?.hasOlder) {
       void store.loadOlder();
     }
-  }, [items.length, layout, store, window?.hasOlder]);
+  }, [items.length, layout, store, activeWindow?.hasOlder]);
 
   useEffect(() => {
     updateRange();
@@ -121,7 +121,8 @@ function ActiveChat({ chatId }: { chatId: string }) {
         if (Math.abs(prev - h) >= 2) pendingHeights.current.set(key, h);
       }
       if (!measureRaf.current && pendingHeights.current.size) {
-        measureRaf.current = window.setTimeout(flushMeasurements, MEASURE_FLUSH_MS) as unknown as number;
+        // globalThis (not local `activeWindow`) carries setTimeout in browser/JSDOM.
+        measureRaf.current = globalThis.setTimeout(flushMeasurements, MEASURE_FLUSH_MS) as unknown as number;
       }
     });
     observer.observe(node);
