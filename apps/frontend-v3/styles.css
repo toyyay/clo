@@ -964,20 +964,23 @@ body {
   box-shadow: 0 1px 4px rgba(0,0,0,0.08);
 }
 
-/* messages */
-.msg {
-  padding: calc(8px * var(--ui-density)) calc(12px * var(--ui-density));
-  border-radius: 8px;
+/* messages — flat by default (assistant has no chrome); user gets a bubble. */
+.asst {
+  padding: 0;
+  background: transparent;
 }
-.msg-user { background: var(--bg-msg-user); }
-.msg-asst { background: var(--bg-msg-asst); }
-.msg-think { background: var(--bg-msg-think); color: var(--text-think); font-style: italic; }
-.msg-role {
-  font-size: calc(10px * var(--chat-scale));
-  text-transform: uppercase;
-  color: var(--text-dim);
-  margin-bottom: 2px;
-  letter-spacing: 0.04em;
+.bubble-row {
+  display: flex;
+  justify-content: flex-start;
+}
+.bubble {
+  background: var(--bg-msg-user);
+  color: var(--text);
+  padding: calc(5px * var(--ui-density)) calc(9px * var(--ui-density));
+  border-radius: 6px;
+  max-width: 100%;
+  line-height: var(--chat-line-height);
+  word-wrap: break-word;
 }
 .msg-body {
   white-space: pre-wrap;
@@ -987,45 +990,63 @@ body {
 .msg-body p, .msg-body .para { margin: 0 0 var(--chat-paragraph-spacing) 0; }
 .msg-body p:last-child, .msg-body .para:last-child { margin-bottom: 0; }
 .msg-body h1, .msg-body h2, .msg-body h3, .msg-body h4, .msg-body h5, .msg-body h6 {
-  margin: 8px 0 4px;
+  margin: 6px 0 2px;
   line-height: 1.25;
 }
-.msg-body ul, .msg-body ol { margin: 0 0 6px 0; padding-left: 24px; }
+.msg-body ul, .msg-body ol { margin: 0 0 4px 0; padding-left: 22px; }
 .msg-body li { margin: 0; }
 .msg-body blockquote {
-  margin: 4px 0;
-  padding: 4px 12px;
-  border-left: 3px solid var(--border-strong);
+  margin: 2px 0;
+  padding: 2px 10px;
+  border-left: 2px solid var(--border-strong);
   color: var(--text-muted);
-  background: var(--bg-tool);
-  border-radius: 4px;
 }
-.msg-body hr { border: none; border-top: 1px solid var(--border); margin: 8px 0; }
-.think-body { font-size: calc(12px * var(--chat-scale)); line-height: var(--chat-line-height); }
+.msg-body hr { border: none; border-top: 1px solid var(--border); margin: 6px 0; }
 
-.tool {
-  border: 1px solid var(--border-tool);
-  border-radius: 6px;
-  padding: 6px 10px;
-  background: var(--bg-tool);
-}
-.tool-result.is-err { border-color: var(--border-err); background: var(--bg-tool-err); }
-.tool-head {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-  font-size: calc(12px * var(--font-scale));
+/* thinking — collapsed by default like v2; click summary to expand. */
+.thinking {
   color: var(--text-muted);
-  margin-bottom: 4px;
+  font-size: calc(13px * var(--chat-scale));
+  line-height: var(--chat-line-height);
 }
-.tool-name { font-weight: 600; color: var(--text); }
-.tool-trunc { color: var(--border-err); font-size: calc(10px * var(--font-scale)); }
+.thinking summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-style: italic;
+  list-style: none;
+  user-select: none;
+  padding: 2px 0;
+}
+.thinking summary::-webkit-details-marker { display: none; }
+.thinking > div {
+  margin-top: 4px;
+  padding: 4px 8px;
+  border-left: 2px solid var(--border);
+  white-space: pre-wrap;
+  font-style: italic;
+}
+
+/* tool calls — flat, no surrounding box. The tool-group-wrap above already
+   provides the left border; each tool just shows its name and a code block. */
+.tool {
+  padding: 0;
+  background: transparent;
+  border: 0;
+}
+.tool-name {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: calc(11px * var(--chat-scale));
+  color: var(--text-muted);
+  margin: 2px 0;
+}
+.tool-trunc { color: var(--border-err); font-size: calc(10px * var(--font-scale)); margin-left: 4px; }
+.tool-result.is-err .tool-output { background: var(--bg-tool-err); color: var(--text); }
 .tool-input, .tool-output {
   margin: 0;
-  padding: 6px 8px;
+  padding: 4px 8px;
   background: var(--bg-tool-input);
   border-radius: 4px;
-  font-size: calc(11px * var(--font-scale));
+  font-size: calc(12px * var(--chat-scale));
   overflow-x: auto;
   white-space: pre-wrap;
   word-break: break-word;

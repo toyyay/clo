@@ -13,6 +13,9 @@ const LOAD_EDGE_PX = 720;
 const MEASURE_FLUSH_MS = 80;
 const HEIGHT_DELTA_THRESHOLD_PX = 6;
 const NEAR_BOTTOM_PX = 200;
+// Height the collapsed tool-group label takes — used to make the virtual
+// layout total match the actual DOM when groups are collapsed by default.
+const COLLAPSED_GROUP_LABEL_HEIGHT = 28;
 
 export function ChatView() {
   const state = useStoreState();
@@ -67,9 +70,21 @@ function ChatSkeleton({ chatId }: { chatId: string }) {
 }
 
 function SkeletonRow({ role, lines }: { role: "user" | "assistant"; lines: number }) {
+  if (role === "user") {
+    return (
+      <div className="bubble-row msg-skeleton">
+        <div className="bubble">
+          <div className="msg-body">
+            {Array.from({ length: lines }).map((_, i) => (
+              <div key={i} className="skeleton-line" style={{ width: `${85 - (i * 9) % 35}%` }} />
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
   return (
-    <div className={`msg ${role === "assistant" ? "msg-asst" : "msg-user"} msg-skeleton`}>
-      <div className="msg-role">{role}</div>
+    <div className="asst msg-skeleton">
       <div className="msg-body">
         {Array.from({ length: lines }).map((_, i) => (
           <div key={i} className="skeleton-line" style={{ width: `${85 - (i * 9) % 35}%` }} />
@@ -82,7 +97,7 @@ function SkeletonRow({ role, lines }: { role: "user" | "assistant"; lines: numbe
 function SkeletonTool() {
   return (
     <div className="tool tool-use msg-skeleton">
-      <div className="tool-head">
+      <div className="tool-name">
         <span className="skeleton-line" style={{ width: 80, height: 12 }} />
       </div>
       <div className="tool-input">
@@ -146,17 +161,48 @@ function ActiveChat({ chatId }: { chatId: string }) {
 
   const itemKeys = useMemo(() => items.map((it) => idb.itemKey(it)), [items]);
 
+  // Per-render-item user state. `expandedGroups` defaults to empty so all
+  // tool-groups start collapsed (mirrors v2 UX). `expandedLong` defaults to
+  // empty so long messages start truncated.
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const [expandedLong, setExpandedLong] = useState<Set<string>>(new Set());
+
+  // Span info computed across ALL items so layout math can subtract the
+  // height of items hidden inside a collapsed group.
+  const groupSpansByIdx = useMemo(() => {
+    const map = new Map<number, { firstIdx: number; key: string }>();
+    let i = 0;
+    while (i < items.length) {
+      const k = items[i]!.k;
+      if (k === "tu" || k === "tr") {
+        let j = i + 1;
+        while (j < items.length && (items[j]!.k === "tu" || items[j]!.k === "tr")) j += 1;
+        const groupKey = `tg:${itemKeys[i]!}`;
+        for (let m = i; m < j; m += 1) map.set(m, { firstIdx: i, key: groupKey });
+        i = j;
+      } else i += 1;
+    }
+    return map;
+  }, [items, itemKeys]);
+
   const layout = useMemo(() => {
     const offsets = new Array<number>(items.length + 1);
     let total = 0;
     for (let i = 0; i < items.length; i += 1) {
       offsets[i] = total;
-      const h = heightsRef.current.get(itemKeys[i]!) ?? estimateHeight(items[i]!);
-      total += h;
+      const span = groupSpansByIdx.get(i);
+      if (span && !expandedGroups.has(span.key)) {
+        // Collapsed group: only the head item contributes the label height,
+        // remaining children render zero (they're not in the DOM).
+        if (i === span.firstIdx) total += COLLAPSED_GROUP_LABEL_HEIGHT;
+      } else {
+        const h = heightsRef.current.get(itemKeys[i]!) ?? estimateHeight(items[i]!);
+        total += h;
+      }
     }
     offsets[items.length] = total;
     return { offsets, total };
-  }, [items, itemKeys, measureVersion]);
+  }, [items, itemKeys, measureVersion, groupSpansByIdx, expandedGroups]);
 
   /** Capture the topmost visible item + offset within it, BEFORE any layout
    *  shift. Sets anchoringActive=true so onScroll knows the upcoming
@@ -420,17 +466,10 @@ function ActiveChat({ chatId }: { chatId: string }) {
   const visible = items.slice(range.start, range.end);
   const grouped = useMemo(() => groupConsecutiveTools(visible, range.start, itemKeys), [visible, range.start, itemKeys]);
 
-  // Per-render-item user state: collapsed tool-groups (by their first-item
-  // key) and expanded long messages (also by item key). Keyed so the state
-  // survives re-renders from sync deltas; cleared on chat change because
-  // these refs reset with the component.
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
-  const [expandedLong, setExpandedLong] = useState<Set<string>>(new Set());
-
   const toggleGroup = useCallback(
     (key: string) => {
       captureAnchor();
-      setCollapsedGroups((prev) => {
+      setExpandedGroups((prev) => {
         const next = new Set(prev);
         if (next.has(key)) next.delete(key);
         else next.add(key);
@@ -498,20 +537,20 @@ function ActiveChat({ chatId }: { chatId: string }) {
               );
             }
             // tool-group: wrap consecutive tu/tr items, collapsible by click on label
-            const collapsed = collapsedGroups.has(entry.groupKey);
+            const expanded = expandedGroups.has(entry.groupKey);
             return (
-              <div key={`${chatId}:${entry.groupKey}`} className={`tool-group-wrap ${collapsed ? "collapsed" : ""}`}>
+              <div key={`${chatId}:${entry.groupKey}`} className={`tool-group-wrap ${expanded ? "" : "collapsed"}`}>
                 <button
                   className="tool-group-label"
                   onClick={() => toggleGroup(entry.groupKey)}
-                  aria-expanded={!collapsed}
-                  title={collapsed ? "Expand tool calls" : "Collapse tool calls"}
+                  aria-expanded={expanded}
+                  title={expanded ? "Collapse tool calls" : "Expand tool calls"}
                 >
-                  <span className="tool-group-caret">{collapsed ? "▶" : "▼"}</span>
-                  used {entry.toolCount} tool{entry.toolCount === 1 ? "" : "s"}
-                  {collapsed && (entry.firstName ? ` · ${entry.firstName}` : "")}
+                  <span className="tool-group-caret">{expanded ? "▼" : "▶"}</span>
+                  {entry.toolCount} tool{entry.toolCount === 1 ? "" : "s"}
+                  {!expanded && (entry.firstName ? ` · ${entry.firstName}` : "")}
                 </button>
-                {!collapsed &&
+                {expanded &&
                   entry.items.map((sub, i) => {
                     const idx = entry.startIndex + i;
                     const key = itemKeys[idx]!;

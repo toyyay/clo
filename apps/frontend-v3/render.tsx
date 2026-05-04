@@ -3,10 +3,6 @@
 // Здесь НЕТ react-markdown, НЕТ remark-gfm. Сервер уже посчитал RenderItem'ы;
 // клиент лишь свитчит по `k` и рисует. Если в payload есть `blocks`, рендерим
 // предпарсенные markdown-блоки (всё ещё без сторонних либ — простой свитч).
-//
-// Минималистично, расширяемо: для богатого markdown'а можно потом добавить
-// серверный блочный парсер и расширить разметку blocks без изменений на клиенте
-// больше, чем добавление новых case в switch.
 
 import type { MarkdownBlock, RenderItem } from "../../packages/sync-v3/contracts";
 
@@ -23,20 +19,31 @@ export function RenderItemView({
 }) {
   switch (item.k) {
     case "t": {
-      const isLong = onToggleLong !== undefined; // parent decided based on threshold
+      const isLong = onToggleLong !== undefined;
       const showFull = !isLong || longExpanded === true;
       const txt = showFull ? item.txt : item.txt.slice(0, LONG_PREVIEW_CHARS);
-      // Markdown blocks are pre-parsed for the FULL text; if we're truncating,
-      // fall back to plain text on the truncated slice so we don't render
-      // half-trees.
       const useBlocks = showFull && item.blocks;
+      const body = useBlocks ? <Blocks blocks={item.blocks!} /> : <PlainText txt={txt} />;
+      if (item.r === "u") {
+        return (
+          <div className="bubble-row">
+            <div className={`bubble ${isLong && !showFull ? "msg-truncated" : ""}`}>
+              <div className="msg-body">{body}</div>
+              {isLong && (
+                <button className="show-more-btn" onClick={onToggleLong} aria-expanded={showFull}>
+                  {showFull ? "Show less" : `Show full (${formatCharCount(item.txt.length)})`}
+                </button>
+              )}
+            </div>
+          </div>
+        );
+      }
       return (
-        <div className={`msg ${item.r === "a" ? "msg-asst" : "msg-user"} ${isLong && !showFull ? "msg-truncated" : ""}`}>
-          <div className="msg-role">{item.r === "a" ? "assistant" : "user"}</div>
-          <div className="msg-body">{useBlocks ? <Blocks blocks={item.blocks!} /> : <PlainText txt={txt} />}</div>
+        <div className={`asst ${isLong && !showFull ? "msg-truncated" : ""}`}>
+          <div className="msg-body">{body}</div>
           {isLong && (
             <button className="show-more-btn" onClick={onToggleLong} aria-expanded={showFull}>
-              {showFull ? "Show less" : `Show full message (${formatCharCount(item.txt.length)})`}
+              {showFull ? "Show less" : `Show full (${formatCharCount(item.txt.length)})`}
             </button>
           )}
         </div>
@@ -44,45 +51,35 @@ export function RenderItemView({
     }
     case "th":
       return (
-        <div className="msg msg-think">
-          <div className="msg-role">thinking</div>
-          <div className="msg-body think-body">
+        <details className="thinking">
+          <summary>thinking</summary>
+          <div>
             <PlainText txt={item.txt} />
           </div>
-        </div>
+        </details>
       );
     case "tu":
       return (
         <div className="tool tool-use">
-          <div className="tool-head">
-            <span className="tool-icon">▶</span>
-            <span className="tool-name">{item.name}</span>
-          </div>
+          <div className="tool-name">{item.name}</div>
           <pre className="tool-input">{safeStringify(item.in)}</pre>
         </div>
       );
     case "tr":
       return (
         <div className={`tool tool-result ${item.isErr ? "is-err" : ""}`}>
-          <div className="tool-head">
-            <span className="tool-icon">←</span>
-            <span className="tool-name">result</span>
-            {item.trunc && <span className="tool-trunc">truncated</span>}
-          </div>
-          <pre className="tool-output">{item.out}</pre>
+          <pre className="tool-output">
+            {item.out}
+            {item.trunc && <span className="tool-trunc"> …truncated</span>}
+          </pre>
         </div>
       );
     case "tg":
-      // ToolGroupItem refs uses/results that are rendered by their own items.
-      // Group is rendered as a wrapper element when present in the stream — but
-      // if it appears alone we still emit a placeholder for layout consistency.
       return <div className="tool-group" />;
   }
 }
 
 function PlainText({ txt }: { txt: string }) {
-  // Cheap "paragraph splitter" — server-side block parsing replaces this when
-  // payload.blocks is populated; until then keep this dumb but readable.
   return (
     <>
       {txt.split(/\n\n+/).map((para, i) => (
