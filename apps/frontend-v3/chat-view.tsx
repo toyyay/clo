@@ -118,16 +118,38 @@ function ActiveChat({ chatId }: { chatId: string }) {
 
   // Auto-scroll to the bottom on first paint after the chat opens —
   // matches the legacy "open chat → see latest message" expectation.
+  // Re-runs while heights are still hydrating (layout.total grows as real
+  // measurements replace estimates), and stops once we've reached a stable
+  // bottom OR the user has scrolled manually.
+  const userScrolled = useRef(false);
   useLayoutEffect(() => {
     if (initialScrollDone.current) return;
-    if (!items.length || !heightsHydrated.current) return;
+    if (!items.length) return;
+    if (userScrolled.current) {
+      initialScrollDone.current = true;
+      return;
+    }
     const el = scrollRef.current;
     if (!el) return;
+    if (layout.total <= el.clientHeight) {
+      // Whole chat fits — nothing to scroll to.
+      initialScrollDone.current = true;
+      return;
+    }
     el.scrollTop = layout.total;
-    initialScrollDone.current = true;
+    // Don't latch initialScrollDone yet — keep snapping to the new bottom while
+    // heights hydrate (which grows layout.total). Once heights settle, the next
+    // run will see no growth and we'll latch via the equal-bottom check below.
+    requestAnimationFrame(() => {
+      if (!scrollRef.current) return;
+      const distFromBottom = scrollRef.current.scrollHeight - scrollRef.current.scrollTop - scrollRef.current.clientHeight;
+      if (distFromBottom < 4) initialScrollDone.current = true;
+    });
   }, [chatId, items.length, layout.total]);
 
   const onScroll = useCallback(() => {
+    // Mark user-driven scroll so initial auto-scroll stops re-snapping.
+    if (initialScrollDone.current === false) userScrolled.current = true;
     requestAnimationFrame(() => updateRange(true));
   }, [updateRange]);
 
