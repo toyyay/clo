@@ -389,14 +389,17 @@ async function fetchGroupsForChats(sql: any, chats: ChatIndex[]): Promise<GroupN
   if (chats.length === 0) return [];
   // Берём из materialized view только узлы, релевантные нашему набору чатов.
   // На малом количестве чатов / групп проще читать всё дерево живущих агентов.
-  const hostIds = new Set(chats.map((c) => c.hostId));
-  const rows = await sql`
-    select group_key, level, parent_key, label, host_id, provider, project_key,
-           chat_count, approx_bytes, last_seen_at
-    from v3_group_aggregates
-    where host_id = any(${Array.from(hostIds)})
-    order by level asc, last_seen_at desc nulls last
-  `;
+  const hostIds = Array.from(new Set(chats.map((c) => c.hostId)));
+  // Bun's tagged-SQL doesn't auto-convert JS arrays to Postgres text[] — pass via ANY(VALUES ...).
+  const placeholders = hostIds.map((_, i) => `$${i + 1}`).join(",");
+  const rows = await sql.unsafe(
+    `select group_key, level, parent_key, label, host_id, provider, project_key,
+            chat_count, approx_bytes, last_seen_at
+     from v3_group_aggregates
+     where host_id in (${placeholders})
+     order by level asc, last_seen_at desc nulls last`,
+    hostIds,
+  );
 
   // topChatIds для level=3: 5 самых свежих чатов в этом проекте.
   const groupNodes: GroupNode[] = rows.map((r: any) => ({
