@@ -76,6 +76,7 @@ export type Store = {
   loadOlder(limit?: number): Promise<void>;
   loadGroupChildren(parentKey: string): Promise<GroupNode[]>;
   loadChatPage(groupKey: string, opts: { afterLastSeenAt?: string; limit: number }): Promise<ChatIndex[]>;
+  searchChats(query: string, limit?: number): Promise<{ chats: ChatIndex[]; hasMore: boolean }>;
 };
 
 const TAIL_DEFAULT = 200;
@@ -113,6 +114,8 @@ export function createStore(): Store {
   const historyRequests = new Map<string, (frame: { items: SeqRenderItem[]; hasOlder: boolean; hasNewer: boolean }) => void>();
   /** map reqId → resolver for pending chats.byGroup */
   const chatPageRequests = new Map<string, (frame: { chats: ChatIndex[]; hasMore: boolean }) => void>();
+  /** map reqId → resolver for pending chats.search */
+  const chatSearchRequests = new Map<string, (frame: { chats: ChatIndex[]; hasMore: boolean }) => void>();
 
   function commit(next: Partial<StoreState>) {
     state = { ...state, ...next };
@@ -255,6 +258,14 @@ export function createStore(): Store {
         if (cb) {
           cb({ chats: frame.chats, hasMore: frame.hasMore });
           chatPageRequests.delete(frame.reqId);
+        }
+        return;
+      }
+      case "chats.search.ok": {
+        const cb = chatSearchRequests.get(frame.reqId);
+        if (cb) {
+          cb({ chats: frame.chats, hasMore: frame.hasMore });
+          chatSearchRequests.delete(frame.reqId);
         }
         return;
       }
@@ -555,6 +566,42 @@ export function createStore(): Store {
       }
       return idb.getChatsByGroup(groupKey, opts);
     },
+
+    async searchChats(query, limit = 50) {
+      const trimmed = query.trim();
+      if (!trimmed) return { chats: [], hasMore: false };
+      // Server-side search hits the full corpus, not just chats already in
+      // visibleChats / IDB. Falls back to a local scan of visibleChats when
+      // the link is offline so users don't get a hard "no matches" answer.
+      if (ws && state.status.kind === "open") {
+        try {
+          const reply = await requestChatSearch(ws, chatSearchRequests, { query: trimmed, limit });
+          if (reply.chats.length) {
+            await idb.bulkPutChatIndex(reply.chats);
+            const visibleChats = new Map(state.visibleChats);
+            for (const c of reply.chats) visibleChats.set(c.chatId, c);
+            commit({ visibleChats });
+          }
+          return reply;
+        } catch (err) {
+          console.warn("[sync-v3] chats.search failed, falling back to local scan", err);
+        }
+      }
+      const lower = trimmed.toLowerCase();
+      const out: ChatIndex[] = [];
+      for (const c of state.visibleChats.values()) {
+        if (
+          c.title.toLowerCase().includes(lower) ||
+          c.chatId.toLowerCase().includes(lower) ||
+          c.projectKey.toLowerCase().includes(lower)
+        ) {
+          out.push(c);
+        }
+        if (out.length >= limit) break;
+      }
+      out.sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
+      return { chats: out, hasMore: out.length >= limit };
+    },
   };
 }
 
@@ -574,6 +621,25 @@ function requestChatPage(
       resolve(frame);
     });
     ws.send({ op: "chats.byGroup", reqId, ...opts });
+  });
+}
+
+function requestChatSearch(
+  ws: WsClient,
+  pending: Map<string, (frame: { chats: ChatIndex[]; hasMore: boolean }) => void>,
+  opts: { query: string; limit: number },
+): Promise<{ chats: ChatIndex[]; hasMore: boolean }> {
+  return new Promise((resolve, reject) => {
+    const reqId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    const timer = setTimeout(() => {
+      pending.delete(reqId);
+      reject(new Error("chats.search timeout"));
+    }, 15_000);
+    pending.set(reqId, (frame) => {
+      clearTimeout(timer);
+      resolve(frame);
+    });
+    ws.send({ op: "chats.search", reqId, ...opts });
   });
 }
 

@@ -56,8 +56,17 @@ export type Repo = {
   /** Lazy listing of chats inside a group_key — used by sidebar "Show all"
    *  on projects whose chats fall outside the snapshot's MAX_SNAPSHOT_CHATS top. */
   listChatsByGroup(opts: ListChatsByGroupOpts): Promise<{ chats: ChatIndex[]; hasMore: boolean }>;
+  /** Server-side chat search by title/projectKey, against the full corpus
+   *  (NOT just chats already streamed in the snapshot). Used by the sidebar
+   *  search box so a query for an old chat actually finds it. */
+  searchChats(opts: SearchChatsOpts): Promise<{ chats: ChatIndex[]; hasMore: boolean }>;
   bytesRemainingForView(view: ViewSpec, cursor: number): Promise<number>;
   refreshGroupAggregates(): Promise<void>;
+};
+
+export type SearchChatsOpts = {
+  query: string;
+  limit: number;
 };
 
 export type ListChatsByGroupOpts = {
@@ -97,7 +106,56 @@ export function makeRepo(sql: any): Repo {
     fetchChatTailById: (sourceFileId, limit) => fetchChatTail(sql, sourceFileId, limit),
     fetchChatIndex: (sourceFileId) => fetchChatIndex(sql, sourceFileId),
     listChatsByGroup: (opts) => listChatsByGroup(sql, opts),
+    searchChats: (opts) => searchChats(sql, opts),
   };
+}
+
+const MAX_SEARCH_HITS = 200;
+
+async function searchChats(sql: any, opts: SearchChatsOpts): Promise<{ chats: ChatIndex[]; hasMore: boolean }> {
+  const trimmed = opts.query.trim();
+  if (!trimmed) return { chats: [], hasMore: false };
+  const limit = Math.max(1, Math.min(MAX_SEARCH_HITS, Math.floor(opts.limit)));
+  // ILIKE pattern with both the literal query and a non-anchored fragment.
+  // Postgres LIKE treats % and _ as wildcards — escape them so a query like
+  // "100%" doesn't degrade to "match anything". \\\\ is one backslash in JS
+  // → one backslash in SQL once tagged-SQL is done with it.
+  const escaped = trimmed.replace(/[\\%_]/g, (c) => `\\${c}`);
+  const pattern = `%${escaped}%`;
+  const rows = await sql`
+    select
+      f.id,
+      f.agent_id,
+      f.provider,
+      coalesce(nullif(f.metadata->>'projectKey', ''), '(unknown)') as project_key,
+      coalesce(nullif(f.metadata->>'title', ''), nullif(f.metadata->>'projectName', ''), nullif(f.metadata->>'projectKey', ''), '(no title)') as title,
+      f.last_seen_at,
+      f.size_bytes,
+      coalesce((select count(*) from agent_render_items r where r.source_file_id = f.id and r.display = true), 0) as item_count
+    from agent_source_files f
+    where f.deleted_at is null
+      and f.source_kind = 'conversation'
+      and (
+        coalesce(f.metadata->>'title', '') ilike ${pattern}
+        or coalesce(f.metadata->>'projectKey', '') ilike ${pattern}
+        or coalesce(f.metadata->>'projectName', '') ilike ${pattern}
+      )
+    order by f.last_seen_at desc
+    limit ${limit + 1}
+  `;
+  const hasMore = rows.length > limit;
+  const chats: ChatIndex[] = rows.slice(0, limit).map((row: any) => ({
+    chatId: v3SessionIdFromSourceFileId(row.id),
+    groupKey: groupKeyFor(row.agent_id, row.provider, row.project_key),
+    hostId: row.agent_id,
+    provider: row.provider,
+    projectKey: row.project_key,
+    title: row.title,
+    lastSeenAt: toISO(row.last_seen_at),
+    approxBytes: Number(row.size_bytes ?? 0),
+    itemCount: Number(row.item_count ?? 0),
+  }));
+  return { chats, hasMore };
 }
 
 async function listChatsByGroup(sql: any, opts: ListChatsByGroupOpts): Promise<{ chats: ChatIndex[]; hasMore: boolean }> {
@@ -201,7 +259,15 @@ async function buildSnapshot(sql: any, view: ViewSpec): Promise<SnapshotResult> 
   );
 
   if (chats.length === 0) {
-    return { cursor: 0, groups: [], chats: [], tails: {}, totals: { items: 0, bytesRemaining: 0 } };
+    // Still ship the full group tree — user may have 0 active chats in this
+    // view but expects to see hosts/projects in the sidebar.
+    return {
+      cursor: 0,
+      groups: await fetchGroupsForChats(sql, []),
+      chats: [],
+      tails: {},
+      totals: { items: 0, bytesRemaining: 0 },
+    };
   }
 
   const chatIndex: ChatIndex[] = chats.map((row: any) => ({
@@ -463,20 +529,18 @@ async function fetchHistoryRange(sql: any, opts: HistoryRangeOpts) {
 }
 
 async function fetchGroupsForChats(sql: any, chats: ChatIndex[]): Promise<GroupNode[]> {
-  if (chats.length === 0) return [];
-  // Берём из materialized view только узлы, релевантные нашему набору чатов.
-  // На малом количестве чатов / групп проще читать всё дерево живущих агентов.
-  const hostIds = Array.from(new Set(chats.map((c) => c.hostId)));
-  // Bun's tagged-SQL doesn't auto-convert JS arrays to Postgres text[] — pass via ANY(VALUES ...).
-  const placeholders = hostIds.map((_, i) => `$${i + 1}`).join(",");
-  const rows = await sql.unsafe(
-    `select group_key, level, parent_key, label, host_id, provider, project_key,
-            chat_count, approx_bytes, last_seen_at
-     from v3_group_aggregates
-     where host_id in (${placeholders})
-     order by level asc, last_seen_at desc nulls last`,
-    hostIds,
-  );
+  // Always return the FULL tree from the materialized view — not just the
+  // hosts whose chats happen to fit in the snapshot's MAX_SNAPSHOT_CHATS top.
+  // Otherwise users with > 500 chats lose entire host/project branches that
+  // contain only older sessions: the chats below the cutoff are unreachable
+  // because their host node never appears in the sidebar.
+  // The view aggregates ~thousands of rows on real installs — cheap to ship.
+  const rows = await sql`
+    select group_key, level, parent_key, label, host_id, provider, project_key,
+           chat_count, approx_bytes, last_seen_at
+    from v3_group_aggregates
+    order by level asc, last_seen_at desc nulls last
+  `;
 
   // topChatIds для level=3: 5 самых свежих чатов в этом проекте.
   const groupNodes: GroupNode[] = rows.map((r: any) => ({

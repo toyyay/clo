@@ -807,11 +807,9 @@ body {
 .chat-list {
   display: flex;
   flex-direction: column;
-  gap: calc(6px * var(--ui-density));
-  padding: 12px 16px;
-  max-width: var(--chat-width);
+  gap: calc(4px * var(--ui-density));
+  padding: 6px 10px;
   width: 100%;
-  margin: 0 auto;
   font-size: calc(14px * var(--chat-scale));
   line-height: var(--chat-line-height);
 }
@@ -924,6 +922,14 @@ body {
   color: var(--text-dim);
 }
 .sidebar-loading-label { letter-spacing: 0.02em; }
+.search-more-hint {
+  padding: 6px 10px;
+  font-size: calc(11px * var(--font-scale));
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+  border-top: 1px dashed var(--border);
+  margin-top: 4px;
+}
 .group-loading {
   display: inline-block;
   margin-right: 4px;

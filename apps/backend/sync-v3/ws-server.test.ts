@@ -104,6 +104,9 @@ function makeFakeRepo(): Repo & {
       // a dedicated test below.
       return { chats: [], hasMore: false };
     },
+    async searchChats() {
+      return { chats: [], hasMore: false };
+    },
   };
 }
 

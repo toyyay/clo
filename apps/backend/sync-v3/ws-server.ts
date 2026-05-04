@@ -628,6 +628,36 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
         return;
       }
 
+      case "chats.search": {
+        const t0 = Date.now();
+        const result = await ctx.repo.searchChats({
+          query: frame.query,
+          limit: frame.limit,
+        });
+        const bytes = send(ws, {
+          op: "chats.search.ok",
+          reqId: frame.reqId,
+          query: frame.query,
+          chats: result.chats,
+          hasMore: result.hasMore,
+        });
+        telemetry.log({
+          clientId: ws.data.clientId ?? null,
+          event: "chats.search",
+          level: "info",
+          durationMs: Date.now() - t0,
+          bytes,
+          payload: {
+            query: frame.query.slice(0, 64),
+            queryLen: frame.query.length,
+            limit: frame.limit,
+            hits: result.chats.length,
+            hasMore: result.hasMore,
+          },
+        });
+        return;
+      }
+
       case "ping": {
         send(ws, { op: "pong" });
         return;

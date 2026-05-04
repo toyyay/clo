@@ -96,7 +96,7 @@ export function Sidebar({ visible }: { visible: boolean }) {
     }
   }, [chatPagesByGroup, chatHasMoreByGroup, store]);
 
-  const searchResults = useSearch(search, state.visibleChats);
+  const searchResults = useSearch(search, store);
 
   return (
     <aside className={`sidebar ${visible ? "visible" : "hidden"}`}>
@@ -112,12 +112,19 @@ export function Sidebar({ visible }: { visible: boolean }) {
 
       {search.trim() ? (
         <div className="tree">
-          {searchResults.length === 0 ? (
+          {searchResults.loading && searchResults.chats.length === 0 ? (
+            <SidebarLoadingRow indent={0} label="Searching…" />
+          ) : searchResults.chats.length === 0 ? (
             <div className="empty-tree">No matches</div>
           ) : (
-            searchResults.map((chat) => (
-              <ChatRow key={chat.chatId} chat={chat} indent={0} />
-            ))
+            <>
+              {searchResults.chats.map((chat) => (
+                <ChatRow key={chat.chatId} chat={chat} indent={0} />
+              ))}
+              {searchResults.hasMore && (
+                <div className="search-more-hint">More results — refine the query.</div>
+              )}
+            </>
           )}
         </div>
       ) : (
@@ -152,20 +159,36 @@ export function Sidebar({ visible }: { visible: boolean }) {
   );
 }
 
-function useSearch(query: string, visibleChats: Map<string, ChatIndex>): ChatIndex[] {
-  const trimmed = query.trim().toLowerCase();
-  return useMemo(() => {
-    if (!trimmed) return [];
-    const out: ChatIndex[] = [];
-    for (const c of visibleChats.values()) {
-      if (c.title.toLowerCase().includes(trimmed) || c.chatId.toLowerCase().includes(trimmed)) {
-        out.push(c);
-      }
-      if (out.length >= 50) break;
+type SearchState = { chats: ChatIndex[]; hasMore: boolean; loading: boolean };
+
+/** Debounced server-side chat search. Falls back to local visibleChats scan
+ *  inside store.searchChats when the WS link is offline. */
+function useSearch(query: string, store: ReturnType<typeof useStore>): SearchState {
+  const trimmed = query.trim();
+  const [state, setState] = useState<SearchState>({ chats: [], hasMore: false, loading: false });
+  useEffect(() => {
+    if (!trimmed) {
+      setState({ chats: [], hasMore: false, loading: false });
+      return;
     }
-    out.sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
-    return out;
-  }, [trimmed, visibleChats]);
+    setState((cur) => ({ ...cur, loading: true }));
+    let cancelled = false;
+    const handle = setTimeout(async () => {
+      try {
+        const reply = await store.searchChats(trimmed, 50);
+        if (cancelled) return;
+        setState({ chats: reply.chats, hasMore: reply.hasMore, loading: false });
+      } catch {
+        if (cancelled) return;
+        setState({ chats: [], hasMore: false, loading: false });
+      }
+    }, 200);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
+  }, [trimmed, store]);
+  return state;
 }
 
 type NodeProps = {

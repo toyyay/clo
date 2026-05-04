@@ -80,6 +80,7 @@ function buildPredicate(pred: Predicate, ctx: BuildCtx): string {
     ctx.params.push(pred.lastSeenWithin.days);
     return `(f.last_seen_at >= now() - ($${i}::int * interval '1 day'))`;
   }
+  if ("everything" in pred) return "TRUE";
   return "FALSE";
 }
 
