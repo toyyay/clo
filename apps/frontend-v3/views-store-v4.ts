@@ -25,11 +25,9 @@
 import type {
   ChatIndex,
   ClientFrame,
-  ClientViewState,
   GroupNode,
   RenderItem,
   ServerFrame,
-  ViewSpec,
 } from "../../packages/sync-v3/contracts";
 import * as idb from "./idb";
 import { createWsClient, type ConnStatus, type WsClient, type WsLink } from "./ws-client";
@@ -49,7 +47,9 @@ export type ActiveChatWindow = {
 
 export type StoreState = {
   status: ConnStatus;
-  views: Map<string, ViewSpec>;
+  /** Legacy v3 field — kept on the type so UI components written against the
+   *  old store still mount; v4 always exposes an empty Map. */
+  views: Map<string, unknown>;
   cursors: Map<string, number>;
   pendingBytes: Map<string, number>;
   groups: Map<string, GroupNode>;
@@ -69,10 +69,8 @@ export type Store = {
   start(opts: { url: string; clientId: string }): Promise<void>;
   stop(): void;
 
-  upsertView(view: ViewSpec): Promise<void>;
-  deleteView(viewId: string): Promise<void>;
-  excludeChat(viewId: string, chatId: string): Promise<void>;
-  includeChat(viewId: string, chatId: string): Promise<void>;
+  excludeChat(chatId: string): Promise<void>;
+  includeChat(chatId: string): Promise<void>;
   openChat(chatId: string, tailLimit?: number): Promise<void>;
   closeActiveChat(): void;
   loadOlder(limit?: number): Promise<void>;
@@ -731,22 +729,10 @@ export function createStore(): Store {
         scheduleRetry(pq);
         return;
       }
-      // v4 uses none of the v3-specific frames. They might still arrive if
-      // the server is in dual-protocol mode — ignore silently.
-      case "view.snapshot":
-      case "view.batch":
-      case "view.idle":
-      case "view.error":
-      case "chat.added":
-      case "chat.removed":
-      case "history.range.ok":
-      case "chats.byGroup.ok":
-      case "chats.search.ok":
+      // query.run.* are v3 aliases the server still emits for DevTools snippets
+      // that haven't moved to `query` yet. Treat them as their v4 twins.
       case "query.run.ok":
       case "query.run.err":
-      case "group.delta":
-      case "evict.suggest":
-      case "flow.adjust":
       case "pong":
         return;
     }
@@ -807,11 +793,9 @@ export function createStore(): Store {
           onFrame(frame);
           commit({});
         },
-        // v4 store doesn't subscribe to views; it doesn't need an outbox or
-        // hello-time view list. We still satisfy the ws-client interface.
-        async getViewStates(): Promise<ClientViewState[]> {
-          return [];
-        },
+        // v4 store has no outbox — every query is fire-and-retry from the
+        // pending-queries map, so the ws-client doesn't need to drain
+        // anything before hello.
         async drainOutbox(): Promise<ClientFrame[]> {
           return [];
         },
@@ -846,22 +830,7 @@ export function createStore(): Store {
       pendingQueries.clear();
     },
 
-    // v3-protocol mutations are no-ops in v4. The default-view bootstrap in
-    // app.tsx will call upsertView; we accept it silently so the UI doesn't
-    // see an error on first paint.
-    async upsertView(view) {
-      const views = new Map(state.views);
-      views.set(view.id, view);
-      commit({ views });
-    },
-    async deleteView(viewId) {
-      const views = new Map(state.views);
-      views.delete(viewId);
-      const cursors = new Map(state.cursors);
-      cursors.delete(viewId);
-      commit({ views, cursors });
-    },
-    async excludeChat(_viewId, chatId) {
+    async excludeChat(chatId) {
       await idb.addExcludeRule({ type: "chatId", value: chatId, addedAt: new Date().toISOString() });
       excludeRules = await idb.listExcludeRules();
       // Drop locally too so the sidebar updates instantly.
@@ -870,7 +839,7 @@ export function createStore(): Store {
       commit({ visibleChats });
       void sidebarScope.run();
     },
-    async includeChat(_viewId, chatId) {
+    async includeChat(chatId) {
       // Inverse of excludeChat: remove any chatId rules that match. Refresh.
       const rules = await idb.listExcludeRules();
       for (const r of rules) {

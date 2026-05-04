@@ -76,35 +76,8 @@ export function SyncStatusPopover({ onClose }: { onClose: () => void }) {
         <Row label="Group nodes" value={`${state.groups.size}`} />
       </div>
 
-      {state.views.size > 0 && (
-        <>
-          <div className="sync-status-section-label">Per view</div>
-          <div className="sync-status-views">
-            {[...state.views.values()].map((view) => {
-              const cursor = state.cursors.get(view.id) ?? 0;
-              const pend = state.pendingBytes.get(view.id) ?? 0;
-              const lastBatch = state.lastBatchAt.get(view.id) ?? 0;
-              const sinceBatch = lastBatch > 0 ? now - lastBatch : null;
-              return (
-                <div key={view.id} className="sync-status-view-row">
-                  <div className="sync-status-view-name">{view.id}</div>
-                  <div className="sync-status-view-meta">
-                    cursor #{cursor.toLocaleString()}
-                    <span className="dot">·</span>
-                    {pend > 0 ? `${formatBytes(pend)} left` : "idle"}
-                    {sinceBatch !== null && (
-                      <>
-                        <span className="dot">·</span>
-                        last batch {ageString(sinceBatch)} ago
-                      </>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </>
-      )}
+      {/* v3 had per-view cursor/lastBatch panels here; v4 has no view-spec
+          state on the server, so we just show overall connection metrics. */}
 
       <div className="sync-status-foot">
         <span className="sync-status-hint">

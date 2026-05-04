@@ -10,14 +10,12 @@
 // Не знает про IDB напрямую — всё проходит через колбэки. Это позволяет
 // тестировать клиент без браузера.
 
-import type { ClientFrame, ClientViewState, ServerFrame, ViewSpec } from "../../packages/sync-v3/contracts";
-import { canonicalizeSpec, WS_PROTOCOL_VERSION } from "../../packages/sync-v3/contracts";
+import type { ClientFrame, ServerFrame } from "../../packages/sync-v3/contracts";
+import { WS_PROTOCOL_VERSION } from "../../packages/sync-v3/contracts";
 
 export type WsClientOptions = {
   url: string;
   clientId: string;
-  /** snapshot of (viewId, specHash, cursor) for hello */
-  getViewStates: () => Promise<ClientViewState[]>;
   /** mutation outbox flush — returns frames to send before normal traffic */
   drainOutbox: () => Promise<ClientFrame[]>;
   onFrame: (frame: ServerFrame) => void;
@@ -112,12 +110,12 @@ export function createWsClient(options: WsClientOptions): WsClient {
       attempt = 0;
       setStatus({ kind: "open", since: Date.now() });
       try {
-        // Flush outbox (subscribe upserts, excludes etc.) BEFORE hello so server
-        // applies them and computes specHash before our hello-time comparison.
+        // Drain whatever the store queued while we were offline (queries
+        // pending retry, etc.). Sent BEFORE hello so the server can attach
+        // them to the same session log entry.
         const outbox = await options.drainOutbox();
         for (const frame of outbox) socket.send(JSON.stringify(frame));
 
-        const states = await options.getViewStates();
         const deviceMemoryGb = typeof (navigator as any)?.deviceMemory === "number"
           ? (navigator as any).deviceMemory
           : undefined;
@@ -127,7 +125,6 @@ export function createWsClient(options: WsClientOptions): WsClient {
             v: WS_PROTOCOL_VERSION,
             clientId: options.clientId,
             deviceMemoryGb,
-            views: states,
           } satisfies ClientFrame),
         );
 
@@ -222,31 +219,7 @@ export function createWsClient(options: WsClientOptions): WsClient {
   };
 }
 
-// ---------- helpers usable from views-store --------------------------------
+// v3's specHash helper used to live here. v4 protocol has no view-spec — the
+// frontend writes its own SQL — so the helper is gone. If you need to fingerprint
+// something for reconnect dedup, hash an arbitrary string the same way v3 did.
 
-/**
- * SHA-256 truncated to 16 bytes (32 hex chars), matching server (ws-server.ts:specHash).
- * Falls back to 4×32-bit FNV-1a stripes only on environments without Web Crypto;
- * the fallback emits the same 32 hex chars so reconnect handshake works correctly
- * even though it's not collision-resistant. Server uses crypto SHA-256 always —
- * mismatch on the fallback path triggers a fresh snapshot which is correct
- * behavior (slightly less efficient, never wrong).
- */
-export async function specHash(spec: ViewSpec): Promise<string> {
-  const data = new TextEncoder().encode(canonicalizeSpec(spec));
-  if (typeof crypto !== "undefined" && "subtle" in crypto) {
-    const buf = await crypto.subtle.digest("SHA-256", data);
-    return [...new Uint8Array(buf)].slice(0, 16).map((b) => b.toString(16).padStart(2, "0")).join("");
-  }
-  // Non-crypto fallback: 4 stripes of 32-bit FNV-1a with different seeds, total 32 hex chars.
-  const seeds = [0x811c9dc5, 0x01000193, 0xdeadbeef, 0xcafef00d];
-  const stripes = seeds.map((seed) => {
-    let h = seed >>> 0;
-    for (let i = 0; i < data.length; i += 1) {
-      h = (h ^ data[i]!) >>> 0;
-      h = (h * 16777619) >>> 0;
-    }
-    return h.toString(16).padStart(8, "0");
-  });
-  return stripes.join("");
-}

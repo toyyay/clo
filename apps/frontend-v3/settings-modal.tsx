@@ -10,28 +10,20 @@ import { useStore, useStoreState } from "./store-hook";
 import { formatBytes, formatRelative } from "./format";
 import type { ExcludeRuleRow, ExcludeRuleType } from "./idb";
 
-const PROTOCOL_KEY = "chatview-v3:protocol";
-
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const store = useStore();
   const state = useStoreState();
   const [sha, setSha] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
-  const [protocol, setProtocol] = useState<"v3" | "v4">(() => {
-    try {
-      return localStorage.getItem(PROTOCOL_KEY) === "v4" ? "v4" : "v3";
-    } catch {
-      return "v3";
-    }
-  });
   const [rules, setRules] = useState<ExcludeRuleRow[]>([]);
   const [newRuleType, setNewRuleType] = useState<ExcludeRuleType>("host");
   const [newRuleValue, setNewRuleValue] = useState<string>("");
 
-  // v4-only: load and manipulate exclude rules. The v3 store doesn't expose
-  // these methods; guard the calls so we don't crash on the older store.
-  const supportsRules = protocol === "v4" && typeof (store as unknown as { listExcludeRules?: unknown }).listExcludeRules === "function";
+  // v4 store always exposes listExcludeRules; the guard is here only to keep
+  // settings-modal renderable in case `useStore()` ever returns a stub during
+  // a hot-reload window.
+  const supportsRules = typeof (store as unknown as { listExcludeRules?: unknown }).listExcludeRules === "function";
   useEffect(() => {
     if (!supportsRules) return;
     let cancelled = false;
@@ -45,15 +37,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       cancelled = true;
     };
   }, [supportsRules, store]);
-
-  const switchProtocol = (next: "v3" | "v4") => {
-    try {
-      localStorage.setItem(PROTOCOL_KEY, next);
-    } catch {}
-    setProtocol(next);
-    // Reload to swap stores cleanly.
-    setTimeout(() => location.reload(), 50);
-  };
 
   const addRule = async () => {
     const v = newRuleValue.trim();
@@ -189,28 +172,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             <div className="modal-actions">
               <button className="danger" onClick={resetAndReload} disabled={busy}>
                 Reset &amp; reload
-              </button>
-            </div>
-          </div>
-
-          <div className="modal-section">
-            <div className="modal-section-title">Sync protocol</div>
-            <div className="modal-section-desc">
-              v3 is the snapshot/batch model. v4 (experimental) is pull-on-tick: WebSocket only carries
-              "something changed", client decides what to re-pull. Switch reloads the page.
-            </div>
-            <div className="modal-actions">
-              <button
-                onClick={() => switchProtocol("v3")}
-                style={{ borderColor: protocol === "v3" ? "var(--text-link)" : undefined }}
-              >
-                v3 {protocol === "v3" && "✓"}
-              </button>
-              <button
-                onClick={() => switchProtocol("v4")}
-                style={{ borderColor: protocol === "v4" ? "var(--text-link)" : undefined }}
-              >
-                v4 (experimental) {protocol === "v4" && "✓"}
               </button>
             </div>
           </div>

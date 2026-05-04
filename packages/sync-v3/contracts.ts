@@ -89,47 +89,6 @@ export type MarkdownBlock =
   | { t: "quote"; s: string }
   | { t: "hr" };
 
-// ---------- Predicate / ViewSpec -------------------------------------------
-
-export type Predicate =
-  | { all: Predicate[] }
-  | { any: Predicate[] }
-  | { not: Predicate }
-  | { host: string }
-  | { project: string }
-  | { provider: "claude" | "codex" | "gemini" | "unknown" }
-  | { sessionId: string }
-  | { lastSeenWithin: { days: number } }
-  /** Match every chat. Use as a top-level predicate when the user wants
-   *  the full unscoped sidebar (no time / scope cutoff). */
-  | { everything: true };
-
-export type ViewSpec = {
-  id: string;
-  predicate: Predicate;
-  /** explicit chat ids that must be inside the view (override predicate negative) */
-  includes?: string[];
-  /** explicit chat ids that must NOT be inside the view */
-  excludes?: string[];
-  /** if true, new chats matching predicate are auto-added */
-  followNew?: boolean;
-  history?: {
-    /** how many tail RenderItems to deliver per chat on snapshot */
-    tailItems?: number;
-    /** include raw event payloads (default: false) */
-    rawIncluded?: boolean;
-  };
-  /** receive live updates */
-  liveTail?: boolean;
-  /** 0..100, larger = drained first */
-  priority?: number;
-  /** server-suggested eviction caps */
-  evict?: {
-    maxChatsInMemory?: number;
-    maxItemsPerChat?: number;
-  };
-};
-
 // ---------- Aggregates / Sidebar -------------------------------------------
 
 export type GroupNode = {
@@ -161,122 +120,38 @@ export type ChatIndex = {
 
 // ---------- WS Frames ------------------------------------------------------
 //
-// Two parallel protocols live in this union for now:
-//   • v3 ops (`view.*`, `chat.added/removed`, `chats.byGroup/search`, `history.range`)
-//     — pre-existing snapshot/batch model; being phased out.
-//   • v4 ops (`query`, `tick`, `hello.ok` extended with maxRev) — pull-on-tick
-//     model. Server is a dumb transport: it broadcasts {op:"tick", maxRev,
-//     files} when ingest writes new render rows; client decides what to
-//     re-pull via `query`. No predicate/snapshot/batch state on server.
+// v4 protocol: minimal pull-on-tick. Server is a dumb transport — it
+// broadcasts {op:"tick", maxRev, files} when ingest writes new render rows
+// and otherwise just relays `query.ok`/`query.err` replies to the client's
+// own SELECT statements. There is NO predicate / snapshot / batch state on
+// the server side; the client decides what to re-pull and applies its own
+// filters via SQL WHERE clauses.
 //
-// During Phase 2-3 of the v4 rollout, both work. Phase 4 deletes the v3
-// frames entirely along with their server-side machinery.
+// `query.run` is kept as a deprecated alias of `query` so the DevTools
+// escape hatch (`window.chatview.q(...)`) keeps working in both spellings.
 
 export type ClientFrame =
-  | { op: "hello"; v: number; clientId: string; deviceMemoryGb?: number; views: ClientViewState[] }
-  | { op: "view.upsert"; view: ViewSpec }
-  | { op: "view.delete"; viewId: string }
-  | { op: "view.ack"; viewId: string; cursor: number }
-  | { op: "view.focus"; viewId: string; chatId: string }
-  | { op: "chat.exclude"; viewId: string; chatId: string }
-  | { op: "chat.include"; viewId: string; chatId: string }
-  | { op: "history.range"; reqId: string; chatId: string; before?: number; after?: number; limit: number }
-  | { op: "chats.byGroup"; reqId: string; groupKey: string; afterLastSeenAt?: string; limit: number }
-  | { op: "chats.search"; reqId: string; query: string; limit: number }
-  /** Escape hatch: run an arbitrary SQL query against the chatview Postgres
-   *  in a read-only, statement_timeout-bounded transaction. Used by the
-   *  frontend to iterate UI features without round-tripping new RPC ops
-   *  through the protocol every time. Note: this is a small private app
-   *  (~5 devices, single user); the backend does NOT whitelist or sign
-   *  queries — params are bound, transaction is read-only, timeout is 5s. */
-  | { op: "query.run"; reqId: string; sql: string; params?: unknown[] }
-  /** v4: alias of query.run with a shorter name and the same semantics. */
+  | { op: "hello"; v: number; clientId: string; deviceMemoryGb?: number }
   | { op: "query"; reqId: string; sql: string; params?: unknown[] }
+  /** Deprecated alias of `query` — kept so the DevTools escape hatch keeps
+   *  working without rebuilding. Both ops have identical semantics. */
+  | { op: "query.run"; reqId: string; sql: string; params?: unknown[] }
   | { op: "ping" };
 
-export type ClientViewState = {
-  viewId: string;
-  /** sha256 of canonical(spec); if mismatched server resends snapshot */
-  specHash: string;
-  /** last acked cursor */
-  cursor: number;
-};
-
 export type ServerFrame =
-  | { op: "hello.ok"; v: number; serverTime: string; maxRev?: number }
-  /** v4 live-tick: "something changed in the DB". `files` is a short list of
+  | { op: "hello.ok"; v: number; serverTime: string; maxRev: number }
+  /** Live-tick: "something changed in the DB". `files` is a short list of
    *  affected source_file_ids when the debounce window stays small enough;
    *  if it grows past ~64 ids server omits it and client re-pulls broadly. */
   | { op: "tick"; maxRev: number; files?: number[] }
-  /** v4 query reply (alias of query.run.ok with a shorter name). `maxRev`
-   *  is the max sync_revision visible to the read transaction — clients use
-   *  it to decide whether they're already caught up to the latest tick. */
+  /** Reply to `query` / `query.run`. `maxRev` is the largest sync_revision
+   *  visible to the read transaction at the time the rows were collected;
+   *  clients use it to decide if they're already caught up to the latest
+   *  tick (race-safe re-pull tracker). */
   | { op: "query.ok"; reqId: string; rows: Record<string, unknown>[]; rowCount: number; durationMs: number; truncated: boolean; maxRev: number }
   | { op: "query.err"; reqId: string; error: string }
-  | { op: "view.snapshot"; viewId: string; cursor: number; groups: GroupNode[]; chats: ChatIndex[]; tails: Record<string, SeqRenderItem[]>; totals: { items: number; bytesRemaining: number } }
-  | { op: "view.batch"; viewId: string; cursor: number; items: BatchItem[]; bytesRemaining: number; moreReady: boolean }
-  | { op: "view.idle"; viewId: string; cursor: number }
-  | { op: "view.error"; viewId: string; reason: string }
-  | { op: "chat.added"; viewId: string; chat: ChatIndex; tail: SeqRenderItem[] }
-  | { op: "chat.removed"; viewId: string; chatId: string; reason: "excluded" | "predicate_no_match" | "deleted"; evictHint?: boolean }
-  | { op: "group.delta"; deltas: Array<Partial<GroupNode> & { key: string }> }
-  | { op: "evict.suggest"; chatIds: string[]; reason: "stale" | "exceeds_quota" }
-  | { op: "history.range.ok"; reqId: string; chatId: string; items: SeqRenderItem[]; hasOlder: boolean; hasNewer: boolean }
-  | { op: "chats.byGroup.ok"; reqId: string; groupKey: string; chats: ChatIndex[]; hasMore: boolean }
-  | { op: "chats.search.ok"; reqId: string; query: string; chats: ChatIndex[]; hasMore: boolean }
-  | { op: "query.run.ok"; reqId: string; rows: Record<string, unknown>[]; rowCount: number; durationMs: number; truncated: boolean; maxRev?: number }
+  /** Deprecated aliases of query.ok / query.err — emitted for `query.run`
+   *  callers so existing DevTools snippets keep parsing. */
+  | { op: "query.run.ok"; reqId: string; rows: Record<string, unknown>[]; rowCount: number; durationMs: number; truncated: boolean; maxRev: number }
   | { op: "query.run.err"; reqId: string; error: string }
-  | { op: "flow.adjust"; batchBytes: number; reason: string }
   | { op: "pong" };
-
-export type BatchItem = {
-  chatId: string;
-  item: RenderItem;
-  /** monotonic per-(chat) sequence — для пагинации в IDB по [chatId, seq] */
-  seq: number;
-};
-
-// ---------- Predicate canonicalization (для specHash) ----------------------
-
-/**
- * Стабильное JSON-представление спека. Ключи отсортированы.
- * Используется для вычисления specHash: server и client должны хешировать одинаково.
- */
-export function canonicalizeSpec(spec: ViewSpec): string {
-  return JSON.stringify(spec, sortedReplacer);
-}
-
-function sortedReplacer(_key: string, value: unknown): unknown {
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    const sorted: Record<string, unknown> = {};
-    for (const k of Object.keys(value as Record<string, unknown>).sort()) {
-      sorted[k] = (value as Record<string, unknown>)[k];
-    }
-    return sorted;
-  }
-  return value;
-}
-
-// ---------- Predicate evaluation (для тестов / клиентских проверок) --------
-
-/** Применяет predicate к чату. Используется в тестах и client-side фильтрах. */
-export function evalPredicate(
-  pred: Predicate,
-  chat: { hostId: string; provider: string; projectKey: string; sessionId: string; lastSeenAt: string },
-  now = Date.now(),
-): boolean {
-  if ("all" in pred) return pred.all.every((p) => evalPredicate(p, chat, now));
-  if ("any" in pred) return pred.any.some((p) => evalPredicate(p, chat, now));
-  if ("not" in pred) return !evalPredicate(pred.not, chat, now);
-  if ("host" in pred) return chat.hostId === pred.host;
-  if ("project" in pred) return chat.projectKey === pred.project;
-  if ("provider" in pred) return chat.provider === pred.provider;
-  if ("sessionId" in pred) return chat.sessionId === pred.sessionId;
-  if ("lastSeenWithin" in pred) {
-    const t = Date.parse(chat.lastSeenAt);
-    if (!Number.isFinite(t)) return false;
-    const cutoff = now - pred.lastSeenWithin.days * 86_400_000;
-    return t >= cutoff;
-  }
-  return false;
-}

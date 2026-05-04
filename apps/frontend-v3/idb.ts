@@ -17,16 +17,20 @@
 //   groups:         groupKey → GroupNode
 //   mutation_outbox: id → { op; createdAt }
 
-import type { ChatIndex, GroupNode, RenderItem, ViewSpec } from "../../packages/sync-v3/contracts";
+import type { ChatIndex, GroupNode, RenderItem } from "../../packages/sync-v3/contracts";
 
 const DB_NAME = "chatview-v3";
 // v2: adds the `exclude_rules` store used by the v4 protocol store. Old stores
 // untouched — onupgradeneeded only creates the new one.
 const DB_VERSION = 2;
 
+/** Legacy v3 view-row shape. Kept as a freeform record so existing rows
+ *  (written by the v3 store) round-trip cleanly through bulk-IDB getters
+ *  even though the v4 store ignores them. The store / index.html migration
+ *  to drop the `views` / `view_chats` IDB stores happens in DB_VERSION 3. */
 export type ViewRow = {
   viewId: string;
-  spec: ViewSpec;
+  spec: unknown;
   cursor: number;
   specHash: string;
   updatedAt: string;

@@ -3,33 +3,17 @@ import { useEffect, useState } from "react";
 import { Sidebar } from "./sidebar";
 import { ChatView } from "./chat-view";
 import { Topbar } from "./topbar";
-import { useStore, useStoreState } from "./store-hook";
+import { useStore } from "./store-hook";
 import { applyVisualSettings, readInterfacePrefs, readTheme } from "./settings";
-import type { ViewSpec } from "../../packages/sync-v3/contracts";
 
 // Apply persisted visual settings synchronously, before React first paints,
 // so the page never flashes the wrong theme.
 applyVisualSettings(readTheme(), readInterfacePrefs());
 
-// `everything` predicate — show every chat the user can see, regardless of
-// age. The previous 30-day cutoff silently dropped whole projects whose
-// last activity was older than a month. The snapshot is still capped at
-// MAX_SNAPSHOT_CHATS by lastSeenAt; chats below that line surface lazily
-// via chats.byGroup when the user expands a project.
-const DEFAULT_VIEW: ViewSpec = {
-  id: "all-recent",
-  predicate: { everything: true },
-  followNew: true,
-  history: { tailItems: 200 },
-  liveTail: true,
-  priority: 50,
-};
-
 const SIDEBAR_OPEN_KEY = "chatview-v3:sidebar-open";
 
 export function App() {
   const store = useStore();
-  const state = useStoreState();
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
     try {
       const v = localStorage.getItem(SIDEBAR_OPEN_KEY);
@@ -53,19 +37,6 @@ export function App() {
     };
     return () => store.stop();
   }, [store]);
-
-  // Bootstrap / migrate the default view. The very first run installs it;
-  // subsequent runs reinstall it ONLY if the persisted spec doesn't match
-  // DEFAULT_VIEW. That handles the migration from `lastSeenWithin: 30d` to
-  // `everything: true` — without this check, users keep their stale view
-  // forever and never see chats older than 30 days.
-  useEffect(() => {
-    if (state.status.kind !== "open") return;
-    const existing = state.views.get(DEFAULT_VIEW.id);
-    if (!existing || JSON.stringify(existing.predicate) !== JSON.stringify(DEFAULT_VIEW.predicate)) {
-      void store.upsertView(DEFAULT_VIEW);
-    }
-  }, [state.status.kind, state.views, store]);
 
   const toggleSidebar = () => {
     setSidebarOpen((v) => {

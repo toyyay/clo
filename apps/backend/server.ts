@@ -154,24 +154,18 @@ function v3Handlers() {
   }
   return v3HandlersSingleton;
 }
-/** Called by ingest path after agent append commits, so any connected clients */
-/** drain new events in real time. Cheap: just sets a dirty flag per-view.    */
+/** Called by ingest path after agent append commits. Forwards to the v4
+ *  notify-listener so connected clients receive a `tick` frame and re-pull
+ *  what they care about. */
 export function notifyV3NewEvents(maxRevision: number) {
-  if (!v3HandlersSingleton) return;
-  v3HandlersSingleton.notifyNewEvents(maxRevision);
-  // v4 path: feed the listener too. maxRevision is sometimes 0 (caller didn't
-  // know a precise value) — the listener falls back to its 1s poll in that
-  // case so we never under-tick.
   if (v4NotifyListenerSingleton && maxRevision > 0) {
     v4NotifyListenerSingleton.reportRenderChange(0, maxRevision);
   }
 }
-/** Called when a specific source_file_id received new events. Used to fire   */
-/** chat.added on followNew=true views.                                       */
+/** Called when a specific source_file_id received new events. Same path
+ *  as notifyV3NewEvents but with the chat id, so the tick can include
+ *  `files: [...]` and clients re-pull narrowly. */
 export function notifyV3AffectedChat(sourceFileId: number, syncRevision = 0) {
-  if (!v3HandlersSingleton) return;
-  v3HandlersSingleton.notifyAffectedChat(sourceFileId);
-  // v4 path: include the source_file_id so clients can re-pull narrowly.
   if (v4NotifyListenerSingleton) {
     v4NotifyListenerSingleton.reportRenderChange(sourceFileId, syncRevision);
   }

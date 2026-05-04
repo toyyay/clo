@@ -1,122 +1,38 @@
 import { describe, expect, test } from "bun:test";
-import { makeHandlers, newV3SocketData, specHash, type V3WebSocket } from "./ws-server";
-import type { ChatIndex, GroupNode, RenderItem, SeqRenderItem, ServerFrame, ViewSpec } from "../../../packages/sync-v3/contracts";
-import type { DeltaResult, Repo, ResolvedViewMatch, SnapshotResult } from "./repo";
+import { makeHandlers, newV3SocketData, type V3WebSocket } from "./ws-server";
+import type { ServerFrame } from "../../../packages/sync-v3/contracts";
+import type { Repo } from "./repo";
 
-// In-memory fake repo for integration tests.
+// In-memory fake repo for the v4 protocol. Only what `query` and `hello.ok`
+// touch — the v3 snapshot/batch pieces are gone.
 function makeFakeRepo(): Repo & {
-  addEvent(chatId: string, item: RenderItem, seq: number): void;
-  setChatMembership(viewId: string, chatId: string, isMember: boolean): void;
+  setMaxRev(n: number): void;
+  setQueryRows(rows: Record<string, unknown>[]): void;
+  setQueryShouldThrow(err: Error | null): void;
 } {
-  const items: { chatId: string; item: RenderItem; seq: number; bytes: number }[] = [];
-  const chatTitles = new Map<string, string>();
-  // (clientId omitted in fake) — track by viewId only
-  const memberships = new Map<string, Set<string>>(); // viewId -> chatIds
-
+  let maxRev = 0;
+  let queryRows: Record<string, unknown>[] = [];
+  let queryError: Error | null = null;
   return {
-    addEvent(chatId, item, seq) {
-      items.push({ chatId, item, seq, bytes: 200 });
-      if (!chatTitles.has(chatId)) chatTitles.set(chatId, `chat ${chatId}`);
+    setMaxRev(n) {
+      maxRev = n;
     },
-    setChatMembership(viewId, chatId, isMember) {
-      const s = memberships.get(viewId) ?? new Set();
-      if (isMember) s.add(chatId);
-      else s.delete(chatId);
-      memberships.set(viewId, s);
+    setQueryRows(rows) {
+      queryRows = rows;
     },
-    async buildSnapshot(view: ViewSpec): Promise<SnapshotResult> {
-      const matched = items.filter((it) => matchesViewExcludes(view, it.chatId));
-      const cursor = matched.reduce((m, it) => Math.max(m, it.seq), 0);
-      const chatIds = Array.from(new Set(matched.map((it) => it.chatId)));
-      const chats: ChatIndex[] = chatIds.map((cid) => ({
-        chatId: cid,
-        groupKey: "h:test|p:claude|pr:default",
-        hostId: "test",
-        provider: "claude",
-        projectKey: "default",
-        title: chatTitles.get(cid) ?? cid,
-        lastSeenAt: "2026-05-04T00:00:00Z",
-        approxBytes: 1000,
-        itemCount: matched.filter((it) => it.chatId === cid).length,
-      }));
-      const tails: Record<string, SeqRenderItem[]> = {};
-      const tailLimit = view.history?.tailItems ?? 200;
-      for (const cid of chatIds) {
-        tails[cid] = matched
-          .filter((it) => it.chatId === cid)
-          .slice(-tailLimit)
-          .map((it) => ({ item: it.item, seq: it.seq }));
-      }
-      const groups: GroupNode[] = [
-        { key: "h:test", level: 1, parentKey: null, label: "test", chatCount: chatIds.length, approxBytes: 1000, lastSeenAt: "2026-05-04T00:00:00Z", topChatIds: [] },
-      ];
-      return { cursor, groups, chats, tails, totals: { items: matched.length, bytesRemaining: 0 } };
+    setQueryShouldThrow(err) {
+      queryError = err;
     },
-    async fetchDelta(view: ViewSpec, since: number, _limitBytes?: number): Promise<DeltaResult> {
-      const matched = items.filter((it) => matchesViewExcludes(view, it.chatId) && it.seq > since);
-      matched.sort((a, b) => a.seq - b.seq);
-      const out = matched.map((it) => ({ chatId: it.chatId, item: it.item, seq: it.seq }));
-      const cursor = out.length ? out[out.length - 1].seq : since;
-      return { cursor, items: out, bytesRemaining: 0, moreReady: false };
+    async runRawQuery() {
+      if (queryError) throw queryError;
+      return { rows: queryRows.slice(), durationMs: 1, truncated: false };
     },
-    async fetchHistoryRange(opts) {
-      const chatItems = items
-        .filter((it) => it.chatId === opts.chatId)
-        .map((it): SeqRenderItem => ({ item: it.item, seq: it.seq }));
-      return { items: chatItems.slice(-opts.limit), hasOlder: chatItems.length > opts.limit, hasNewer: false };
-    },
-    async bytesRemainingForView() {
-      return 0;
-    },
-    async refreshGroupAggregates() {},
-    async resolveMatchingViews(sourceFileId): Promise<ResolvedViewMatch[]> {
-      const chatId = `v3:${sourceFileId}`;
-      const out: ResolvedViewMatch[] = [];
-      for (const [viewId, set] of memberships) {
-        out.push({ clientId: "c-test", viewId, alreadyMember: set.has(chatId) });
-      }
-      return out;
-    },
-    async fetchChatTailById(sourceFileId, limit): Promise<SeqRenderItem[]> {
-      const chatId = `v3:${sourceFileId}`;
-      return items
-        .filter((it) => it.chatId === chatId)
-        .slice(-limit)
-        .map((it) => ({ item: it.item, seq: it.seq }));
-    },
-    async fetchChatIndex(sourceFileId): Promise<ChatIndex | null> {
-      const chatId = `v3:${sourceFileId}`;
-      if (!items.some((it) => it.chatId === chatId)) return null;
-      return {
-        chatId,
-        groupKey: "h:test|p:claude|pr:default",
-        hostId: "test",
-        provider: "claude",
-        projectKey: "default",
-        title: chatTitles.get(chatId) ?? chatId,
-        lastSeenAt: "2026-05-04T00:00:00Z",
-        approxBytes: 1000,
-        itemCount: items.filter((it) => it.chatId === chatId).length,
-      };
-    },
-    async listChatsByGroup() {
-      // Test repo doesn't simulate the project tree; protocol coverage is in
-      // a dedicated test below.
-      return { chats: [], hasMore: false };
-    },
-    async searchChats() {
-      return { chats: [], hasMore: false };
-    },
-    async runRawQuery(opts) {
-      return runFakeQuery(opts);
-    },
-    async runRawQueryWithMaxRev(opts) {
-      const result = runFakeQuery(opts);
-      const maxRev = items.reduce((m, it) => Math.max(m, it.seq), 0);
-      return { ...result, maxRev };
+    async runRawQueryWithMaxRev() {
+      if (queryError) throw queryError;
+      return { rows: queryRows.slice(), durationMs: 1, truncated: false, maxRev };
     },
     async fetchMaxRev() {
-      return items.reduce((m, it) => Math.max(m, it.seq), 0);
+      return maxRev;
     },
     async refreshV4MaterializedViews() {
       return [
@@ -125,23 +41,8 @@ function makeFakeRepo(): Repo & {
         { name: "v3_chat_last_render", ok: true },
       ];
     },
+    async refreshGroupAggregates() {},
   };
-}
-
-// Tiny stub for runRawQuery: supports only the literal sqls we use in tests.
-// Anything else returns the empty result so behavioural tests stay isolated
-// from real SQL parsing.
-function runFakeQuery(opts: { sql: string; params?: unknown[] }) {
-  const sql = opts.sql.trim().toLowerCase();
-  if (sql === "select 1 as x") {
-    return { rows: [{ x: 1 }], durationMs: 0, truncated: false };
-  }
-  return { rows: [], durationMs: 0, truncated: false };
-}
-
-function matchesViewExcludes(view: ViewSpec, chatId: string): boolean {
-  if ((view.excludes ?? []).includes(chatId)) return false;
-  return true;
 }
 
 function makeFakeSocket() {
@@ -157,324 +58,155 @@ function makeFakeSocket() {
   return { ws, sent };
 }
 
-const TEST_VIEW: ViewSpec = {
-  id: "active",
-  predicate: { host: "test" },
-  history: { tailItems: 5 },
-  liveTail: true,
-  priority: 100,
-};
-
-const TEXT_ITEM: RenderItem = { k: "t", id: 1, p: 0, r: "u", txt: "hello" };
-
-describe("ws-server", () => {
-  test("hello returns ack and snapshots known views", async () => {
+describe("ws-server v4", () => {
+  test("hello returns hello.ok with maxRev", async () => {
     const repo = makeFakeRepo();
-    repo.addEvent("v3:1", TEXT_ITEM, 1);
-
-    const handlers = makeHandlers({
-      repo,
-      async loadViews() {
-        return [{ view: TEST_VIEW, cursor: 0, hash: specHash(TEST_VIEW) }];
-      },
-    });
-
-    const { ws, sent } = makeFakeSocket();
-    handlers.onOpen(ws);
-    await handlers.onMessage(
-      ws,
-      JSON.stringify({ op: "hello", v: 1, clientId: "c1", views: [] }),
-    );
-
-    const helloOk = sent.find((f) => f.op === "hello.ok");
-    expect(helloOk).toBeDefined();
-    const snapshot = sent.find((f) => f.op === "view.snapshot");
-    expect(snapshot).toBeDefined();
-    if (snapshot && snapshot.op === "view.snapshot") {
-      expect(snapshot.viewId).toBe("active");
-      expect(snapshot.chats.length).toBe(1);
-      expect(snapshot.tails["v3:1"]).toBeDefined();
-      // SeqRenderItem shape: each tail entry has .item and .seq
-      const tailEntry = snapshot.tails["v3:1"]?.[0];
-      expect(tailEntry?.seq).toBe(1);
-      expect(tailEntry?.item.k).toBe("t");
-    }
-  });
-
-  test("followNew: chat.added emitted when new chat matches and not yet a member", async () => {
-    const repo = makeFakeRepo();
+    repo.setMaxRev(42);
     const handlers = makeHandlers({ repo });
     const { ws, sent } = makeFakeSocket();
     handlers.onOpen(ws);
-    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 1, clientId: "c-test", views: [] }));
-    const followView: ViewSpec = { ...TEST_VIEW, id: "follow", followNew: true };
-    await handlers.onMessage(ws, JSON.stringify({ op: "view.upsert", view: followView }));
-    sent.length = 0;
+    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 4, clientId: "c1" }));
 
-    // Simulate: new chat appears (sourceFileId=42), not yet in view
-    repo.addEvent("v3:42", TEXT_ITEM, 5);
-    repo.setChatMembership("follow", "v3:42", false);
-    handlers.notifyAffectedChat(42);
-
-    // Wait for async dispatch
-    await new Promise((r) => setTimeout(r, 5));
-
-    const added = sent.find((f) => f.op === "chat.added");
-    expect(added).toBeDefined();
-    if (added && added.op === "chat.added") {
-      expect(added.viewId).toBe("follow");
-      expect(added.chat.chatId).toBe("v3:42");
-      expect(added.tail.length).toBe(1);
-      expect(added.tail[0]!.seq).toBe(5);
-    }
-  });
-
-  test("followNew: existing member chat does NOT trigger chat.added (just drains)", async () => {
-    const repo = makeFakeRepo();
-    const handlers = makeHandlers({ repo });
-    const { ws, sent } = makeFakeSocket();
-    handlers.onOpen(ws);
-    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 1, clientId: "c-test", views: [] }));
-    const followView: ViewSpec = { ...TEST_VIEW, id: "follow", followNew: true };
-    await handlers.onMessage(ws, JSON.stringify({ op: "view.upsert", view: followView }));
-    sent.length = 0;
-
-    repo.addEvent("v3:42", TEXT_ITEM, 5);
-    repo.setChatMembership("follow", "v3:42", true); // already a member
-    handlers.notifyAffectedChat(42);
-    await new Promise((r) => setTimeout(r, 5));
-
-    expect(sent.find((f) => f.op === "chat.added")).toBeUndefined();
-  });
-
-  test("upsert + new event fires batch via notifyNewEvents", async () => {
-    const repo = makeFakeRepo();
-    const handlers = makeHandlers({ repo });
-    const { ws, sent } = makeFakeSocket();
-    handlers.onOpen(ws);
-    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 1, clientId: "c2", views: [] }));
-    await handlers.onMessage(ws, JSON.stringify({ op: "view.upsert", view: TEST_VIEW }));
-
-    // After upsert, snapshot is sent (empty)
-    expect(sent.find((f) => f.op === "view.snapshot")).toBeDefined();
-
-    // Simulate new event arrival
-    repo.addEvent("v3:1", TEXT_ITEM, 1);
-    handlers.notifyNewEvents(1);
-
-    // Wait for microtask drain
-    await Promise.resolve();
-    await Promise.resolve();
-
-    const batch = sent.find((f) => f.op === "view.batch");
-    expect(batch).toBeDefined();
-    if (batch && batch.op === "view.batch") {
-      expect(batch.items.length).toBe(1);
-      expect(batch.cursor).toBe(1);
-    }
-  });
-
-  test("ack advances cursor; subsequent drain starts after acked", async () => {
-    const repo = makeFakeRepo();
-    const handlers = makeHandlers({ repo });
-    const { ws, sent } = makeFakeSocket();
-    handlers.onOpen(ws);
-    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 1, clientId: "c3", views: [] }));
-    await handlers.onMessage(ws, JSON.stringify({ op: "view.upsert", view: TEST_VIEW }));
-
-    repo.addEvent("v3:1", TEXT_ITEM, 1);
-    handlers.notifyNewEvents(1);
-    await Promise.resolve(); await Promise.resolve();
-
-    expect(ws.data.acked.get("active")).toBe(0);
-    await handlers.onMessage(ws, JSON.stringify({ op: "view.ack", viewId: "active", cursor: 1 }));
-    expect(ws.data.acked.get("active")).toBe(1);
-
-    // No new events, drain triggered → should send view.idle (after ack ticked)
-    await Promise.resolve(); await Promise.resolve();
-    const idle = sent.filter((f) => f.op === "view.idle");
-    expect(idle.length).toBeGreaterThan(0);
-  });
-
-  test("history.range returns items + reqId echo", async () => {
-    const repo = makeFakeRepo();
-    repo.addEvent("v3:42", TEXT_ITEM, 1);
-    const handlers = makeHandlers({ repo });
-    const { ws, sent } = makeFakeSocket();
-    handlers.onOpen(ws);
-    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 1, clientId: "c4", views: [] }));
-    await handlers.onMessage(
-      ws,
-      JSON.stringify({ op: "history.range", reqId: "r1", chatId: "v3:42", limit: 10 }),
-    );
-
-    const reply = sent.find((f) => f.op === "history.range.ok");
-    expect(reply).toBeDefined();
-    if (reply && reply.op === "history.range.ok") {
-      expect(reply.reqId).toBe("r1");
-      expect(reply.items.length).toBe(1);
-    }
-  });
-
-  test("chat.exclude removes chat from view & sends chat.removed", async () => {
-    const repo = makeFakeRepo();
-    repo.addEvent("v3:1", TEXT_ITEM, 1);
-    const handlers = makeHandlers({ repo });
-    const { ws, sent } = makeFakeSocket();
-    handlers.onOpen(ws);
-    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 1, clientId: "c5", views: [] }));
-    await handlers.onMessage(ws, JSON.stringify({ op: "view.upsert", view: TEST_VIEW }));
-    sent.length = 0;
-
-    await handlers.onMessage(
-      ws,
-      JSON.stringify({ op: "chat.exclude", viewId: "active", chatId: "v3:1" }),
-    );
-
-    const removed = sent.find((f) => f.op === "chat.removed");
-    expect(removed).toBeDefined();
-    if (removed && removed.op === "chat.removed") {
-      expect(removed.chatId).toBe("v3:1");
-      expect(removed.evictHint).toBe(true);
-    }
-  });
-
-  test("ping/pong", async () => {
-    const repo = makeFakeRepo();
-    const handlers = makeHandlers({ repo });
-    const { ws, sent } = makeFakeSocket();
-    handlers.onOpen(ws);
-    await handlers.onMessage(ws, JSON.stringify({ op: "ping" }));
-    expect(sent.some((f) => f.op === "pong")).toBe(true);
-  });
-
-  test("specHash mismatch on hello triggers fresh snapshot", async () => {
-    const repo = makeFakeRepo();
-    repo.addEvent("v3:1", TEXT_ITEM, 1);
-    const handlers = makeHandlers({
-      repo,
-      async loadViews() {
-        return [{ view: TEST_VIEW, cursor: 99, hash: specHash(TEST_VIEW) }];
-      },
-    });
-    const { ws, sent } = makeFakeSocket();
-    handlers.onOpen(ws);
-    // Client sends a stale hash
-    await handlers.onMessage(
-      ws,
-      JSON.stringify({
-        op: "hello",
-        v: 1,
-        clientId: "c6",
-        views: [{ viewId: "active", specHash: "stalehash", cursor: 99 }],
-      }),
-    );
-    const snap = sent.find((f) => f.op === "view.snapshot");
-    expect(snap).toBeDefined();
-  });
-
-  test("hello.ok includes maxRev (number, >= 0)", async () => {
-    const repo = makeFakeRepo();
-    repo.addEvent("v3:1", TEXT_ITEM, 7);
-    const handlers = makeHandlers({ repo });
-    const { ws, sent } = makeFakeSocket();
-    handlers.onOpen(ws);
-    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 1, clientId: "cmr", views: [] }));
     const helloOk = sent.find((f) => f.op === "hello.ok");
     expect(helloOk).toBeDefined();
     if (helloOk && helloOk.op === "hello.ok") {
-      expect(typeof helloOk.maxRev).toBe("number");
-      expect(helloOk.maxRev).toBeGreaterThanOrEqual(0);
-      // Fake repo derives maxRev from item seq; 7 was added above.
-      expect(helloOk.maxRev).toBe(7);
+      expect(helloOk.v).toBe(1); // WS_PROTOCOL_VERSION constant
+      expect(helloOk.maxRev).toBe(42);
+      expect(typeof helloOk.serverTime).toBe("string");
     }
   });
 
-  test("v4 query op returns query.ok with rows + maxRev", async () => {
+  test("query op returns query.ok with rows + maxRev", async () => {
     const repo = makeFakeRepo();
-    repo.addEvent("v3:1", TEXT_ITEM, 3);
+    repo.setMaxRev(99);
+    repo.setQueryRows([{ x: 1 }, { x: 2 }]);
     const handlers = makeHandlers({ repo });
     const { ws, sent } = makeFakeSocket();
     handlers.onOpen(ws);
-    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 1, clientId: "cq", views: [] }));
-    sent.length = 0;
-
     await handlers.onMessage(
       ws,
       JSON.stringify({ op: "query", reqId: "q1", sql: "select 1 as x" }),
     );
 
-    const reply = sent.find((f) => f.op === "query.ok");
-    expect(reply).toBeDefined();
-    if (reply && reply.op === "query.ok") {
-      expect(reply.reqId).toBe("q1");
-      expect(reply.rows).toEqual([{ x: 1 }]);
-      expect(typeof reply.maxRev).toBe("number");
-      expect(reply.maxRev).toBe(3);
+    const ok = sent.find((f) => f.op === "query.ok");
+    expect(ok).toBeDefined();
+    if (ok && ok.op === "query.ok") {
+      expect(ok.reqId).toBe("q1");
+      expect(ok.rows.length).toBe(2);
+      expect(ok.rowCount).toBe(2);
+      expect(ok.maxRev).toBe(99);
+      expect(ok.truncated).toBe(false);
     }
-    // v3 query.run.ok must NOT be emitted for the v4 op.
-    expect(sent.find((f) => f.op === "query.run.ok")).toBeUndefined();
   });
 
-  test("v3 query.run still works in parallel and now also carries maxRev", async () => {
+  test("query.run alias returns query.run.ok with maxRev (kept for DevTools)", async () => {
     const repo = makeFakeRepo();
-    repo.addEvent("v3:1", TEXT_ITEM, 5);
+    repo.setMaxRev(7);
+    repo.setQueryRows([{ y: "ok" }]);
     const handlers = makeHandlers({ repo });
     const { ws, sent } = makeFakeSocket();
     handlers.onOpen(ws);
-    await handlers.onMessage(ws, JSON.stringify({ op: "hello", v: 1, clientId: "cqr", views: [] }));
-    sent.length = 0;
-
     await handlers.onMessage(
       ws,
-      JSON.stringify({ op: "query.run", reqId: "qr1", sql: "select 1 as x" }),
+      JSON.stringify({ op: "query.run", reqId: "r1", sql: "select 'ok' as y" }),
     );
-    const reply = sent.find((f) => f.op === "query.run.ok");
-    expect(reply).toBeDefined();
-    if (reply && reply.op === "query.run.ok") {
-      expect(reply.reqId).toBe("qr1");
-      expect(reply.maxRev).toBe(5);
+
+    const ok = sent.find((f) => f.op === "query.run.ok");
+    expect(ok).toBeDefined();
+    if (ok && ok.op === "query.run.ok") {
+      expect(ok.reqId).toBe("r1");
+      expect(ok.rows[0]?.y).toBe("ok");
+      expect(ok.maxRev).toBe(7);
     }
   });
 
-  test("broadcastTick fans out to every open socket", () => {
+  test("query failure surfaces as query.err with reason", async () => {
     const repo = makeFakeRepo();
+    repo.setQueryShouldThrow(new Error("syntax error"));
     const handlers = makeHandlers({ repo });
+    const { ws, sent } = makeFakeSocket();
+    handlers.onOpen(ws);
+    await handlers.onMessage(
+      ws,
+      JSON.stringify({ op: "query", reqId: "qerr", sql: "boom" }),
+    );
+
+    const err = sent.find((f) => f.op === "query.err");
+    expect(err).toBeDefined();
+    if (err && err.op === "query.err") {
+      expect(err.reqId).toBe("qerr");
+      expect(err.error).toContain("syntax error");
+    }
+  });
+
+  test("ping returns pong", async () => {
+    const handlers = makeHandlers({ repo: makeFakeRepo() });
+    const { ws, sent } = makeFakeSocket();
+    handlers.onOpen(ws);
+    await handlers.onMessage(ws, JSON.stringify({ op: "ping" }));
+    expect(sent.find((f) => f.op === "pong")).toBeDefined();
+  });
+
+  test("broadcastTick fans out tick to every open socket", () => {
+    const handlers = makeHandlers({ repo: makeFakeRepo() });
     const a = makeFakeSocket();
     const b = makeFakeSocket();
     handlers.onOpen(a.ws);
     handlers.onOpen(b.ws);
 
-    handlers.broadcastTick(42, [1, 2, 3]);
-    const aTick = a.sent.find((f) => f.op === "tick");
-    const bTick = b.sent.find((f) => f.op === "tick");
-    expect(aTick).toBeDefined();
-    expect(bTick).toBeDefined();
-    if (aTick && aTick.op === "tick") {
-      expect(aTick.maxRev).toBe(42);
-      expect(aTick.files).toEqual([1, 2, 3]);
-    }
+    handlers.broadcastTick(123, [10, 20]);
 
-    // Without files (large batch) — frame should omit `files`.
-    a.sent.length = 0;
-    handlers.broadcastTick(99);
-    const aTick2 = a.sent.find((f) => f.op === "tick");
-    expect(aTick2).toBeDefined();
-    if (aTick2 && aTick2.op === "tick") {
-      expect(aTick2.maxRev).toBe(99);
-      expect(aTick2.files).toBeUndefined();
+    for (const sock of [a, b]) {
+      const tick = sock.sent.find((f) => f.op === "tick");
+      expect(tick).toBeDefined();
+      if (tick && tick.op === "tick") {
+        expect(tick.maxRev).toBe(123);
+        expect(tick.files).toEqual([10, 20]);
+      }
     }
   });
 
-  test("close marks socket and stops draining", async () => {
-    const repo = makeFakeRepo();
-    const handlers = makeHandlers({ repo });
-    const { ws } = makeFakeSocket();
+  test("broadcastTick without files omits the field", () => {
+    const handlers = makeHandlers({ repo: makeFakeRepo() });
+    const { ws, sent } = makeFakeSocket();
     handlers.onOpen(ws);
-    handlers.onClose(ws);
-    expect(ws.data.closed).toBe(true);
-    repo.addEvent("v3:1", TEXT_ITEM, 1);
-    handlers.notifyNewEvents(1);
-    // No throw is enough; draining is no-op when closed.
+    handlers.broadcastTick(456);
+
+    const tick = sent.find((f) => f.op === "tick");
+    expect(tick).toBeDefined();
+    if (tick && tick.op === "tick") {
+      expect(tick.maxRev).toBe(456);
+      expect(tick.files).toBeUndefined();
+    }
+  });
+
+  test("close removes socket from broadcast set", () => {
+    const handlers = makeHandlers({ repo: makeFakeRepo() });
+    const a = makeFakeSocket();
+    const b = makeFakeSocket();
+    handlers.onOpen(a.ws);
+    handlers.onOpen(b.ws);
+    handlers.onClose(a.ws);
+
+    handlers.broadcastTick(1);
+
+    expect(a.sent.find((f) => f.op === "tick")).toBeUndefined();
+    expect(b.sent.find((f) => f.op === "tick")).toBeDefined();
+  });
+
+  test("unknown op is silently ignored (no crash)", async () => {
+    const handlers = makeHandlers({ repo: makeFakeRepo() });
+    const { ws, sent } = makeFakeSocket();
+    handlers.onOpen(ws);
+    await handlers.onMessage(ws, JSON.stringify({ op: "no.such.op", reqId: "x" }));
+    expect(sent.length).toBe(0);
+  });
+
+  test("malformed JSON is silently dropped", async () => {
+    const handlers = makeHandlers({ repo: makeFakeRepo() });
+    const { ws, sent } = makeFakeSocket();
+    handlers.onOpen(ws);
+    await handlers.onMessage(ws, "this is not json {{{");
+    expect(sent.length).toBe(0);
   });
 });

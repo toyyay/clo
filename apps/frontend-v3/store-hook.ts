@@ -1,33 +1,16 @@
 // Singleton store + React bindings.
 //
-// Selects between the v3 (`view.snapshot/batch`) and v4 (`tick + query`)
-// protocol stores at boot. Default is v3; flip via either:
-//   • localStorage key `chatview-v3:protocol` set to "v4"
-//   • URL query param `?v4` (any value, even empty)
-//
-// The two stores expose the same Store interface so UI components don't care.
+// v4 protocol only: the WS link carries `tick {maxRev, files?}` for liveness
+// and `query` / `query.ok` for read RPCs. No predicate / snapshot / batch
+// state on either side. See views-store-v4.ts for the implementation.
 import { useSyncExternalStore } from "react";
-import { createStore as createStoreV3 } from "./views-store";
-import { createStore as createStoreV4 } from "./views-store-v4";
-import type { Store, StoreState } from "./views-store";
+import { createStore } from "./views-store-v4";
+import type { Store, StoreState } from "./views-store-v4";
 
 let _store: Store | null = null;
 
-function pickProtocol(): "v3" | "v4" {
-  try {
-    const url = new URL(window.location.href);
-    if (url.searchParams.has("v4")) return "v4";
-  } catch {}
-  try {
-    if (localStorage.getItem("chatview-v3:protocol") === "v4") return "v4";
-  } catch {}
-  return "v3";
-}
-
 export function getStore(): Store {
-  if (!_store) {
-    _store = pickProtocol() === "v4" ? (createStoreV4() as unknown as Store) : createStoreV3();
-  }
+  if (!_store) _store = createStore();
   return _store;
 }
 

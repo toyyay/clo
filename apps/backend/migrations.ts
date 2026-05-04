@@ -987,6 +987,28 @@ create unique index idx_v3_chat_last_render_pk on v3_chat_last_render (source_fi
 `.trim(),
     transaction: false,
   },
+  {
+    id: "0018",
+    name: "drop_v3_view_state",
+    sql: `
+-- v4 protocol drops every server-side view subscription primitive. The
+-- frontend now drives chat-list, search, history-range and per-project
+-- pagination through raw \`query\` ops; the server holds zero per-client
+-- view state.
+--
+-- Tables being removed:
+--   • client_views          — predicate spec per (client_id, view_id)
+--   • client_view_cursors   — last-acked cursor per (client_id, view_id)
+--   • client_view_chats     — chat membership cache used by chat.added/removed
+--
+-- All three are pure-derived state — wiping them is safe even if a v3 client
+-- somehow reconnects (it just won't get a snapshot, which is the desired
+-- behaviour post-v4 rollout).
+drop table if exists client_view_chats;
+drop table if exists client_view_cursors;
+drop table if exists client_views;
+`.trim(),
+  },
 ];
 
 export function migrationsEnabled(env = process.env) {
