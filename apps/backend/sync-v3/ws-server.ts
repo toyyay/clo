@@ -205,6 +205,14 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
       if (delta.items.length === 0) {
         if (delta.bytesRemaining === 0) {
           send(ws, { op: "view.idle", viewId, cursor: since });
+          telemetry.log({
+            clientId: ws.data.clientId ?? null,
+            viewId,
+            event: "view.idle",
+            level: "debug",
+            durationMs: Date.now() - t0,
+            payload: { cursor: since },
+          });
         }
         ws.data.dirty.delete(viewId);
         return;
