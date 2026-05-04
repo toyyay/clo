@@ -20,9 +20,13 @@
 // а не здесь. Каждое нормализованное событие производит независимые items.
 
 import type { RenderItem } from "../../../packages/sync-v3/contracts";
+import { parseMarkdownBlocks } from "./markdown";
 
 const MAX_TOOL_RESULT_TEXT = 4096;
 const MAX_TOOL_INPUT_BYTES = 4096;
+// Skip markdown parsing for very long messages — keeps the ingest path fast
+// and the payload small. Client falls back to plain-text rendering of `txt`.
+const MAX_MARKDOWN_BYTES = 32_768;
 
 export type EventLike = {
   /** id из agent_normalized_events */
@@ -207,7 +211,15 @@ function appendText(
   if (!role || !readable.trim()) return;
   const p = nextPart();
   const r = role === "assistant" ? ("a" as const) : ("u" as const);
-  const payload = { k: "t" as const, id: event.id, p, r, txt: readable };
+  // Pre-parse markdown into blocks so the client doesn't need react-markdown.
+  // For oversize text we skip parsing (the client renders txt as plain text).
+  let blocks: RenderItem extends { k: "t"; blocks?: infer B } ? B : undefined;
+  if (Buffer.byteLength(readable, "utf8") <= MAX_MARKDOWN_BYTES) {
+    const parsed = parseMarkdownBlocks(readable);
+    if (parsed.length > 0) blocks = parsed as any;
+  }
+  const payload: any = { k: "t", id: event.id, p, r, txt: readable };
+  if (blocks) payload.blocks = blocks;
   out.push({
     source_event_id: event.id,
     part_index: p,

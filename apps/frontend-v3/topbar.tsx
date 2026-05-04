@@ -1,14 +1,16 @@
 // Top bar — visually echoes the legacy client (☰ burger, chat title +
-// metadata, sync pill, ⋯ menu) so users coming from / before the swap
-// don't lose orientation.
+// metadata, sync pill, Aa, ⋯ menu).
 
 import { useEffect, useState } from "react";
 import { useStore, useStoreState } from "./store-hook";
-import { formatRelative } from "./format";
+import { formatBytes, formatRelative } from "./format";
+import { SettingsPopover, useVisualSettings } from "./settings";
 
 export function Topbar({ onToggleSidebar, sidebarOpen }: { onToggleSidebar: () => void; sidebarOpen: boolean }) {
   const state = useStoreState();
   const activeChat = state.activeChat ? state.visibleChats.get(state.activeChat) : null;
+  const visual = useVisualSettings();
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   return (
     <header className="topbar">
@@ -40,9 +42,41 @@ export function Topbar({ onToggleSidebar, sidebarOpen }: { onToggleSidebar: () =
         )}
       </div>
 
+      <SyncProgress />
       <SyncPill />
+
+      <button
+        className="icon-btn settings-button"
+        onClick={() => setSettingsOpen((v) => !v)}
+        aria-label="Display settings"
+        title="Display settings"
+      >
+        Aa
+      </button>
+      {settingsOpen && (
+        <SettingsPopover
+          theme={visual.theme}
+          fontScale={visual.fontScale}
+          onThemeChange={visual.setTheme}
+          onFontScaleChange={visual.setFontScale}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
+
       <AppMenu />
     </header>
+  );
+}
+
+function SyncProgress() {
+  const state = useStoreState();
+  let bytes = 0;
+  for (const v of state.pendingBytes.values()) bytes += v;
+  if (bytes === 0) return null;
+  return (
+    <div className="sync-progress" title={`${formatBytes(bytes)} pending`}>
+      ⤓ {formatBytes(bytes)}
+    </div>
   );
 }
 
@@ -51,28 +85,17 @@ function SyncPill() {
   const kind = state.status.kind;
   const label = kind === "open" ? "ok" : kind === "connecting" ? "…" : kind === "reconnecting" ? "rec" : kind === "closed" ? "off" : "—";
   return (
-    <div className={`sync-pill sync-pill-${kind}`} title={statusTooltip(state)}>
+    <div className={`sync-pill sync-pill-${kind}`} title={`status: ${kind} · views: ${state.views.size}`}>
       <span className="sync-dot" />
       <span className="sync-label">{label}</span>
     </div>
   );
 }
 
-function statusTooltip(state: ReturnType<typeof useStoreState>) {
-  const parts: string[] = [];
-  parts.push(`status: ${state.status.kind}`);
-  parts.push(`views: ${state.views.size}`);
-  let bytes = 0;
-  for (const v of state.pendingBytes.values()) bytes += v;
-  if (bytes > 0) parts.push(`pending: ${formatBytes(bytes)}`);
-  return parts.join("\n");
-}
-
 function AppMenu() {
   const store = useStore();
   const [open, setOpen] = useState(false);
 
-  // Close on outside click.
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => {
@@ -133,11 +156,4 @@ function AppMenu() {
       )}
     </>
   );
-}
-
-function formatBytes(b: number): string {
-  if (!b) return "0";
-  if (b < 1024) return `${b} B`;
-  if (b < 1024 * 1024) return `${Math.round(b / 1024)} KB`;
-  return `${(b / 1024 / 1024).toFixed(1)} MB`;
 }
