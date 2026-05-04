@@ -265,9 +265,24 @@ export function createStore(): Store {
           return rows.map((r) => ({ viewId: r.viewId, specHash: r.specHash, cursor: r.cursor }));
         },
         async drainOutbox(): Promise<ClientFrame[]> {
+          // 1. Existing offline mutations (excludes/includes/upserts queued offline).
           const rows = await idb.listMutations();
           await idb.deleteMutations(rows.map((r) => r.id));
-          return rows.map((r) => r.op as ClientFrame);
+          const queued: ClientFrame[] = rows.map((r) => r.op as ClientFrame);
+
+          // 2. Self-healing reconnect: always re-upsert every view we have in
+          //    IDB. Server's persistView is idempotent (INSERT ... ON CONFLICT
+          //    DO UPDATE), so this is safe + ensures client_views and the
+          //    client's IDB state stay in sync — fixes the case where server
+          //    knows the cursor but lost the spec (or it was never persisted).
+          //    Cost: one upsert per view per reconnect (typically 1-3).
+          const storedViews = await idb.listViews();
+          for (const row of storedViews) {
+            // Skip if outbox already has an upsert for this view — avoid duplicates.
+            if (queued.some((f) => f.op === "view.upsert" && f.view.id === row.viewId)) continue;
+            queued.push({ op: "view.upsert", view: row.spec });
+          }
+          return queued;
         },
       });
       ws.start();

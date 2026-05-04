@@ -288,6 +288,12 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
         });
         return;
       }
+      // Touch session liveness on every received frame, not just on ack.
+      // Otherwise a quiet view (cursor up-to-date, only view.idle from server,
+      // no client acks) keeps `last_seen_at` stale.
+      if (ws.data.sessionId !== null) {
+        telemetry.recordSessionPing(ws.data.sessionId).catch(() => {});
+      }
       try {
         await handleFrame(ws, frame);
       } catch (err) {
