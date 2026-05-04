@@ -149,6 +149,35 @@ body {
   border-bottom: 1px solid var(--border);
   background: var(--bg-surface);
   min-width: 0;
+  position: relative;
+}
+.backlog-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  overflow: hidden;
+  background: transparent;
+  pointer-events: none;
+}
+.backlog-bar::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 35%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--text-link) 50%,
+    transparent 100%
+  );
+  animation: backlog-slide 1.4s linear infinite;
+}
+@keyframes backlog-slide {
+  0%   { left: -35%; }
+  100% { left: 100%; }
 }
 .topbar-burger { font-size: 16px; }
 .topbar-center {
@@ -404,7 +433,14 @@ body {
 }
 
 .tree { padding: 4px 0; flex: 1; }
-.empty-tree { padding: 12px; color: var(--text-dim); font-size: calc(13px * var(--font-scale)); }
+.empty-tree {
+  padding: 12px;
+  color: var(--text-dim);
+  font-size: calc(13px * var(--font-scale));
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 
 .group-row { display: flex; flex-direction: column; }
 .group-toggle {

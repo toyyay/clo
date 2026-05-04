@@ -138,7 +138,14 @@ export function Sidebar({ visible }: { visible: boolean }) {
               onLoadChats={loadChatsForProject}
             />
           ))}
-          {!hostNodes.length && <div className="empty-tree">No data yet — connecting…</div>}
+          {!hostNodes.length && (
+            <div className="empty-tree">
+              <span className="dots-spinner" aria-hidden="true">
+                <span /><span /><span />
+              </span>
+              <span>{state.status.kind === "open" ? "Loading chats…" : "Connecting…"}</span>
+            </div>
+          )}
         </div>
       )}
     </aside>

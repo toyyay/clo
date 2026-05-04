@@ -65,8 +65,26 @@ export function Topbar({ onToggleSidebar, sidebarOpen }: { onToggleSidebar: () =
       )}
 
       <AppMenu />
+      <BacklogBar />
     </header>
   );
+}
+
+/** Thin indeterminate progress bar painted at the bottom edge of the topbar
+ *  while there's pending sync backlog or we're in the middle of (re)connecting.
+ *  Tells the user "the app isn't frozen, data is still flowing" without
+ *  needing them to open the diagnostics popover. */
+function BacklogBar() {
+  const state = useStoreState();
+  let pending = 0;
+  for (const v of state.pendingBytes.values()) pending += v;
+  const kind = state.status.kind;
+  const visible =
+    kind === "connecting" ||
+    kind === "reconnecting" ||
+    (kind === "open" && pending > 16_384);
+  if (!visible) return null;
+  return <div className="backlog-bar" aria-hidden="true" />;
 }
 
 function SyncProgress() {
