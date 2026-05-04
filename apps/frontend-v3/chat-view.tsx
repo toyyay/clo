@@ -16,6 +16,9 @@ const NEAR_BOTTOM_PX = 200;
 
 export function ChatView() {
   const state = useStoreState();
+  if (state.loadingChat && (!state.activeChat || !state.activeWindow)) {
+    return <ChatSkeleton chatId={state.loadingChat} />;
+  }
   if (!state.activeChat || !state.activeWindow) {
     return <ChatPlaceholder />;
   }
@@ -33,6 +36,60 @@ function ChatPlaceholder() {
           : "Select a chat from the sidebar."}
       </div>
     </main>
+  );
+}
+
+function ChatSkeleton({ chatId }: { chatId: string }) {
+  const state = useStoreState();
+  const meta = state.visibleChats.get(chatId);
+  return (
+    <main className="chat-view">
+      <div className="chat-scroll">
+        <div className="chat-list chat-skeleton-list">
+          <SkeletonRow role="user" lines={2} />
+          <SkeletonRow role="assistant" lines={4} />
+          <SkeletonTool />
+          <SkeletonRow role="assistant" lines={3} />
+          <SkeletonRow role="user" lines={1} />
+        </div>
+      </div>
+      <div className="composer">
+        <textarea
+          className="composer-input"
+          disabled
+          placeholder={`Loading ${meta?.title ?? chatId}…`}
+          rows={2}
+        />
+        <button className="composer-send" disabled>Send</button>
+      </div>
+    </main>
+  );
+}
+
+function SkeletonRow({ role, lines }: { role: "user" | "assistant"; lines: number }) {
+  return (
+    <div className={`msg ${role === "assistant" ? "msg-asst" : "msg-user"} msg-skeleton`}>
+      <div className="msg-role">{role}</div>
+      <div className="msg-body">
+        {Array.from({ length: lines }).map((_, i) => (
+          <div key={i} className="skeleton-line" style={{ width: `${85 - (i * 9) % 35}%` }} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SkeletonTool() {
+  return (
+    <div className="tool tool-use msg-skeleton">
+      <div className="tool-head">
+        <span className="skeleton-line" style={{ width: 80, height: 12 }} />
+      </div>
+      <div className="tool-input">
+        <div className="skeleton-line" style={{ width: "70%" }} />
+        <div className="skeleton-line" style={{ width: "55%" }} />
+      </div>
+    </div>
   );
 }
 

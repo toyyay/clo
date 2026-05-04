@@ -570,6 +570,29 @@ body {
   font-size: calc(13px * var(--font-scale));
 }
 
+/* skeleton placeholders shown while the chat is opening */
+.chat-skeleton-list { gap: 10px; }
+.msg-skeleton { opacity: 0.7; pointer-events: none; }
+.msg-skeleton .msg-role { color: var(--text-dim); }
+.skeleton-line {
+  display: block;
+  height: 14px;
+  margin: 6px 0;
+  border-radius: 4px;
+  background: linear-gradient(
+    90deg,
+    var(--bg-surface-hover) 0%,
+    var(--border) 40%,
+    var(--bg-surface-hover) 80%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.4s linear infinite;
+}
+@keyframes skeleton-shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
 /* messages */
 .msg { padding: 8px 12px; border-radius: 8px; }
 .msg-user { background: var(--bg-msg-user); }

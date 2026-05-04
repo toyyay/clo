@@ -220,6 +220,7 @@ Bun.serve<WsData>({
     "/v2": index,
     "/v2/": index,
     "/service-worker.js": async (req: Request) => serviceWorkerResponse(req),
+    "/sw-v3.js": async (req: Request) => v3ServiceWorkerResponse(req),
     "/manifest.webmanifest": (req: Request) => webManifestResponse(req),
     "/app-icon.svg": () => appIconResponse(),
     "/api/health": () => json({ ok: true, commit_sha: gitSha }),
@@ -1234,6 +1235,19 @@ function requestOrigin(req: Request) {
 async function serviceWorkerResponse(req: Request) {
   if (req.method !== "GET") return text("method not allowed", 405);
   const source = await readFile(new URL("../frontend/service-worker.js", import.meta.url), "utf8");
+  const body = source.replaceAll("__CHATVIEW_BUILD_SHA__", gitSha);
+  return new Response(body, {
+    headers: {
+      "cache-control": "no-store, no-cache, must-revalidate",
+      "content-type": "application/javascript; charset=utf-8",
+      "service-worker-allowed": "/",
+    },
+  });
+}
+
+async function v3ServiceWorkerResponse(req: Request) {
+  if (req.method !== "GET") return text("method not allowed", 405);
+  const source = await readFile(new URL("../frontend-v3/sw.js", import.meta.url), "utf8");
   const body = source.replaceAll("__CHATVIEW_BUILD_SHA__", gitSha);
   return new Response(body, {
     headers: {

@@ -45,6 +45,9 @@ export type StoreState = {
   visibleChats: Map<string, ChatIndex>;
   activeChat: string | null;
   activeWindow: ActiveChatWindow | null;
+  /** Chat the user clicked on but whose tail hasn't loaded yet. Used to show
+   *  skeleton placeholders instead of an empty area. */
+  loadingChat: string | null;
   /** Live WS link metrics — see ws-client WsLink. */
   link: WsLink;
   /** Last per-view ack progress, used to estimate throughput. */
@@ -88,6 +91,7 @@ export function createStore(): Store {
     visibleChats: new Map(),
     activeChat: null,
     activeWindow: null,
+    loadingChat: null,
     link: { pingRttMs: null, pingMeasuredAt: null, lastFrameAt: null, lastSentAt: null, bytesIn: 0, bytesOut: 0 },
     lastBatchAt: new Map(),
     throughputBps: 0,
@@ -393,6 +397,8 @@ export function createStore(): Store {
       // another chat (or closes this one) before our async work finishes,
       // we silently drop the result instead of polluting the next chat.
       const token = ++activeChatToken;
+      // Show skeleton immediately — even before IDB read returns.
+      commit({ loadingChat: chatId, activeChat: null, activeWindow: null });
 
       // 1. IDB сначала — мгновенный first-frame для офлайна и быстрого старта.
       let tailRows = await idb.getChatTail(chatId, tailLimit);
@@ -434,12 +440,12 @@ export function createStore(): Store {
         hasOlder: tailRows.length === tailLimit,
         hasNewer: false,
       };
-      commit({ activeChat: chatId, activeWindow: window });
+      commit({ activeChat: chatId, activeWindow: window, loadingChat: null });
     },
 
     closeActiveChat() {
       activeChatToken += 1;
-      commit({ activeChat: null, activeWindow: null });
+      commit({ activeChat: null, activeWindow: null, loadingChat: null });
     },
 
     async loadOlder(limit = HISTORY_PAGE) {

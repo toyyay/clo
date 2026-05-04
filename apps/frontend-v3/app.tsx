@@ -38,6 +38,7 @@ export function App() {
   useEffect(() => {
     const clientId = ensureClientId();
     void store.start({ url: makeWsUrl(), clientId });
+    void registerServiceWorker();
     return () => store.stop();
   }, [store]);
 
@@ -96,6 +97,17 @@ function BuildBadge() {
 function makeWsUrl(): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${location.host}/api/v3/ws`;
+}
+
+async function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) return;
+  try {
+    // The legacy /service-worker.js is now a kill-switch — it self-unregisters
+    // on activate. After it does, our /sw-v3.js takes over scope "/".
+    await navigator.serviceWorker.register("/sw-v3.js", { scope: "/" });
+  } catch (err) {
+    console.warn("[sync-v3] service worker register failed", err);
+  }
 }
 
 function ensureClientId(): string {
