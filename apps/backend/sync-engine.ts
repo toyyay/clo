@@ -370,24 +370,33 @@ export async function handleAgentAppend(req: Request, sql: any) {
         `;
         acceptedEvents++;
 
-        // sync-v3: write pre-rendered items in the same tx. If this throws,
-        // the whole append is rolled back which is the desired behavior — we
-        // don't want normalized events to land without their render rows.
+        // sync-v3: write pre-rendered items in the same tx. We intentionally
+        // SWALLOW errors here — the legacy ingest path is the source of truth
+        // for normalized events, and a render-pipeline regression must NOT
+        // break ingestion. Render rows can be backfilled from normalized
+        // events at any time via scripts/backfill-render-items.ts.
         const inserted = insertedRows[0];
         if (inserted) {
-          await writeRenderItemsForEvent(tx, {
-            eventId: Number(inserted.id),
-            syncRevision: Number(inserted.sync_revision),
-            sourceFileId: Number(sourceRows[0].id),
-            sourceGeneration: chunk.sourceGeneration,
-            agentId: agent.agentId,
-            provider: source.provider,
-            projectKey: sourceProjectKey,
-            normalized: event.normalized,
-            raw: (event as any).raw,
-            role: event.role ?? null,
-            eventType: event.eventType ?? null,
-          });
+          try {
+            await writeRenderItemsForEvent(tx, {
+              eventId: Number(inserted.id),
+              syncRevision: Number(inserted.sync_revision),
+              sourceFileId: Number(sourceRows[0].id),
+              sourceGeneration: chunk.sourceGeneration,
+              agentId: agent.agentId,
+              provider: source.provider,
+              projectKey: sourceProjectKey,
+              normalized: event.normalized,
+              raw: (event as any).raw,
+              role: event.role ?? null,
+              eventType: event.eventType ?? null,
+            });
+          } catch (renderErr) {
+            console.warn("[sync-v3] writeRenderItemsForEvent failed", {
+              eventId: Number(inserted.id),
+              error: renderErr instanceof Error ? renderErr.message : String(renderErr),
+            });
+          }
         }
       }
     }
