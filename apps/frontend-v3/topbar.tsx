@@ -74,25 +74,22 @@ export function Topbar({ onToggleSidebar, sidebarOpen }: { onToggleSidebar: () =
  *  while there's pending sync backlog or we're in the middle of (re)connecting. */
 function BacklogBar() {
   const state = useStoreState();
-  let pending = 0;
-  for (const v of state.pendingBytes.values()) pending += v;
+  // v4: there is no per-view pending-bytes meter (server doesn't track view
+  // state). Show the indeterminate bar only while the WS is mid-handshake.
   const kind = state.status.kind;
-  const visible =
-    kind === "connecting" ||
-    kind === "reconnecting" ||
-    (kind === "open" && pending > 16_384);
-  if (!visible) return null;
+  if (kind !== "connecting" && kind !== "reconnecting") return null;
   return <div className="backlog-bar" aria-hidden="true" />;
 }
 
 function SyncProgress() {
   const state = useStoreState();
-  let bytes = 0;
-  for (const v of state.pendingBytes.values()) bytes += v;
-  if (bytes === 0) return null;
+  // v4: surface live throughput while data is actively flowing. Hidden when
+  // throughput drops to ~zero so the topbar doesn't carry a phantom chip.
+  const bps = Math.round(state.throughputBps ?? 0);
+  if (bps < 1024) return null;
   return (
-    <div className="sync-progress" title={`${formatBytes(bytes)} pending`}>
-      ⤓ {formatBytes(bytes)}
+    <div className="sync-progress" title={`${formatBytes(bps)}/s incoming`}>
+      ⤓ {formatBytes(bps)}/s
     </div>
   );
 }
@@ -101,9 +98,10 @@ function SyncPill() {
   const state = useStoreState();
   const [open, setOpen] = useState(false);
   const kind = state.status.kind;
-  let totalPending = 0;
-  for (const v of state.pendingBytes.values()) totalPending += v;
-  const stuck = kind === "open" && totalPending > 0 && state.link.lastFrameAt !== null && (Date.now() - state.link.lastFrameAt) > 20_000;
+  // v4 stuck-detect: no frame in 20s while we believe we're open. Per-view
+  // pending bytes don't exist anymore so we can't gate on them; the heuristic
+  // is now purely time-since-last-frame.
+  const stuck = kind === "open" && state.link.lastFrameAt !== null && Date.now() - state.link.lastFrameAt > 20_000;
   const label = stuck ? "?!" : kind === "open" ? "ok" : kind === "connecting" ? "…" : kind === "reconnecting" ? "rec" : kind === "closed" ? "off" : "—";
   const pillKind = stuck ? "stuck" : kind;
   return (

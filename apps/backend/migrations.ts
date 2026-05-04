@@ -1009,6 +1009,32 @@ drop table if exists client_view_cursors;
 drop table if exists client_views;
 `.trim(),
   },
+  {
+    id: "0019",
+    name: "drop_wasted_indexes",
+    sql: `
+-- Indexes a 5-agent perf review (2026-05-04) flagged as never-scanned in
+-- the v4 read patterns. Each one was useful for v3 query shapes that no
+-- longer exist; dropping reclaims disk and removes write amplification on
+-- the materialised-view refresh path.
+--
+--   • idx_render_items_agent_provider_project — v3 grouped chats by
+--     (agent, provider, project) before snapshot; v4 always selects by
+--     source_file_id.
+--   • idx_v3_chat_index_full_host          — v4 never groups by host alone.
+--   • idx_v3_chat_search_seen              — FTS query joins by id, doesn't
+--     scan by last_seen_at.
+--   • idx_v3_group_aggregates_parent       — frontend reads parent links
+--     from IDB after the boot UNION; the SQL never filters by parent_key.
+--   • idx_v3_group_aggregates_level        — same: level is in the SELECT
+--     output, never in WHERE.
+drop index if exists idx_render_items_agent_provider_project;
+drop index if exists idx_v3_chat_index_full_host;
+drop index if exists idx_v3_chat_search_seen;
+drop index if exists idx_v3_group_aggregates_parent;
+drop index if exists idx_v3_group_aggregates_level;
+`.trim(),
+  },
 ];
 
 export function migrationsEnabled(env = process.env) {

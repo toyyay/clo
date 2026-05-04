@@ -768,9 +768,26 @@ export function createStore(): Store {
         clientId: opts.clientId,
         onStatus: (s) => {
           // On reconnect, helloOk needs to be re-armed; sidebar will re-pull
-          // after hello.ok.
+          // after hello.ok arrives.
           if (s.kind !== "open") helloOk = false;
           commit({ status: s });
+          // Watchdog: if WS opens but hello.ok never arrives within 5 s,
+          // tear the link down to force a reconnect — otherwise the entire
+          // UI sits frozen on a wedged server with no recovery path.
+          if (s.kind === "open") {
+            setTimeout(() => {
+              if (helloOk) return;
+              if (!ws) return;
+              if (state.status.kind !== "open") return;
+              console.warn("[sync-v4] hello.ok timeout — forcing reconnect");
+              try {
+                ws.stop();
+              } catch {}
+              try {
+                ws?.start();
+              } catch {}
+            }, 5000);
+          }
         },
         onFrame: (frame) => {
           // Track throughput (same logic as v3 store).

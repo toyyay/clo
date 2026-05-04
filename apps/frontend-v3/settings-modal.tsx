@@ -113,9 +113,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     location.reload();
   };
 
-  let pending = 0;
-  for (const v of state.pendingBytes.values()) pending += v;
   const lastFrame = state.link.lastFrameAt ? formatRelative(new Date(state.link.lastFrameAt).toISOString()) : "never";
+  const throughputBps = Math.round(state.throughputBps ?? 0);
 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
@@ -144,8 +143,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               <b>{state.status.kind}</b>
               <span>Last frame</span>
               <b>{lastFrame}</b>
-              <span>Pending</span>
-              <b>{formatBytes(pending)}</b>
+              <span>Throughput</span>
+              <b>{throughputBps > 0 ? `${formatBytes(throughputBps)}/s` : "idle"}</b>
               <span>Visible chats</span>
               <b>{state.visibleChats.size.toLocaleString()}</b>
             </div>

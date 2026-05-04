@@ -6,3 +6,4 @@ data/
 .env
 *.dump
 *.sql.gz
+.claude/
