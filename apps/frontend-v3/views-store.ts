@@ -48,6 +48,10 @@ export type StoreState = {
   /** Chat the user clicked on but whose tail hasn't loaded yet. Used to show
    *  skeleton placeholders instead of an empty area. */
   loadingChat: string | null;
+  /** True while loadOlder is in flight for the active chat. Drives the
+   *  "loading earlier messages…" pill above the virtual list so the user
+   *  can tell "thinking" from "nothing more". */
+  loadingOlder: boolean;
   /** Live WS link metrics — see ws-client WsLink. */
   link: WsLink;
   /** Last per-view ack progress, used to estimate throughput. */
@@ -92,6 +96,7 @@ export function createStore(): Store {
     activeChat: null,
     activeWindow: null,
     loadingChat: null,
+    loadingOlder: false,
     link: { pingRttMs: null, pingMeasuredAt: null, lastFrameAt: null, lastSentAt: null, bytesIn: 0, bytesOut: 0 },
     lastBatchAt: new Map(),
     throughputBps: 0,
@@ -451,56 +456,63 @@ export function createStore(): Store {
     async loadOlder(limit = HISTORY_PAGE) {
       const w = state.activeWindow;
       if (!w || !w.hasOlder) return;
+      if (state.loadingOlder) return; // already loading — don't fan out
       const tokenAtStart = activeChatToken;
       const chatIdAtStart = w.chatId;
+      commit({ loadingOlder: true });
 
-      const fromIdb = await idb.getChatRange(chatIdAtStart, {
-        fromSeq: 0,
-        toSeq: w.firstSeq - 1,
-        limit,
-        direction: "prev",
-      });
-      // If user switched chats while we were reading IDB, abort.
-      if (tokenAtStart !== activeChatToken || state.activeChat !== chatIdAtStart) return;
-
-      let items = fromIdb.map((r) => r.item);
-      let firstSeq = fromIdb[0]?.seq ?? w.firstSeq;
-      let hasOlder = fromIdb.length === limit;
-
-      if (fromIdb.length < limit && ws && state.status.kind === "open") {
-        const remaining = limit - fromIdb.length;
-        const serverReply = await requestHistory(ws, historyRequests, {
-          chatId: chatIdAtStart,
-          before: firstSeq,
-          limit: remaining,
+      try {
+        const fromIdb = await idb.getChatRange(chatIdAtStart, {
+          fromSeq: 0,
+          toSeq: w.firstSeq - 1,
+          limit,
+          direction: "prev",
         });
+        // If user switched chats while we were reading IDB, abort.
         if (tokenAtStart !== activeChatToken || state.activeChat !== chatIdAtStart) return;
-        const itemRows: idb.RenderItemRow[] = serverReply.items.map((entry) => ({
-          chatId: chatIdAtStart,
-          seq: entry.seq,
-          itemKey: idb.itemKey(entry.item),
-          item: entry.item,
-          bytes: estimateBytes(entry.item),
-        }));
-        await idb.bulkPutRenderItems(itemRows);
-        if (tokenAtStart !== activeChatToken || state.activeChat !== chatIdAtStart) return;
-        items = [...serverReply.items.map((e) => e.item), ...items];
-        firstSeq = serverReply.items[0]?.seq ?? firstSeq;
-        hasOlder = serverReply.hasOlder;
-      }
 
-      // Final guard before commit.
-      if (tokenAtStart !== activeChatToken || state.activeChat !== chatIdAtStart) return;
-      const stillCurrent = state.activeWindow;
-      if (!stillCurrent || stillCurrent.chatId !== chatIdAtStart) return;
-      commit({
-        activeWindow: {
-          ...stillCurrent,
-          items: [...items, ...stillCurrent.items],
-          firstSeq,
-          hasOlder,
-        },
-      });
+        let items = fromIdb.map((r) => r.item);
+        let firstSeq = fromIdb[0]?.seq ?? w.firstSeq;
+        let hasOlder = fromIdb.length === limit;
+
+        if (fromIdb.length < limit && ws && state.status.kind === "open") {
+          const remaining = limit - fromIdb.length;
+          const serverReply = await requestHistory(ws, historyRequests, {
+            chatId: chatIdAtStart,
+            before: firstSeq,
+            limit: remaining,
+          });
+          if (tokenAtStart !== activeChatToken || state.activeChat !== chatIdAtStart) return;
+          const itemRows: idb.RenderItemRow[] = serverReply.items.map((entry) => ({
+            chatId: chatIdAtStart,
+            seq: entry.seq,
+            itemKey: idb.itemKey(entry.item),
+            item: entry.item,
+            bytes: estimateBytes(entry.item),
+          }));
+          await idb.bulkPutRenderItems(itemRows);
+          if (tokenAtStart !== activeChatToken || state.activeChat !== chatIdAtStart) return;
+          items = [...serverReply.items.map((e) => e.item), ...items];
+          firstSeq = serverReply.items[0]?.seq ?? firstSeq;
+          hasOlder = serverReply.hasOlder;
+        }
+
+        // Final guard before commit.
+        if (tokenAtStart !== activeChatToken || state.activeChat !== chatIdAtStart) return;
+        const stillCurrent = state.activeWindow;
+        if (!stillCurrent || stillCurrent.chatId !== chatIdAtStart) return;
+        commit({
+          activeWindow: {
+            ...stillCurrent,
+            items: [...items, ...stillCurrent.items],
+            firstSeq,
+            hasOlder,
+          },
+        });
+      } finally {
+        // Always clear, even if we early-returned because the user switched chats.
+        commit({ loadingOlder: false });
+      }
     },
 
     async loadGroupChildren(parentKey) {

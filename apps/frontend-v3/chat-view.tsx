@@ -468,6 +468,14 @@ function ActiveChat({ chatId }: { chatId: string }) {
                 : "No items in this chat yet."}
           </div>
         )}
+        {!isEmpty && state.loadingOlder && (
+          <div className="chat-older-loading" aria-live="polite">
+            <span className="dots-spinner" aria-hidden="true">
+              <span /><span /><span />
+            </span>
+            <span>Loading earlier messages…</span>
+          </div>
+        )}
         <div
           ref={containerRef}
           className="chat-list"

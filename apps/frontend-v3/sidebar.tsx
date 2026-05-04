@@ -24,6 +24,11 @@ export function Sidebar({ visible }: { visible: boolean }) {
   const [childrenByParent, setChildrenByParent] = useState<Map<string, GroupNode[]>>(new Map());
   const [chatPagesByGroup, setChatPagesByGroup] = useState<Map<string, ChatIndex[]>>(new Map());
   const [chatHasMoreByGroup, setChatHasMoreByGroup] = useState<Map<string, boolean>>(new Map());
+  /** Group keys whose children are currently being read from IDB. Used to
+   *  show inline "loading…" so the user can tell "thinking" from "empty". */
+  const [loadingChildren, setLoadingChildren] = useState<Set<string>>(new Set());
+  /** Project keys whose chat list is currently being loaded (preview or Show more). */
+  const [loadingChats, setLoadingChats] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState("");
 
   // Boot: load level=1 hosts. Re-run when store gets fresh groups.
@@ -38,10 +43,23 @@ export function Sidebar({ visible }: { visible: boolean }) {
     persistExpanded(next);
 
     if (!childrenByParent.has(key)) {
-      const kids = await store.loadGroupChildren(key);
-      const updated = new Map(childrenByParent);
-      updated.set(key, sortByLastSeen(kids));
-      setChildrenByParent(updated);
+      setLoadingChildren((s) => {
+        const n = new Set(s);
+        n.add(key);
+        return n;
+      });
+      try {
+        const kids = await store.loadGroupChildren(key);
+        const updated = new Map(childrenByParent);
+        updated.set(key, sortByLastSeen(kids));
+        setChildrenByParent(updated);
+      } finally {
+        setLoadingChildren((s) => {
+          const n = new Set(s);
+          n.delete(key);
+          return n;
+        });
+      }
     }
   }, [childrenByParent, expanded, store]);
 
@@ -53,16 +71,29 @@ export function Sidebar({ visible }: { visible: boolean }) {
   }, [expanded]);
 
   const loadChatsForProject = useCallback(async (projectKey: string, append = false) => {
-    const after = append ? chatPagesByGroup.get(projectKey)?.at(-1)?.lastSeenAt : undefined;
-    const next = await store.loadChatPage(projectKey, { afterLastSeenAt: after, limit: PAGE_SIZE });
-    const updatedPages = new Map(chatPagesByGroup);
-    const existing = updatedPages.get(projectKey) ?? [];
-    const merged = append ? [...existing, ...next] : next;
-    updatedPages.set(projectKey, merged);
-    setChatPagesByGroup(updatedPages);
-    const updatedHasMore = new Map(chatHasMoreByGroup);
-    updatedHasMore.set(projectKey, next.length === PAGE_SIZE);
-    setChatHasMoreByGroup(updatedHasMore);
+    setLoadingChats((s) => {
+      const n = new Set(s);
+      n.add(projectKey);
+      return n;
+    });
+    try {
+      const after = append ? chatPagesByGroup.get(projectKey)?.at(-1)?.lastSeenAt : undefined;
+      const next = await store.loadChatPage(projectKey, { afterLastSeenAt: after, limit: PAGE_SIZE });
+      const updatedPages = new Map(chatPagesByGroup);
+      const existing = updatedPages.get(projectKey) ?? [];
+      const merged = append ? [...existing, ...next] : next;
+      updatedPages.set(projectKey, merged);
+      setChatPagesByGroup(updatedPages);
+      const updatedHasMore = new Map(chatHasMoreByGroup);
+      updatedHasMore.set(projectKey, next.length === PAGE_SIZE);
+      setChatHasMoreByGroup(updatedHasMore);
+    } finally {
+      setLoadingChats((s) => {
+        const n = new Set(s);
+        n.delete(projectKey);
+        return n;
+      });
+    }
   }, [chatPagesByGroup, chatHasMoreByGroup, store]);
 
   const searchResults = useSearch(search, state.visibleChats);
@@ -100,6 +131,8 @@ export function Sidebar({ visible }: { visible: boolean }) {
               childrenByParent={childrenByParent}
               chatPagesByGroup={chatPagesByGroup}
               chatHasMoreByGroup={chatHasMoreByGroup}
+              loadingChildren={loadingChildren}
+              loadingChats={loadingChats}
               onExpand={expand}
               onCollapse={collapse}
               onLoadChats={loadChatsForProject}
@@ -135,14 +168,18 @@ type NodeProps = {
   childrenByParent: Map<string, GroupNode[]>;
   chatPagesByGroup: Map<string, ChatIndex[]>;
   chatHasMoreByGroup: Map<string, boolean>;
+  loadingChildren: Set<string>;
+  loadingChats: Set<string>;
   onExpand: (key: string) => void;
   onCollapse: (key: string) => void;
   onLoadChats: (projectKey: string, append?: boolean) => void;
 };
 
 function GroupRow(props: NodeProps) {
-  const { node, expanded, childrenByParent, indent } = props;
+  const { node, expanded, childrenByParent, loadingChildren, indent } = props;
   const isOpen = expanded.has(node.key);
+  const kids = childrenByParent.get(node.key);
+  const isLoading = loadingChildren.has(node.key);
   return (
     <div className={`group-row group-l${node.level}`}>
       <button
@@ -153,6 +190,7 @@ function GroupRow(props: NodeProps) {
         <span className={`caret ${isOpen ? "open" : ""}`}>▶</span>
         <span className="group-label">{node.label}</span>
         <span className="group-meta">
+          {isLoading && <span className="group-loading" aria-label="loading">⋯</span>}
           <span className="group-count">{node.chatCount}</span>
           <span className="group-bytes">{formatBytes(node.approxBytes)}</span>
           {node.lastSeenAt && <span className="group-time">{formatRelative(node.lastSeenAt)}</span>}
@@ -160,7 +198,10 @@ function GroupRow(props: NodeProps) {
       </button>
       {isOpen && (
         <div className="group-children">
-          {(childrenByParent.get(node.key) ?? []).map((child) => (
+          {isLoading && !kids && (
+            <SidebarLoadingRow indent={indent + 1} />
+          )}
+          {(kids ?? []).map((child) => (
             <GroupRow key={child.key} {...props} node={child} indent={indent + 1} />
           ))}
           {node.level === 3 && <ProjectChats {...props} project={node} indent={indent + 1} />}
@@ -171,24 +212,45 @@ function GroupRow(props: NodeProps) {
 }
 
 function ProjectChats(props: NodeProps & { project: GroupNode; indent: number }) {
-  const { project, chatPagesByGroup, chatHasMoreByGroup, onLoadChats, indent } = props;
+  const { project, chatPagesByGroup, chatHasMoreByGroup, loadingChats, onLoadChats, indent } = props;
   const cached = chatPagesByGroup.get(project.key);
   const previewIds = project.topChatIds;
 
   const [preview, setPreview] = useState<ChatIndex[]>([]);
+  const [loadingPreview, setLoadingPreview] = useState(previewIds.length > 0);
   useEffect(() => {
-    void idb.getChatIndexMany(previewIds).then((rows) => setPreview(sortChatsByLastSeen(rows)));
+    if (previewIds.length === 0) {
+      setLoadingPreview(false);
+      return;
+    }
+    setLoadingPreview(true);
+    let cancelled = false;
+    void idb.getChatIndexMany(previewIds).then((rows) => {
+      if (cancelled) return;
+      setPreview(sortChatsByLastSeen(rows));
+      setLoadingPreview(false);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [previewIds.join("|")]);
 
   const list = cached ?? preview;
   const hasMore = chatHasMoreByGroup.get(project.key) ?? (cached === undefined && project.chatCount > preview.length);
+  const isLoading = loadingChats.has(project.key);
 
   return (
     <div className="project-chats">
+      {loadingPreview && list.length === 0 && (
+        <SidebarLoadingRow indent={indent} />
+      )}
       {list.map((chat) => (
         <ChatRow key={chat.chatId} chat={chat} indent={indent} />
       ))}
-      {hasMore && (
+      {isLoading && (
+        <SidebarLoadingRow indent={indent} label="Loading chats…" />
+      )}
+      {hasMore && !isLoading && (
         <button
           className="show-more"
           onClick={() => onLoadChats(project.key, !!cached)}
@@ -197,6 +259,21 @@ function ProjectChats(props: NodeProps & { project: GroupNode; indent: number })
           {cached ? "Show more" : `Show all ${project.chatCount}`}
         </button>
       )}
+    </div>
+  );
+}
+
+function SidebarLoadingRow({ indent, label = "Loading…" }: { indent: number; label?: string }) {
+  return (
+    <div
+      className="sidebar-loading-row"
+      style={{ paddingLeft: 8 + indent * 12 }}
+      aria-live="polite"
+    >
+      <span className="dots-spinner" aria-hidden="true">
+        <span /><span /><span />
+      </span>
+      <span className="sidebar-loading-label">{label}</span>
     </div>
   );
 }
