@@ -289,11 +289,12 @@ export function createStore(): Store {
 
   function scheduleRetry(pq: PendingQuery): void {
     if (pq.cancelled) return;
+    // Use the CURRENT attempt index for backoff (so the first failed attempt
+    // retries with RETRY_BACKOFF_MS[0] = 0 ms instead of skipping straight to
+    // 500 ms), THEN bump the counter for the next round.
+    const idx = Math.min(pq.attempt, RETRY_BACKOFF_MS.length - 1);
+    const backoff = RETRY_BACKOFF_MS[idx] ?? RETRY_BACKOFF_TAIL_MS;
     pq.attempt += 1;
-    const backoff =
-      pq.attempt < RETRY_BACKOFF_MS.length
-        ? (RETRY_BACKOFF_MS[pq.attempt] ?? RETRY_BACKOFF_TAIL_MS)
-        : RETRY_BACKOFF_TAIL_MS;
     if (pq.retryTimer) clearTimeout(pq.retryTimer);
     pq.retryTimer = setTimeout(() => {
       pq.retryTimer = null;

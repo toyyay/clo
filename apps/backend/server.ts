@@ -229,7 +229,7 @@ void resumeQueuedTranscriptionJobs().catch((error) => {
 
 Bun.serve<WsData>({
   port,
-  routes: withApiRequestLogging({
+  routes: withSecurityHeaders(withApiRequestLogging({
     // Default UI is now sync-v3. The legacy client lives under /v2 explicitly
     // and remains hash-routed so its existing chat URLs (#chat=...) keep
     // working when prefixed with /v2.
@@ -483,6 +483,20 @@ Bun.serve<WsData>({
     "/api/v3/ws": (req: Request, server: { upgrade(req: Request, options: { data: WsData }): boolean }) => {
       const auth = requireWebAuth(req);
       if (auth) return auth;
+      // Origin check — defends the v4 `query` op against cross-origin SQL
+      // exfiltration. Without this a malicious page in another tab could
+      // open a WS to /api/v3/ws (the SameSite=Lax cookie is sent with
+      // cross-site WS upgrades by browsers historically), call `query`,
+      // and read the user's chat history. Strict allowlist; reject any
+      // non-matching origin.
+      const origin = req.headers.get("origin");
+      if (origin !== null) {
+        const reqUrl = new URL(req.url);
+        const expected = `${reqUrl.protocol === "https:" ? "https:" : "http:"}//${reqUrl.host}`;
+        if (origin !== expected) {
+          return text("origin not allowed", 403);
+        }
+      }
       const openMeta = {
         userAgent: req.headers.get("user-agent"),
         ip: req.headers.get("cf-connecting-ip") ?? req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? null,
@@ -679,7 +693,7 @@ Bun.serve<WsData>({
     },
     "/api/imports/media": async (req: Request) => handleImportMedia(req),
     "/api/shortcuts/audio": async (req: Request) => handleImportMedia(req),
-  }),
+  })),
   websocket: {
     open(ws) {
       if (ws.data.kind === "v3") {
@@ -725,6 +739,61 @@ Bun.serve<WsData>({
 });
 
 console.log(`chatview backend running at http://localhost:${port}`);
+
+/** Default security headers applied to every Response we send. The strict
+ *  CSP, frame-ancestors none, X-Frame-Options DENY combo neutralises clickjack
+ *  and cross-frame attacks; X-Content-Type-Options nosniff blunts MIME-confusion.
+ *  HSTS is added only on TLS — leaving it off plain HTTP avoids breaking local
+ *  dev (`http://localhost:3737`).
+ *
+ *  CSP is intentionally simple: the v3 app is a single SPA bundled by Bun
+ *  served from `self` with no external scripts. If the build ever pulls in a
+ *  CDN, allowlist it explicitly here. */
+const SECURITY_HEADERS_BASE: Record<string, string> = {
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+  "Content-Security-Policy":
+    "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; " +
+    "style-src 'self' 'unsafe-inline'; script-src 'self'; " +
+    "connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+};
+
+function applySecurityHeaders(res: Response, req: Request): Response {
+  // Some responses (websocket upgrades, file downloads with their own header
+  // contracts) we want to leave alone. The websocket upgrade path doesn't
+  // return a Response at all, so this only sees ordinary HTTP responses.
+  try {
+    for (const [k, v] of Object.entries(SECURITY_HEADERS_BASE)) {
+      if (!res.headers.has(k)) res.headers.set(k, v);
+    }
+    if (isHttps(req) && !res.headers.has("Strict-Transport-Security")) {
+      res.headers.set("Strict-Transport-Security", "max-age=15552000; includeSubDomains");
+    }
+  } catch {
+    // Headers may be locked on some response shapes (e.g. upgrade fallback);
+    // dropping the security headers in that edge case is preferable to crashing
+    // the request.
+  }
+  return res;
+}
+
+function withSecurityHeaders<T extends Record<string, unknown>>(routes: T): T {
+  const wrapped: Record<string, unknown> = {};
+  for (const [path, handler] of Object.entries(routes)) {
+    if (typeof handler !== "function") {
+      wrapped[path] = handler;
+      continue;
+    }
+    wrapped[path] = async (...args: unknown[]) => {
+      const req = args[0] as Request;
+      const result = await (handler as (...args: unknown[]) => unknown)(...args);
+      if (result instanceof Response) return applySecurityHeaders(result, req);
+      return result;
+    };
+  }
+  return wrapped as T;
+}
 
 function withApiRequestLogging<T extends Record<string, unknown>>(routes: T): T {
   const wrapped: Record<string, unknown> = {};
@@ -1093,7 +1162,7 @@ function makeWebAuthCookie(req: Request, token: string) {
     `${webAuthCookie}=${encodeURIComponent(token)}`,
     "Path=/",
     "HttpOnly",
-    "SameSite=Lax",
+    "SameSite=Strict",
     `Max-Age=${webAuthCookieMaxAge}`,
   ];
   if (isHttps(req)) parts.push("Secure");
@@ -1101,7 +1170,7 @@ function makeWebAuthCookie(req: Request, token: string) {
 }
 
 function clearWebAuthCookie(req: Request) {
-  const parts = [`${webAuthCookie}=`, "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0"];
+  const parts = [`${webAuthCookie}=`, "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=0"];
   if (isHttps(req)) parts.push("Secure");
   return parts.join("; ");
 }

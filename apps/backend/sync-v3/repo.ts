@@ -50,7 +50,12 @@ const MAX_RAW_QUERY_ROWS = 5000;
 /** Per-statement Postgres timeout. Frontend can't deadlock its own backend. */
 const RAW_QUERY_STATEMENT_TIMEOUT_MS = 5000;
 
-const V4_MATERIALIZED_VIEWS = ["v3_chat_index_full", "v3_chat_search", "v3_chat_last_render"] as const;
+// v3_chat_last_render is intentionally NOT refreshed here. The frontend
+// store doesn't read it (verified 2026-05-04 perf review) and refreshing it
+// at every tick costs ~2.6 s on staging — pure waste. Keeping the MV around
+// in the schema so a future hover-preview UI can pick it up; refresh is
+// triggered manually if/when that ships.
+const V4_MATERIALIZED_VIEWS = ["v3_chat_index_full", "v3_chat_search"] as const;
 
 export function makeRepo(sql: any): Repo {
   return {
@@ -81,7 +86,13 @@ async function runRawQueryWithMaxRev(
   const result = await sql.transaction(async (tx: any) => {
     await tx.unsafe(`set local transaction read only`);
     await tx.unsafe(`set local statement_timeout = ${RAW_QUERY_STATEMENT_TIMEOUT_MS}`);
-    const rows = await tx.unsafe(opts.sql, params);
+    // Wrap the user SQL in a bounded subquery so Postgres caps row count
+    // BEFORE the driver materialises everything. Without this, a query like
+    // `select * from agent_render_items` builds the entire 600k-row array in
+    // backend memory before our slice() runs — easy DoS surface. The +1
+    // sentinel lets the JS layer detect "there were more rows" reliably.
+    const wrapped = `select * from (${opts.sql}) __chatview_q limit ${MAX_RAW_QUERY_ROWS + 1}`;
+    const rows = await tx.unsafe(wrapped, params);
     // Read maxRev inside the same tx so it's a consistent snapshot with the
     // user's query — the client uses it as a "I have data up to revision X"
     // watermark.
@@ -105,12 +116,13 @@ async function runRawQuery(
   //   1. SET LOCAL TRANSACTION READ ONLY rejects any UPDATE/INSERT/DDL the
   //      user pastes (or that lives inside a CTE or subquery).
   //   2. SET LOCAL statement_timeout is scoped to this tx only.
-  // Both SET LOCAL targets cannot be parameterized — but the only "user input"
-  // that flows into them is the timeout, which is a numeric literal we own.
+  //   3. Outer LIMIT caps rows BEFORE the driver buffers them in memory —
+  //      see runRawQueryWithMaxRev for the same defence.
   const rows: any[] = await sql.transaction(async (tx: any) => {
     await tx.unsafe(`set local transaction read only`);
     await tx.unsafe(`set local statement_timeout = ${RAW_QUERY_STATEMENT_TIMEOUT_MS}`);
-    return tx.unsafe(opts.sql, params);
+    const wrapped = `select * from (${opts.sql}) __chatview_q limit ${MAX_RAW_QUERY_ROWS + 1}`;
+    return tx.unsafe(wrapped, params);
   });
   const truncated = rows.length > MAX_RAW_QUERY_ROWS;
   const safeRows = rows.slice(0, MAX_RAW_QUERY_ROWS).map((row: any) => normalizeRow(row));

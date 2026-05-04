@@ -205,16 +205,20 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
               },
             });
           } catch (err) {
+            const publicMsg = publicQueryErr(err);
+            const fullMsg = errMsg(err);
             const errFrame: ServerFrame = useV4Reply
-              ? { op: "query.err", reqId: frame.reqId, error: errMsg(err) }
-              : { op: "query.run.err", reqId: frame.reqId, error: errMsg(err) };
+              ? { op: "query.err", reqId: frame.reqId, error: publicMsg }
+              : { op: "query.run.err", reqId: frame.reqId, error: publicMsg };
             send(ws, errFrame);
             telemetry.log({
               clientId: ws.data.clientId ?? null,
               event: `${frame.op}.failed`,
               level: "warn",
               durationMs: Date.now() - t0,
-              payload: { error: errMsg(err), sqlLen: frame.sql.length },
+              // Telemetry retains the full message for debugging; the wire
+              // payload only carried the sanitised one.
+              payload: { error: fullMsg, sqlLen: frame.sql.length },
             });
           }
           return;
@@ -231,6 +235,25 @@ export function makeHandlers(ctx: WsContext): WsHandlers {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** Sanitised error string for `query.err` — keeps Postgres SQLSTATE codes
+ *  and a one-line summary, drops verbose `at line N column M, near "<sql>"`
+ *  hints which leak schema fragments to anyone hijacking the WS. The full
+ *  message is still logged to telemetry so debugging stays possible. */
+function publicQueryErr(err: unknown): string {
+  if (!(err instanceof Error)) return "query failed";
+  const msg = err.message ?? "";
+  const code = (err as { code?: string }).code;
+  // Take only the first line, strip "at character N" / "LINE N:" / position
+  // hints and the SQL excerpt that drivers append after them.
+  const firstLine = msg.split("\n")[0]?.trim() ?? "";
+  const cleaned = firstLine
+    .replace(/\s+at\s+character\s+\d+.*$/i, "")
+    .replace(/\s+LINE\s+\d+:.*$/, "")
+    .replace(/\s+near\s+"[^"]*".*$/, "")
+    .slice(0, 240);
+  return code ? `${code}: ${cleaned || "query failed"}` : cleaned || "query failed";
 }
 
 // ---------- persistence context (telemetry only in v4) --------------------

@@ -58,22 +58,48 @@ export function RenderItemView({
           </div>
         </details>
       );
-    case "tu":
+    case "tu": {
+      // v4 wire-projection strips `in` and replaces it with `inSize` so the
+      // base feed stays small. When that happens we render a size hint
+      // instead of an empty <pre>; the user can click to fetch the real body.
+      const inSize = (item as unknown as { inSize?: number }).inSize;
+      const hasBody = item.in !== undefined;
       return (
         <div className="tool tool-use">
           <div className="tool-name">{item.name}</div>
-          <pre className="tool-input">{safeStringify(item.in)}</pre>
+          {hasBody ? (
+            <pre className="tool-input">{safeStringify(item.in)}</pre>
+          ) : (
+            <div className="tool-input tool-input-stub">
+              tool input
+              {typeof inSize === "number" ? ` · ${formatBytesShort(inSize)}` : ""}
+              {" "}
+              <span className="tool-trunc">(click expand to load — not implemented yet)</span>
+            </div>
+          )}
         </div>
       );
-    case "tr":
+    }
+    case "tr": {
+      const outSize = (item as unknown as { outSize?: number }).outSize;
+      const hasBody = typeof item.out === "string" && item.out.length > 0;
       return (
         <div className={`tool tool-result ${item.isErr ? "is-err" : ""}`}>
-          <pre className="tool-output">
-            {item.out}
-            {item.trunc && <span className="tool-trunc"> …truncated</span>}
-          </pre>
+          {hasBody ? (
+            <pre className="tool-output">
+              {item.out}
+              {item.trunc && <span className="tool-trunc"> …truncated</span>}
+            </pre>
+          ) : (
+            <div className="tool-output tool-input-stub">
+              tool result
+              {typeof outSize === "number" ? ` · ${formatBytesShort(outSize)}` : ""}
+              {item.isErr && " · error"}
+            </div>
+          )}
         </div>
       );
+    }
     case "tg":
       return <div className="tool-group" />;
   }
@@ -152,6 +178,13 @@ function Heading({ level, children }: { level: 1 | 2 | 3 | 4 | 5 | 6; children: 
     case 6:
       return <h6>{children}</h6>;
   }
+}
+
+function formatBytesShort(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "?";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function safeStringify(value: unknown): string {

@@ -93,8 +93,21 @@ export function makeNotifyListener(ctx: NotifyListenerCtx): NotifyListener {
       log("warn", "broadcast.failed", err);
     }
 
-    // Background MV refresh. Failures are warn-logged but never thrown — a
-    // slow MV must not block the next tick.
+    // Background MV refresh. Single-flight: if a previous refresh is still
+    // running, mark "refresh again when done" instead of stacking. Without
+    // this, a steady tick stream could pile up 5-25 parallel refreshes (each
+    // takes hundreds of ms) and exhaust the connection pool.
+    scheduleMvRefresh();
+  }
+
+  let mvRefreshInFlight = false;
+  let mvRefreshPending = false;
+  function scheduleMvRefresh() {
+    if (mvRefreshInFlight) {
+      mvRefreshPending = true;
+      return;
+    }
+    mvRefreshInFlight = true;
     void ctx.repo
       .refreshV4MaterializedViews()
       .then((results) => {
@@ -102,7 +115,14 @@ export function makeNotifyListener(ctx: NotifyListenerCtx): NotifyListener {
           if (!r.ok) log("warn", "mv.refresh.failed", { name: r.name, error: r.error });
         }
       })
-      .catch((err) => log("warn", "mv.refresh.threw", err));
+      .catch((err) => log("warn", "mv.refresh.threw", err))
+      .finally(() => {
+        mvRefreshInFlight = false;
+        if (mvRefreshPending) {
+          mvRefreshPending = false;
+          scheduleMvRefresh();
+        }
+      });
   }
 
   function reportRenderChange(sourceFileId: number, syncRevision: number) {
@@ -114,12 +134,19 @@ export function makeNotifyListener(ctx: NotifyListenerCtx): NotifyListener {
   // Polling fallback — defends against external writers (backfill, manual
   // SQL, future ingest paths). Each poll asks "did max(sync_revision) move?"
   // and if so emits a tick with no `files` (we don't know which ones moved).
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
-  // Backoff — on repeated SQL errors we slow the poll instead of crash-looping.
+  //
+  // Self-rescheduling via setTimeout (NOT setInterval) so on errors we can
+  // actually back off — the previous interval-based version computed
+  // `pollBackoffMs` and threw it away, hammering Postgres at 1 Hz during
+  // outages. A failed poll now waits up to 5s before the next try.
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
   let pollBackoffMs = POLL_INTERVAL_MS;
   const POLL_BACKOFF_MAX_MS = 5000;
+  let stopped = false;
 
   async function poll() {
+    if (stopped) return;
+    let nextDelay = POLL_INTERVAL_MS;
     try {
       const m = await ctx.repo.fetchMaxRev();
       pollBackoffMs = POLL_INTERVAL_MS; // success — reset backoff
@@ -131,13 +158,14 @@ export function makeNotifyListener(ctx: NotifyListenerCtx): NotifyListener {
       }
     } catch (err) {
       log("warn", "poll.failed", err);
-      // Exponential backoff capped at 5s. Reschedule via setTimeout once;
-      // the regular interval keeps running underneath so we don't starve.
+      // Exponential backoff capped at 5s. nextDelay carries the new wait.
       pollBackoffMs = Math.min(POLL_BACKOFF_MAX_MS, Math.max(POLL_INTERVAL_MS, pollBackoffMs * 2));
+      nextDelay = pollBackoffMs;
     }
+    if (!stopped) pollTimer = setTo(() => void poll(), nextDelay);
   }
 
-  pollTimer = setIv(() => void poll(), POLL_INTERVAL_MS);
+  pollTimer = setTo(() => void poll(), POLL_INTERVAL_MS);
   // Seed lastSeenMaxRev on startup so the first poll doesn't fire a spurious
   // tick for the entire pre-existing revision history.
   void ctx.repo
@@ -150,13 +178,12 @@ export function makeNotifyListener(ctx: NotifyListenerCtx): NotifyListener {
   return {
     reportRenderChange,
     stop() {
+      stopped = true;
       if (pollTimer !== null) {
-        clearIv(pollTimer);
+        try { (clearTimeout as any)(pollTimer); } catch {}
         pollTimer = null;
       }
       if (timer !== null) {
-        // Best-effort — flush is via setTimeout; clearTimeout works even if
-        // we got a different timer impl, as long as types match.
         try { (clearTimeout as any)(timer); } catch {}
         timer = null;
       }
