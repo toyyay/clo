@@ -108,6 +108,20 @@ const RETRY_BACKOFF_TAIL_MS = 5000;
  *    • render-item queries (openChat/loadOlder): kind, maxItemBytes (chatId
  *      filter implicit by source_file_id; host/project not stored on items)
  */
+/** Pure JS analogue of `buildExcludeWhere` for the chats-list scope.
+ *  Used to filter cached IDB rows on cold-start hydration and to prune
+ *  `visibleChats` when a new rule is added — situations where round-tripping
+ *  through SQL would defeat the offline-first contract. */
+function isChatExcluded(chat: ChatIndex, rules: idb.ExcludeRuleRow[]): boolean {
+  for (const r of rules) {
+    if (r.type === "host" && chat.hostId === r.value) return true;
+    if (r.type === "project" && chat.projectKey === r.value) return true;
+    if (r.type === "provider" && chat.provider === r.value) return true;
+    if (r.type === "chatId" && chat.chatId === r.value) return true;
+  }
+  return false;
+}
+
 export function buildExcludeWhere(
   rules: idb.ExcludeRuleRow[],
   scope: "chats" | "items",
@@ -754,14 +768,25 @@ export function createStore(): Store {
 
     async start(opts) {
       // Hydrate sidebar from IDB first so the page paints offline-friendly
-      // before WS opens.
-      const level1 = await idb.getGroupsByLevel(1);
-      const level2 = await idb.getGroupsByLevel(2);
-      const level3 = await idb.getGroupsByLevel(3);
+      // before WS opens. Without this step a cold start in airplane mode
+      // would show an empty sidebar even with thousands of cached chats.
+      const [level1, level2, level3, cachedChats] = await Promise.all([
+        idb.getGroupsByLevel(1),
+        idb.getGroupsByLevel(2),
+        idb.getGroupsByLevel(3),
+        idb.getAllChatsByLastSeen(BOOT_CHAT_LIMIT),
+      ]);
       const groups = new Map<string, GroupNode>();
       for (const g of [...level1, ...level2, ...level3]) groups.set(g.key, g);
       excludeRules = await idb.listExcludeRules();
-      commit({ groups });
+      // Apply exclude rules to the IDB hydration too — otherwise a chatId
+      // rule added on this device would re-surface the chat for one paint
+      // cycle on every reload.
+      const visibleChats = new Map(state.visibleChats);
+      for (const c of cachedChats) {
+        if (!isChatExcluded(c, excludeRules)) visibleChats.set(c.chatId, c);
+      }
+      commit({ groups, visibleChats });
 
       ws = createWsClient({
         url: opts.url,
@@ -1174,6 +1199,18 @@ export function createStore(): Store {
     async addExcludeRule(rule) {
       await idb.addExcludeRule(rule);
       excludeRules = await idb.listExcludeRules();
+      // Drop any currently-visible chats that match the new rule so the UI
+      // updates immediately instead of waiting for the next sidebar pull.
+      // Cheap because the Map is bounded by BOOT_CHAT_LIMIT.
+      const visibleChats = new Map(state.visibleChats);
+      let pruned = 0;
+      for (const [id, chat] of visibleChats) {
+        if (isChatExcluded(chat, excludeRules)) {
+          visibleChats.delete(id);
+          pruned++;
+        }
+      }
+      if (pruned > 0) commit({ visibleChats });
       // Force sidebar re-pull (and active chat tail re-pull, since item-level
       // rules may now drop visible items).
       sidebarScope.knownTickMaxRev += 1;

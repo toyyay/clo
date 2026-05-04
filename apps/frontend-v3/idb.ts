@@ -226,6 +226,31 @@ export async function getChatsByGroup(
   });
 }
 
+/** Read every cached ChatIndex row sorted by lastSeenAt DESC, capped at
+ *  `limit`. Used by the v4 store to hydrate `visibleChats` before the WS
+ *  connects so offline cold-starts show the sidebar from the previous
+ *  session immediately. */
+export async function getAllChatsByLastSeen(limit: number): Promise<ChatIndex[]> {
+  const db = await openDb();
+  const store = db.transaction("chat_index").objectStore("chat_index");
+  return new Promise((resolve, reject) => {
+    const acc: ChatIndex[] = [];
+    const req = store.openCursor();
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) {
+        // Sort once at the end — IDB primary cursor doesn't track lastSeenAt.
+        acc.sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
+        resolve(acc.slice(0, limit));
+        return;
+      }
+      acc.push(cursor.value as ChatIndex);
+      cursor.continue();
+    };
+  });
+}
+
 export async function bulkPutChatIndex(rows: ChatIndex[]) {
   if (!rows.length) return;
   const db = await openDb();
